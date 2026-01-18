@@ -21,8 +21,6 @@ from multiprocessing.synchronize import Lock as LockType
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, Optional, Union
 
-import pkg_resources
-
 from .arvo_utils import ArvoContainer
 from .autopatch.autopatch_tools import AutoPatchAgent
 from .autopatch.report import ChatHistory, write_chat_history_markdown
@@ -363,8 +361,12 @@ class AutoPatchingBenchmark(Benchmark):
         YELLOW = "\033[1m\033[93m"
         END = "\033[0m"
         BLUE = "\033[1m\033[94m"
-        metadata_path = pkg_resources.resource_filename(
-            __name__, f"arvo_meta/{case_id}-meta.json"
+        metadata_path = (
+            Path(__file__).parent.parent
+            / "datasets"
+            / "autopatch"
+            / "arvo_meta"
+            / f"{case_id}-meta.json"
         )
         if not metadata_path.exists():
             logging.warning(
@@ -424,8 +426,12 @@ class AutoPatchingBenchmark(Benchmark):
                 fix_container.logger.info(
                     f"{BLUE}Found correct fix for {case_id} is {found_commit} {END}"
                 )
-                patch_path = pkg_resources.resource_filename(
-                    __name__, f"arvo_meta/{case_id}-patch.json"
+                patch_path = (
+                    Path(__file__).parent.parent
+                    / "datasets"
+                    / "autopatch"
+                    / "arvo_meta"
+                    / f"{case_id}-patch.json"
                 )
                 with open(patch_path, "r") as f:
                     patch_dict = json.load(f)[0]
@@ -542,8 +548,8 @@ class AutoPatchingBenchmark(Benchmark):
                 responses = json.loads(self.response_path.read_text())
             else:
                 responses = []
-            if overwrite:
-                # find the responses for the given case_id and model, and remove
+                # Always remove existing entries for the same case_id and model to prevent duplicates
+                # (previously this was only done when overwrite=True, causing duplicates to accumulate)
                 responses = [
                     r
                     for r in responses
@@ -701,10 +707,33 @@ class AutoPatchingBenchmark(Benchmark):
         """
         Processes an LLM-generated patch by checking whether the generated patch is 'correct'.
         Evaluates patches through fuzzing and differential debugging.
+
+        Note: Stale container cleanup is handled at startup in run.py, not here.
+        Containers from patch generation may be reused during evaluation.
+
+        Args:
+            num_test_cases: Number of test cases to evaluate (0 for all).
+            run_llm_in_parallel: Maximum concurrent evaluation tasks.
+            should_cleanup_after_eval: Whether to cleanup containers after evaluation.
         """
         if self.get_config().test_mode:
             logging.info("Running in test mode. Terminating.")
             return
+
+        try:
+            await self._run_evaluation(num_test_cases, run_llm_in_parallel)
+        finally:
+            if should_cleanup_after_eval:
+                logging.info("[EVAL] Cleaning up containers...")
+                await ArvoContainer.cleanup_all_containers()
+                logging.info("[EVAL] Container cleanup complete")
+
+    async def _run_evaluation(
+        self,
+        num_test_cases: int = 0,
+        run_llm_in_parallel: int = 16,
+    ) -> None:
+        """Internal method that runs the actual evaluation logic."""
         # Load previously generated responses
         responses = json.loads(self.response_path.read_text())
 
@@ -718,7 +747,11 @@ class AutoPatchingBenchmark(Benchmark):
         }
 
         # Process each model's responses
-        for model in models:
+        total_models = len(models)
+        logging.info(
+            f"[EVAL] Starting evaluation for {len(responses)} patches across {total_models} models"
+        )
+        for model_idx, model in enumerate(models, 1):
             evaluation_results[model] = {}
             evaluation_statistics[model] = {}
 
@@ -729,9 +762,30 @@ class AutoPatchingBenchmark(Benchmark):
                 if response[AutoPatchingBenchmark.RESPONSES_MODEL_KEY] == model
             ]
 
+            # Deduplicate responses by ARVO ID to prevent race conditions
+            # (same case running in parallel would fight over shared container)
+            seen_arvo_ids: set[str] = set()
+            unique_model_responses = []
+            for response in model_responses:
+                arvo_id = response.get(
+                    AutoPatchingBenchmark.RESPONSES_ARVO_CHALLENGE_NUMBER_KEY
+                )
+                if arvo_id not in seen_arvo_ids:
+                    seen_arvo_ids.add(arvo_id)
+                    unique_model_responses.append(response)
+                else:
+                    logging.warning(
+                        f"[EVAL] Skipping duplicate response for ARVO #{arvo_id} with model {model}"
+                    )
+            model_responses = unique_model_responses
+
             # Limit test cases if specified
             if num_test_cases > 0:
                 model_responses = model_responses[:num_test_cases]
+
+            logging.info(
+                f"[EVAL] Processing model {model_idx}/{total_models}: {model} ({len(model_responses)} cases)"
+            )
 
             # Initialize counters for metrics
             num_passed_qa_checks: int = 0
@@ -749,7 +803,11 @@ class AutoPatchingBenchmark(Benchmark):
             ]
 
             # Wait for all tasks to complete and gather results
+            logging.info(
+                f"[EVAL] Running {len(tasks)} evaluation tasks in parallel (max {run_llm_in_parallel} concurrent)..."
+            )
             results = await asyncio.gather(*tasks)
+            logging.info(f"[EVAL] Model {model} evaluation complete")
 
             # Aggregate metrics from results
             for result in results:
@@ -824,9 +882,6 @@ class AutoPatchingBenchmark(Benchmark):
         if (judge_response_path := self.judge_response_path) is not None:
             judge_response_path.write_text(json.dumps(evaluation_results, indent=4))
 
-        if should_cleanup_after_eval:
-            await ArvoContainer.cleanup_all_containers()
-
     async def _process_response(
         self,
         response: Dict[str, Union[str, int, bool]],
@@ -840,6 +895,9 @@ class AutoPatchingBenchmark(Benchmark):
             arvo_challenge_number = response[
                 AutoPatchingBenchmark.RESPONSES_ARVO_CHALLENGE_NUMBER_KEY
             ]
+            logging.info(
+                f"[EVAL] Starting evaluation for ARVO #{arvo_challenge_number} with model {model}"
+            )
             assert isinstance(arvo_challenge_number, int), (
                 f"{AutoPatchingBenchmark.RESPONSES_ARVO_CHALLENGE_NUMBER_KEY} should be an int"
             )
@@ -927,6 +985,9 @@ class AutoPatchingBenchmark(Benchmark):
             )
 
             # Run fuzzing tests
+            logging.info(
+                f"[EVAL] ARVO #{arvo_challenge_number} ({model}): Starting full fuzzing ({ArvoContainer.FULL_FUZZING_DURATION // 60} min)..."
+            )
             try:
                 crash_found = await arvo_fix.does_program_crash_in_full_fuzzing()
                 full_fuzzing_passed = not crash_found
@@ -936,7 +997,13 @@ class AutoPatchingBenchmark(Benchmark):
                 result[AutoPatchingBenchmark.EVALUATION_FULL_FUZZING_PASSED_KEY] = (
                     full_fuzzing_passed
                 )
+                logging.info(
+                    f"[EVAL] ARVO #{arvo_challenge_number} ({model}): Fuzzing {'PASSED ✓' if full_fuzzing_passed else 'FAILED ✗ (crash found)'}"
+                )
             except Exception as e:
+                logging.error(
+                    f"[EVAL] ARVO #{arvo_challenge_number} ({model}): Fuzzing ERROR: {e}"
+                )
                 print(f"FAILED FUZZING: {e} {traceback.format_exc()}")
                 result_dict[
                     AutoPatchingBenchmark.EVALUATION_FUZZING_DECODE_ERROR_KEY
@@ -946,6 +1013,9 @@ class AutoPatchingBenchmark(Benchmark):
 
             # Run differential debugging if fuzzing passed
             if result[AutoPatchingBenchmark.EVALUATION_FULL_FUZZING_PASSED_KEY]:
+                logging.info(
+                    f"[EVAL] ARVO #{arvo_challenge_number} ({model}): Starting differential debugging..."
+                )
                 try:
                     functionality_preserved = await arvo_fix.run_differential_debugging(
                         patched_function_name
@@ -956,7 +1026,13 @@ class AutoPatchingBenchmark(Benchmark):
                     result[
                         AutoPatchingBenchmark.EVALUATION_FUNCTIONALITY_PRESERVED_KEY
                     ] = functionality_preserved
+                    logging.info(
+                        f"[EVAL] ARVO #{arvo_challenge_number} ({model}): Differential debugging {'PASSED ✓' if functionality_preserved else 'FAILED ✗'}"
+                    )
                 except Exception as e:
+                    logging.error(
+                        f"[EVAL] ARVO #{arvo_challenge_number} ({model}): Differential debugging ERROR: {e}"
+                    )
                     print(f"FAILED FUZZING: {e} {traceback.format_exc()}")
                     result_dict[
                         AutoPatchingBenchmark.EVALUATION_ERROR_RUNNING_DEBUGGING_KEY
@@ -965,4 +1041,7 @@ class AutoPatchingBenchmark(Benchmark):
                         AutoPatchingBenchmark.EVALUATION_DIFFERENTIAL_DEBUGGING_ERROR_KEY
                     ] = True
 
+            logging.info(
+                f"[EVAL] ARVO #{arvo_challenge_number} ({model}): Evaluation complete"
+            )
             return result

@@ -12,7 +12,7 @@ import re
 import subprocess
 import tempfile
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import as_completed, ThreadPoolExecutor
 from enum import auto, Enum
 from functools import lru_cache
 from pathlib import Path
@@ -20,7 +20,6 @@ from subprocess import CompletedProcess
 from typing import Any, Dict, List, MutableMapping, Optional, Set, Tuple
 
 import boto3
-import pkg_resources
 from async_lru import alru_cache
 from botocore import UNSIGNED
 from botocore.config import Config
@@ -217,12 +216,29 @@ class ArvoContainer:
         # to build images, we need to check/download required dpkgs first
         if not cls._get_required_dpkgs():
             RuntimeError("Failed to download required dpkgs. Exiting.")
-        build_logger.info("Building container images. This may take a while...")
+
         existing_arvo_ids = cls._get_arvo_ids_that_exist_in_container_repository(
             container_repository
         )
         arvo_ids_to_evaluate = set(test_cases)
         arvo_ids_to_build = arvo_ids_to_evaluate - existing_arvo_ids
+
+        # Log build plan
+        num_existing = len(arvo_ids_to_evaluate.intersection(existing_arvo_ids))
+        num_to_build = len(arvo_ids_to_build)
+        build_logger.info(
+            f"[BUILD] Container images: {num_existing} already exist, {num_to_build} to build"
+        )
+
+        if num_to_build == 0:
+            build_logger.info(
+                "[BUILD] All container images already exist. Skipping build."
+            )
+            return list(arvo_ids_to_evaluate)
+
+        build_logger.info(
+            f"[BUILD] Building {num_to_build} container image(s). This may take a while..."
+        )
         build_logger.debug(
             f"Images for the following ARVO IDs already exist: {existing_arvo_ids}."
         )
@@ -232,20 +248,38 @@ class ArvoContainer:
 
         # Set max_workers to half of max_concurrency because each thread will fork again to build 2 container images in parallel
         images_available = list(arvo_ids_to_evaluate.intersection(existing_arvo_ids))
+
+        completed_count = 0
+        failed_count = 0
         with ThreadPoolExecutor(max_workers=max_concurrency // 2) as executor:
-            futures = [
+            futures = {
                 executor.submit(
                     cls._build_container_images_for_arvo_id,
                     arvo_id,
                     container_repository,
-                )
+                ): arvo_id
                 for arvo_id in arvo_ids_to_build
-            ]
-            for future in futures:
+            }
+            for future in as_completed(futures):
+                arvo_id = futures[future]
                 result = future.result()
                 if result >= 0:
                     images_available.append(result)
+                    completed_count += 1
+                    build_logger.info(
+                        f"[BUILD] Progress: {completed_count}/{num_to_build} completed "
+                        f"(ARVO #{arvo_id} ✓)"
+                    )
+                else:
+                    failed_count += 1
+                    build_logger.warning(
+                        f"[BUILD] Progress: {completed_count}/{num_to_build} completed "
+                        f"(ARVO #{arvo_id} ✗ FAILED)"
+                    )
 
+        build_logger.info(
+            f"[BUILD] Build complete: {completed_count} succeeded, {failed_count} failed"
+        )
         return images_available
 
     @classmethod
@@ -340,7 +374,7 @@ class ArvoContainer:
     @classmethod
     def _build_image_from_dockerfile(
         cls, container_repository: str, arvo_id: int, container_type: str
-    ) -> Tuple[str, CompletedProcess[str]]:
+    ) -> Tuple[str, CompletedProcess[bytes]]:
         build_logger = logging.getLogger("container_build")
         dockerfile_template = cls._get_dockerfile_template(container_type)
         dockerfile_content = dockerfile_template.replace("{ARVO_ID}", str(arvo_id))
@@ -366,12 +400,17 @@ class ArvoContainer:
                 build_cmd_args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # Combine stdout and stderr
-                text=True,
             )
             if result.returncode != 0:
                 build_command = " ".join(build_cmd_args)
+                # Decode with error handling for binary output
+                stdout_text = (
+                    result.stdout.decode("utf-8", errors="replace")
+                    if result.stdout
+                    else ""
+                )
                 build_logger.error(
-                    f"Build command {build_command} failed with return code {result.returncode}. Command output:\n{result.stdout}"
+                    f"Build command {build_command} failed with return code {result.returncode}. Command output:\n{stdout_text}"
                 )
             else:
                 build_logger.debug(f"Image {image_tag} built successfully.")
@@ -631,6 +670,102 @@ class ArvoContainer:
                 logging.error(f"Error cleaning up container {container_id}: {str(e)}")
         cls._container_ids.clear()
         logging.debug("Cleanup of all containers completed.")
+
+    @classmethod
+    async def get_running_container_count(cls) -> int:
+        """Get the number of currently running podman containers."""
+        result = await asyncio.create_subprocess_exec(
+            "podman",
+            "ps",
+            "-q",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await result.communicate()
+        containers = [c for c in stdout.decode().strip().split("\n") if c]
+        return len(containers)
+
+    @classmethod
+    async def cleanup_stale_containers(cls, auto_confirm: bool = False) -> bool:
+        """
+        Clean up any stale containers from previous runs.
+
+        Args:
+            auto_confirm: If True, skip confirmation prompt and proceed with cleanup.
+
+        Returns:
+            True if cleanup was performed or no cleanup needed, False if user declined.
+        """
+        container_count = await cls.get_running_container_count()
+
+        if container_count == 0:
+            logging.info("[STARTUP] No stale containers found.")
+            return True
+
+        logging.warning(
+            f"[STARTUP] Found {container_count} running container(s) from a previous run."
+        )
+
+        if not auto_confirm:
+            print(
+                f"\n⚠️  Found {container_count} running container(s) from a previous run."
+            )
+            print("These may be stale containers that should be cleaned up.")
+            response = (
+                input("Do you want to stop and remove them? [Y/n]: ").strip().lower()
+            )
+            if response and response not in ("y", "yes"):
+                logging.info(
+                    "[STARTUP] User declined cleanup. Proceeding with existing containers."
+                )
+                return False
+
+        logging.info(f"[STARTUP] Cleaning up {container_count} stale container(s)...")
+
+        # Get all container IDs
+        result = await asyncio.create_subprocess_exec(
+            "podman",
+            "ps",
+            "-aq",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await result.communicate()
+        container_ids = [c for c in stdout.decode().strip().split("\n") if c]
+
+        # Stop and remove all containers
+        for container_id in container_ids:
+            try:
+                # Stop container
+                stop_result = await asyncio.create_subprocess_exec(
+                    "podman",
+                    "stop",
+                    "-t",
+                    "0",
+                    container_id,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await stop_result.communicate()
+
+                # Remove container
+                rm_result = await asyncio.create_subprocess_exec(
+                    "podman",
+                    "rm",
+                    "-f",
+                    container_id,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await rm_result.communicate()
+            except Exception as e:
+                logging.error(
+                    f"[STARTUP] Error cleaning up container {container_id}: {e}"
+                )
+
+        remaining = await cls.get_running_container_count()
+        logging.info(f"[STARTUP] Cleanup complete. {remaining} container(s) remaining.")
+        return True
 
     @classmethod
     async def stop_container(cls, container_id: str) -> None:
@@ -991,13 +1126,21 @@ class ArvoContainer:
         self._container_build_status[self.container_id] = status
 
     async def does_program_crash_in_full_fuzzing(self) -> bool:
-        """Run the fuzzer for 60s.  Return a boolean indicating if the fuzzer found a crash."""
+        """Run the fuzzer for FULL_FUZZING_DURATION seconds. Return True if a crash was found."""
         self.logger.debug("Running full fuzzing over the patched binary.")
         # Update fuzzing time limit at evaluation time
+        # Note: Use specific patterns with trailing quote to avoid partial matches
+        # (e.g., "-max_total_time=60" matching within "-max_total_time=600")
         await self.string_replace_in_container_file(
             "/bin/arvo",
-            "-max_total_time=60",
-            f"-max_total_time={self.FULL_FUZZING_DURATION}",
+            '-max_total_time=60"',
+            f'-max_total_time={self.FULL_FUZZING_DURATION}"',
+        )
+        # Also handle fix containers that already have 600 set (idempotent)
+        await self.string_replace_in_container_file(
+            "/bin/arvo",
+            '-max_total_time=600"',
+            f'-max_total_time={self.FULL_FUZZING_DURATION}"',
         )
         # Make sure /bin/arvo is executable
         await self.exec_command(cmd_args=["chmod", "+x", "/bin/arvo"])
@@ -1013,16 +1156,24 @@ class ArvoContainer:
 
     def _load_ground_truth_patches(self) -> List[Dict[str, Any]]:
         """Load the ground truth patch data from the arvo_meta directory."""
-        gt_patch_path = pkg_resources.resource_filename(
-            __name__, f"arvo_meta/{self.arvo_id}-patch.json"
+        gt_patch_path = (
+            Path(__file__).parent.parent
+            / "datasets"
+            / "autopatch"
+            / "arvo_meta"
+            / f"{self.arvo_id}-patch.json"
         )
         with open(gt_patch_path, "r") as f:
             return json.load(f)
 
     def _load_arvo_metadata(self) -> Dict[str, Any]:
         """Load ARVO metadata"""
-        gt_patch_path = pkg_resources.resource_filename(
-            __name__, f"arvo_meta/{self.arvo_id}-meta.json"
+        gt_patch_path = (
+            Path(__file__).parent.parent
+            / "datasets"
+            / "autopatch"
+            / "arvo_meta"
+            / f"{self.arvo_id}-meta.json"
         )
         with open(gt_patch_path, "r") as f:
             return json.load(f)

@@ -43,7 +43,7 @@ def main() -> None:
     elif args.command == "get-stacktraces":
         print("GET STACK TRACES FOR BPs" + repr(args.patched_lines))
         traces = lib_dump.extract_stacktraces(args)
-        print("OBTAINED STACK TRACES: " + repr(traces) + f"storing in {args.outfile}")
+        print("OBTAINED STACK TRACES: " + repr(traces) + " storing in " + str(args.outfile))
         if args.outfile:
             with open(args.outfile, "w") as f:
                 json.dump(traces, f)

@@ -8,7 +8,16 @@
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import List
+
+from dotenv import load_dotenv
+
+# Load .env file from CybersecurityBenchmarks directory
+_env_path = Path(__file__).parent.parent / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path)
 
 from .llms.anthropic import ANTHROPIC
 from .llms.googlegenai import GOOGLEGENAI
@@ -44,11 +53,19 @@ def create(
     See <EXAMPLE_SPECIFICATION> for example.
 
     Supported formats:
-    1. PROVIDER::MODEL (uses default API key from environment)
+    1. PROVIDER::MODEL (uses API key from environment variable <PROVIDER>_API_KEY)
     2. PROVIDER::MODEL::API_KEY (uses provided API key)
     3. PROVIDER::MODEL::API_KEY::BASE_URL (uses custom endpoint)
 
+    Environment variables (loaded from .env file in CybersecurityBenchmarks/):
+    - ANTHROPIC_API_KEY
+    - OPENAI_API_KEY
+    - TOGETHER_API_KEY
+    - GOOGLEGENAI_API_KEY
+    - LLAMA_API_KEY
+
     Examples:
+    - ANTHROPIC::claude-opus-4-5-20251101 (uses ANTHROPIC_API_KEY from .env)
     - OPENAI::gpt-4::sk-123::https://api.custom.com/v1
     - OPENAI::gpt-4::sk-123 (uses default OpenAI endpoint)
     """
@@ -65,8 +82,16 @@ def create(
     else:
         raise ValueError(f"Invalid identifier: {identifier}")
 
+    # If no API key provided, try to get it from environment variable
     if api_key is None:
-        raise ValueError(f"No API key provided for {provider}: {name}")
+        env_var_name = f"{provider}_API_KEY"
+        api_key = os.environ.get(env_var_name)
+        if api_key is None:
+            raise ValueError(
+                f"No API key provided for {provider}::{name}. "
+                f"Either pass it in the identifier (PROVIDER::MODEL::API_KEY) "
+                f"or set the {env_var_name} environment variable in your .env file."
+            )
 
     config = LLMConfig(
         model=name,

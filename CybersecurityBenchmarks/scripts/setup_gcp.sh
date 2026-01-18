@@ -98,17 +98,17 @@ REAL_USER=${SUDO_USER:-$USER}
 chown -R "$REAL_USER:$REAL_USER" "$MOUNT_POINT"
 
 # ============================================
-# Step 3: Setup Podman storage
+# Step 3: Setup Podman storage (rootful)
 # ============================================
-echo_info "Checking Podman storage configuration..."
+echo_info "Checking rootful Podman storage configuration..."
 
 PODMAN_LINK="/var/lib/containers"
 
 # Check if podman storage is already configured
 if [[ -L "$PODMAN_LINK" ]] && [[ "$(readlink -f "$PODMAN_LINK")" == "$PODMAN_STORAGE" ]]; then
-    echo_info "Podman storage already configured at $PODMAN_STORAGE"
+    echo_info "Rootful Podman storage already configured at $PODMAN_STORAGE"
 else
-    echo_info "Setting up Podman storage at $PODMAN_STORAGE..."
+    echo_info "Setting up rootful Podman storage at $PODMAN_STORAGE..."
     
     # Stop podman if running
     systemctl stop podman 2>/dev/null || true
@@ -135,7 +135,86 @@ else
     # Set ownership
     chown -R "$REAL_USER:$REAL_USER" "$PODMAN_STORAGE"
     
-    echo_info "Podman storage configured!"
+    echo_info "Rootful Podman storage configured!"
+fi
+
+# ============================================
+# Step 4: Setup Podman storage (rootless)
+# ============================================
+echo_info "Checking rootless Podman storage configuration..."
+
+# Get the real user's home directory
+REAL_USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+REAL_USER_ID=$(id -u "$REAL_USER")
+ROOTLESS_CONFIG_DIR="$REAL_USER_HOME/.config/containers"
+ROOTLESS_STORAGE_CONF="$ROOTLESS_CONFIG_DIR/storage.conf"
+ROOTLESS_STORAGE_PATH="$PODMAN_STORAGE/storage"
+
+# Check if rootless storage is already configured correctly
+if [[ -f "$ROOTLESS_STORAGE_CONF" ]] && grep -q "graphroot = \"$ROOTLESS_STORAGE_PATH\"" "$ROOTLESS_STORAGE_CONF" 2>/dev/null; then
+    echo_info "Rootless Podman storage already configured at $ROOTLESS_STORAGE_PATH"
+else
+    echo_info "Setting up rootless Podman storage at $ROOTLESS_STORAGE_PATH..."
+    
+    # Clean up any existing rootless podman data that might conflict
+    ROOTLESS_LOCAL_STORAGE="$REAL_USER_HOME/.local/share/containers"
+    if [[ -d "$ROOTLESS_LOCAL_STORAGE" ]]; then
+        echo_info "Cleaning up old rootless storage at $ROOTLESS_LOCAL_STORAGE..."
+        rm -rf "$ROOTLESS_LOCAL_STORAGE"
+    fi
+    
+    # Clean up any stale lock files
+    rm -rf /run/libpod 2>/dev/null || true
+    rm -rf /run/containers 2>/dev/null || true
+    rm -rf "/run/user/$REAL_USER_ID/libpod" 2>/dev/null || true
+    
+    # Create storage directories
+    mkdir -p "$ROOTLESS_STORAGE_PATH"
+    mkdir -p "/run/user/$REAL_USER_ID/containers"
+    
+    # Create config directory
+    mkdir -p "$ROOTLESS_CONFIG_DIR"
+    
+    # Create rootless storage.conf
+    cat > "$ROOTLESS_STORAGE_CONF" << EOF
+[storage]
+driver = "overlay"
+graphroot = "$ROOTLESS_STORAGE_PATH"
+runroot = "/run/user/$REAL_USER_ID/containers"
+EOF
+    
+    # Set ownership of config directory to the real user
+    chown -R "$REAL_USER:$REAL_USER" "$ROOTLESS_CONFIG_DIR"
+    chown -R "$REAL_USER:$REAL_USER" "$ROOTLESS_STORAGE_PATH"
+    
+    echo_info "Rootless Podman storage configured!"
+    echo_info "Config file: $ROOTLESS_STORAGE_CONF"
+fi
+
+# ============================================
+# Step 5: Enable lingering and configure cgroups
+# ============================================
+echo_info "Enabling lingering for rootless podman..."
+
+# Enable lingering so rootless podman works without active login session
+if ! loginctl show-user "$REAL_USER" 2>/dev/null | grep -q "Linger=yes"; then
+    loginctl enable-linger "$REAL_USER"
+    echo_info "Enabled lingering for user $REAL_USER"
+else
+    echo_info "Lingering already enabled for user $REAL_USER"
+fi
+
+# Configure podman to use cgroupfs (more reliable for rootless without full systemd session)
+CONTAINERS_CONF="$ROOTLESS_CONFIG_DIR/containers.conf"
+if [[ ! -f "$CONTAINERS_CONF" ]] || ! grep -q "cgroup_manager" "$CONTAINERS_CONF" 2>/dev/null; then
+    cat >> "$CONTAINERS_CONF" << 'EOF'
+[engine]
+cgroup_manager = "cgroupfs"
+EOF
+    chown "$REAL_USER:$REAL_USER" "$CONTAINERS_CONF"
+    echo_info "Configured cgroupfs as cgroup manager"
+else
+    echo_info "Cgroup manager already configured"
 fi
 
 # ============================================
@@ -149,7 +228,14 @@ echo ""
 echo "Disk status:"
 df -h "$MOUNT_POINT"
 echo ""
-echo "Podman storage:"
+echo "Rootful Podman storage (sudo podman):"
 ls -la "$PODMAN_LINK"
+echo ""
+echo "Rootless Podman storage (podman as $REAL_USER):"
+echo "  Config: $ROOTLESS_STORAGE_CONF"
+echo "  Storage: $ROOTLESS_STORAGE_PATH"
+cat "$ROOTLESS_STORAGE_CONF"
+echo ""
+echo "Verify with: podman info | grep graphRoot"
 echo ""
 echo "You can now run the AutoPatch benchmark!"

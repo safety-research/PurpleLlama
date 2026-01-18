@@ -254,7 +254,13 @@ class ANTHROPIC(LLM):
         temperature: float = DEFAULT_TEMPERATURE,
         top_p: float = DEFAULT_TOP_P,
     ) -> str:
-        raise NotImplementedError("Chat API not implemented yet.")
+        return self.chat_with_system_prompt(
+            system_prompt="",
+            prompt_with_history=prompt_with_history,
+            guided_decode_json_schema=guided_decode_json_schema,
+            temperature=temperature,
+            top_p=top_p,
+        )
 
     @override
     def chat_with_system_prompt(
@@ -265,11 +271,62 @@ class ANTHROPIC(LLM):
         temperature: float = DEFAULT_TEMPERATURE,
         top_p: float = DEFAULT_TOP_P,
     ) -> str:
-        raise NotImplementedError("System prompt not implemented yet.")
+        url = f"{self.BASE_API_URL}/messages"
+        headers = {
+            "x-api-key": f"{self.api_key}",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+        # Convert prompt_with_history to Anthropic message format
+        # Alternating user/assistant messages, starting with user
+        messages = []
+        for i, msg in enumerate(prompt_with_history):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": msg})
+
+        data = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": messages,
+            "temperature": temperature,
+            # Note: Anthropic API doesn't allow both temperature and top_p
+        }
+
+        if system_prompt:
+            data["system"] = system_prompt
+
+        response = requests.post(url, headers=headers, json=data)
+        json_response = response.json()
+
+        # Handle errors
+        if "error" in json_response:
+            error_msg = json_response.get("error", {}).get("message", str(json_response))
+            logging.error(f"Anthropic API error: {error_msg}")
+            return f"FAILED TO QUERY: {error_msg}"
+
+        content = json_response.get("content", [])
+        if not content:
+            logging.info(
+                f"Failed to extract content from Anthropic API response. Response: {json_response}"
+            )
+            return "FAILED TO QUERY: no content in response"
+
+        text_value = content[0].get("text", None)
+        if not text_value:
+            logging.info(
+                f"Failed to extract text from Anthropic API response content. Content: {content}"
+            )
+            return "FAILED TO QUERY: no text in response"
+
+        return text_value
 
     @override
     def valid_models(self) -> list[str]:
         return [
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
             "claude-3-7-sonnet-20250219",
             "claude-3-5-sonnet-20240620",
             "claude-3-5-haiku-20241022",

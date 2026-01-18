@@ -167,6 +167,13 @@ def main(
     )
 
     parser.add_argument(
+        "--confirm-container-cleanup-at-start",
+        action="store_true",
+        default=False,
+        help="Auto-confirm cleanup of stale containers at startup without prompting.",
+    )
+
+    parser.add_argument(
         "--num-queries-per-prompt",
         help="Set the number of queries per prompt. Default value is 1.",
         type=int,
@@ -328,6 +335,20 @@ def main(
     )
 
     benchmark: Benchmark = Benchmark.create_instance(args.benchmark, config)
+
+    # For autopatch benchmark, cleanup stale containers at startup (before any container operations)
+    if args.benchmark == "autopatch":
+        from .arvo_utils import ArvoContainer
+
+        # Use get_event_loop + run_until_complete to avoid closing the loop
+        # (asyncio.run() would close the loop, breaking subsequent get_event_loop() calls)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(
+            ArvoContainer.cleanup_stale_containers(
+                auto_confirm=args.confirm_container_cleanup_at_start
+            )
+        )
 
     if args.use_precomputed_responses:
         # Using precomputed responses require a valid response path.

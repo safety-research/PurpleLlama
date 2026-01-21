@@ -1210,7 +1210,7 @@ class ArvoContainer:
         get_stacktraces = await self.exec_command(
             cmd_args=cmd_args,
             env_vars={
-                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/out:/usr/local/lldb13/bin",
+                "PATH": "/usr/local/python37/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/out:/usr/local/lldb13/bin",
                 "ASAN_OPTIONS": "detect_leaks=0",  # Disable LeakSanitizer in ASan-instrumented programs
                 "LSAN_OPTIONS": "detect_leaks=0",  # Disable LeakSanitizer when using LSan standalone
             },
@@ -1347,7 +1347,7 @@ class ArvoContainer:
         get_noisy_config = await self.exec_command(
             cmd_args=cmd_args,
             env_vars={
-                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/out:/usr/local/lldb13/bin",
+                "PATH": "/usr/local/python37/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/out:/usr/local/lldb13/bin",
                 "ASAN_OPTIONS": "detect_leaks=0",  # Disable LeakSanitizer in ASan-instrumented programs
                 "LSAN_OPTIONS": "detect_leaks=0",  # Disable LeakSanitizer when using LSan standalone
             },
@@ -1394,7 +1394,7 @@ class ArvoContainer:
             get_delta = await self.exec_command(
                 cmd_args=cmd_args,
                 env_vars={
-                    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/out:/usr/local/lldb13/bin",
+                    "PATH": "/usr/local/python37/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/out:/usr/local/lldb13/bin",
                     "ASAN_OPTIONS": "detect_leaks=0",  # Disable LeakSanitizer in ASan-instrumented programs
                     "LSAN_OPTIONS": "detect_leaks=0",  # Disable LeakSanitizer when using LSan standalone
                 },

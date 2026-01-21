@@ -83,19 +83,44 @@ else
     echo_info "Mounted successfully!"
 fi
 
-# Add to fstab if not already there
+# Add/update fstab entry
+UUID=$(blkid -s UUID -o value "$DEVICE")
+FS_TYPE=$(blkid -s TYPE -o value "$DEVICE")
+
 if grep -q "$MOUNT_POINT" /etc/fstab; then
-    echo_info "fstab entry already exists"
+    # Check if the UUID matches
+    if grep -q "UUID=$UUID" /etc/fstab; then
+        echo_info "fstab entry already exists with correct UUID"
+    else
+        echo_warn "fstab entry exists but UUID doesn't match - updating..."
+        # Remove old entry and add new one
+        sed -i "\|$MOUNT_POINT|d" /etc/fstab
+        echo "UUID=$UUID $MOUNT_POINT $FS_TYPE discard,defaults,nofail 0 2" >> /etc/fstab
+        echo_info "Updated fstab with correct UUID: $UUID"
+    fi
 else
     echo_info "Adding entry to /etc/fstab for persistence..."
-    UUID=$(blkid -s UUID -o value "$DEVICE")
-    echo "UUID=$UUID $MOUNT_POINT ext4 discard,defaults,nofail 0 2" >> /etc/fstab
+    echo "UUID=$UUID $MOUNT_POINT $FS_TYPE discard,defaults,nofail 0 2" >> /etc/fstab
     echo_info "Added to /etc/fstab"
 fi
 
 # Set ownership to the user who invoked sudo
 REAL_USER=${SUDO_USER:-$USER}
-chown -R "$REAL_USER:$REAL_USER" "$MOUNT_POINT"
+REAL_USER_ID=$(id -u "$REAL_USER")
+REAL_GROUP_ID=$(id -g "$REAL_USER")
+
+# Only set ownership on the mount point directory itself (not recursive).
+# This is fast and allows the user to access the directory.
+# Subdirectories (like Podman storage) will be handled separately.
+# If disk was already set up with the same UID (e.g., remounting on another GCP instance
+# with the same username), this will be a no-op or quick update.
+CURRENT_OWNER=$(stat -c '%u' "$MOUNT_POINT")
+if [[ "$CURRENT_OWNER" != "$REAL_USER_ID" ]]; then
+    echo_info "Setting ownership of $MOUNT_POINT to $REAL_USER (not recursive)..."
+    chown "$REAL_USER:$REAL_USER" "$MOUNT_POINT"
+else
+    echo_info "Mount point $MOUNT_POINT already owned by UID $REAL_USER_ID"
+fi
 
 # ============================================
 # Step 3: Setup Podman storage (rootful)
@@ -132,8 +157,14 @@ else
         echo_info "Created symlink: $PODMAN_LINK -> $PODMAN_STORAGE"
     fi
     
-    # Set ownership
-    chown -R "$REAL_USER:$REAL_USER" "$PODMAN_STORAGE"
+    # Set ownership only if needed (check if directory is new or has wrong owner)
+    STORAGE_OWNER=$(stat -c '%u' "$PODMAN_STORAGE" 2>/dev/null || echo "0")
+    if [[ "$STORAGE_OWNER" != "$REAL_USER_ID" ]]; then
+        echo_info "Setting ownership of $PODMAN_STORAGE..."
+        chown -R "$REAL_USER:$REAL_USER" "$PODMAN_STORAGE"
+    else
+        echo_info "Podman storage $PODMAN_STORAGE already has correct ownership"
+    fi
     
     echo_info "Rootful Podman storage configured!"
 fi
@@ -145,10 +176,10 @@ echo_info "Checking rootless Podman storage configuration..."
 
 # Get the real user's home directory
 REAL_USER_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
-REAL_USER_ID=$(id -u "$REAL_USER")
 ROOTLESS_CONFIG_DIR="$REAL_USER_HOME/.config/containers"
 ROOTLESS_STORAGE_CONF="$ROOTLESS_CONFIG_DIR/storage.conf"
 ROOTLESS_STORAGE_PATH="$PODMAN_STORAGE/storage"
+ROOTLESS_RUN_PATH="$PODMAN_STORAGE/run"
 
 # Check if rootless storage is already configured correctly
 if [[ -f "$ROOTLESS_STORAGE_CONF" ]] && grep -q "graphroot = \"$ROOTLESS_STORAGE_PATH\"" "$ROOTLESS_STORAGE_CONF" 2>/dev/null; then
@@ -163,29 +194,37 @@ else
         rm -rf "$ROOTLESS_LOCAL_STORAGE"
     fi
     
-    # Clean up any stale lock files
+    # Clean up any stale lock files in tmpfs
     rm -rf /run/libpod 2>/dev/null || true
     rm -rf /run/containers 2>/dev/null || true
     rm -rf "/run/user/$REAL_USER_ID/libpod" 2>/dev/null || true
+    rm -rf "/run/user/$REAL_USER_ID/containers" 2>/dev/null || true
     
     # Create storage directories
     mkdir -p "$ROOTLESS_STORAGE_PATH"
-    mkdir -p "/run/user/$REAL_USER_ID/containers"
+    mkdir -p "$ROOTLESS_RUN_PATH"
     
     # Create config directory
     mkdir -p "$ROOTLESS_CONFIG_DIR"
     
-    # Create rootless storage.conf
+    # Create rootless storage.conf with fuse-overlayfs (required for rootless overlay on ext4)
+    # Note: runroot is on /data (persistent) instead of tmpfs to avoid permission issues
     cat > "$ROOTLESS_STORAGE_CONF" << EOF
 [storage]
 driver = "overlay"
 graphroot = "$ROOTLESS_STORAGE_PATH"
-runroot = "/run/user/$REAL_USER_ID/containers"
+runroot = "$ROOTLESS_RUN_PATH"
+
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"
 EOF
     
     # Set ownership of config directory to the real user
     chown -R "$REAL_USER:$REAL_USER" "$ROOTLESS_CONFIG_DIR"
+    
+    # Set ownership of storage directories
     chown -R "$REAL_USER:$REAL_USER" "$ROOTLESS_STORAGE_PATH"
+    chown -R "$REAL_USER:$REAL_USER" "$ROOTLESS_RUN_PATH"
     
     echo_info "Rootless Podman storage configured!"
     echo_info "Config file: $ROOTLESS_STORAGE_CONF"
@@ -218,6 +257,28 @@ else
 fi
 
 # ============================================
+# Step 6: Verify podman works
+# ============================================
+echo_info "Verifying podman configuration..."
+
+# Test podman as the real user
+if sudo -u "$REAL_USER" podman info &>/dev/null; then
+    echo_info "Podman is working correctly!"
+else
+    echo_warn "Podman verification failed. Attempting to reset storage..."
+    # Clear and recreate storage if verification fails
+    rm -rf "$ROOTLESS_STORAGE_PATH"/* "$ROOTLESS_RUN_PATH"/* 2>/dev/null || true
+    mkdir -p "$ROOTLESS_STORAGE_PATH" "$ROOTLESS_RUN_PATH"
+    chown -R "$REAL_USER:$REAL_USER" "$ROOTLESS_STORAGE_PATH" "$ROOTLESS_RUN_PATH"
+    
+    if sudo -u "$REAL_USER" podman info &>/dev/null; then
+        echo_info "Podman is now working after storage reset!"
+    else
+        echo_error "Podman still not working. Check: sudo -u $REAL_USER podman info"
+    fi
+fi
+
+# ============================================
 # Summary
 # ============================================
 echo ""
@@ -228,14 +289,19 @@ echo ""
 echo "Disk status:"
 df -h "$MOUNT_POINT"
 echo ""
+echo "Mount verification:"
+mount | grep "$DEVICE" || echo_warn "Device not shown in mount output!"
+echo ""
 echo "Rootful Podman storage (sudo podman):"
 ls -la "$PODMAN_LINK"
 echo ""
 echo "Rootless Podman storage (podman as $REAL_USER):"
 echo "  Config: $ROOTLESS_STORAGE_CONF"
 echo "  Storage: $ROOTLESS_STORAGE_PATH"
+echo "  Runroot: $ROOTLESS_RUN_PATH"
 cat "$ROOTLESS_STORAGE_CONF"
 echo ""
-echo "Verify with: podman info | grep graphRoot"
+echo "Podman graphRoot:"
+sudo -u "$REAL_USER" podman info 2>/dev/null | grep graphRoot || echo_warn "Could not get podman info"
 echo ""
 echo "You can now run the AutoPatch benchmark!"

@@ -10,7 +10,7 @@ import sys
 
 try:
     from . import lib_dump  # Relative import for when part of a package
-except ImportError:
+except (ImportError, SystemError):
     # pyre-ignore[21]: Could not find a module corresponding to import `lib_dump`
     import lib_dump  # @manual Absolute import for when running as a standalone script (e.g. in containers)
 

@@ -123,10 +123,11 @@ fi
 echo "Python source downloaded"
 
 # ==========================================
-# Extract libstdc++.so.6 from Ubuntu 20.04
+# Extract libstdc++.so.6 and libxml2.so.2 from Ubuntu 20.04
 # LLDB needs GLIBCXX_3.4.22+ but Ubuntu 16.04 only has 3.4.21
+# LLDB also needs libxml2.so.2 at runtime
 # ==========================================
-echo "=== Extracting libstdc++.so.6 from Ubuntu 20.04 ==="
+echo "=== Extracting shared libraries from Ubuntu 20.04 ==="
 cd "$BUILD_DIR/shared"
 
 podman pull docker.io/library/ubuntu:20.04 >/dev/null 2>&1
@@ -135,6 +136,23 @@ podman run --rm docker.io/library/ubuntu:20.04 cat /usr/lib/x86_64-linux-gnu/lib
 echo "Extracted libstdc++.so.6 ($(ls -lh libstdc++.so.6 | awk '{print $5}'))"
 echo "GLIBCXX versions available:"
 strings libstdc++.so.6 | grep GLIBCXX | sort -V | tail -3
+
+# Extract lldb runtime dependencies (libxml2 and libicu)
+echo "=== Extracting lldb runtime dependencies from Ubuntu 20.04 ==="
+# Use a volume mount to extract the files properly
+rm -f libxml2.so.2 libicuuc.so.66 libicudata.so.66
+podman run --rm -v "$BUILD_DIR/shared:/output" docker.io/library/ubuntu:20.04 bash -c "
+    apt-get update -qq && 
+    apt-get install -y -qq libxml2 && 
+    cp /usr/lib/x86_64-linux-gnu/libxml2.so.2 /output/libxml2.so.2 &&
+    cp /usr/lib/x86_64-linux-gnu/libicuuc.so.66 /output/libicuuc.so.66 &&
+    cp /usr/lib/x86_64-linux-gnu/libicudata.so.66 /output/libicudata.so.66
+"
+echo "Extracted libxml2.so.2 ($(ls -lh libxml2.so.2 | awk '{print $5}'))"
+echo "Extracted libicuuc.so.66 ($(ls -lh libicuuc.so.66 | awk '{print $5}'))"
+echo "Extracted libicudata.so.66 ($(ls -lh libicudata.so.66 | awk '{print $5}'))"
+# Verify they are valid ELF files
+file libxml2.so.2 libicuuc.so.66 libicudata.so.66 || true
 
 # ==========================================
 # Build for Ubuntu 16.04
@@ -325,6 +343,12 @@ cp -r "$LLDB_16_04_DIR" 16.04/rootfs/usr/local/lldb13
 echo "Installing libstdc++.so.6 from Ubuntu 20.04..."
 mkdir -p 16.04/rootfs/usr/local/lldb13/lib
 cp "$BUILD_DIR/shared/libstdc++.so.6" 16.04/rootfs/usr/local/lldb13/lib/
+
+# Copy lldb runtime dependencies (not all ARVO containers have these)
+echo "Installing libxml2.so.2, libicuuc.so.66, libicudata.so.66..."
+cp "$BUILD_DIR/shared/libxml2.so.2" 16.04/rootfs/usr/local/lldb13/lib/
+cp "$BUILD_DIR/shared/libicuuc.so.66" 16.04/rootfs/usr/local/lldb13/lib/
+cp "$BUILD_DIR/shared/libicudata.so.66" 16.04/rootfs/usr/local/lldb13/lib/
 
 # Install Python from Ubuntu 16.04 build
 echo "Installing Python ${PYTHON_VERSION}..."
@@ -566,6 +590,12 @@ cp -r "$LLDB_20_04_DIR" 20.04/rootfs/usr/local/lldb13
 echo "Installing libstdc++.so.6 from Ubuntu 20.04..."
 mkdir -p 20.04/rootfs/usr/local/lldb13/lib
 cp "$BUILD_DIR/shared/libstdc++.so.6" 20.04/rootfs/usr/local/lldb13/lib/
+
+# Copy lldb runtime dependencies (not all ARVO containers have these)
+echo "Installing libxml2.so.2, libicuuc.so.66, libicudata.so.66..."
+cp "$BUILD_DIR/shared/libxml2.so.2" 20.04/rootfs/usr/local/lldb13/lib/
+cp "$BUILD_DIR/shared/libicuuc.so.66" 20.04/rootfs/usr/local/lldb13/lib/
+cp "$BUILD_DIR/shared/libicudata.so.66" 20.04/rootfs/usr/local/lldb13/lib/
 
 # Install Python from Ubuntu 20.04 build
 echo "Installing Python ${PYTHON_VERSION}..."

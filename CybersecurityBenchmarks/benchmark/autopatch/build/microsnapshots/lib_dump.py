@@ -546,6 +546,9 @@ def extract_stacktraces(args: Arguments) -> List[Tuple[str, ...]]:
         config.args = [inp]
         stacktraces = dump_stacktrace(Path(args.binary_orig), config)
         for st in stacktraces:
+            # Skip timeout entries which are dicts, not lists
+            if isinstance(st, dict) and st.get("desc") == "TIMEOUT":
+                continue
             all_stacktraces.add(tuple(cast(List[str], st)[::-1]))
     return list(all_stacktraces)
 

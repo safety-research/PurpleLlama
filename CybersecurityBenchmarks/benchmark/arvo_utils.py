@@ -980,6 +980,7 @@ class ArvoContainer:
         combine_outputs: bool = False,
         env_vars: Optional[MutableMapping[str, str]] = None,
         workdir: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> CompletedProcess[bytes]:
         exec_cmd_args = [
             "podman",  # Use podman instead of docker to allow for use on devservers
@@ -1004,7 +1005,22 @@ class ArvoContainer:
             stdout=asyncio.subprocess.PIPE,
             stderr=stderr,
         )
-        stdout, stderr = await result.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                result.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            self.logger.error(
+                f"Command `{cmd_str}` timed out after {timeout} seconds. Killing process."
+            )
+            result.kill()
+            await result.wait()
+            return CompletedProcess(
+                exec_cmd_args,
+                -1,
+                b"",
+                f"Command timed out after {timeout} seconds".encode(),
+            )
         returncode = result.returncode if result.returncode is not None else -1
         self.logger.debug(
             f"Command `{cmd_str}` executed with return code: {returncode}."
@@ -1292,13 +1308,29 @@ class ArvoContainer:
         self.logger.debug("Obtaining stacktraces for differential debugging")
 
         try:
-            gt_patches = [self.get_groundtruth_bps()[0]]
+            # Iterate through all ground truth breakpoints to find one that gets hit
+            all_gt_bps = self.get_groundtruth_bps()
+            ground_truth_stacktraces = []
+            binary_filepath = await self.get_binary_filepath()
 
-            ground_truth_stacktraces = await self.get_stacktraces(
-                "ground_truth", await self.get_binary_filepath(), gt_patches
-            )
+            for i, gt_bp in enumerate(all_gt_bps):
+                self.logger.debug(
+                    f"Trying ground truth breakpoint {i + 1}/{len(all_gt_bps)}: {gt_bp}"
+                )
+                ground_truth_stacktraces = await self.get_stacktraces(
+                    f"ground_truth_{i}", binary_filepath, [gt_bp]
+                )
+                if len(ground_truth_stacktraces) > 0:
+                    self.logger.debug(f"Found stacktraces using breakpoint: {gt_bp}")
+                    break
+                self.logger.debug(
+                    f"No stacktraces from breakpoint {gt_bp}, trying next..."
+                )
+
             if len(ground_truth_stacktraces) == 0:
-                self.logger.error("No ground truth stacktraces found")
+                self.logger.error(
+                    f"No ground truth stacktraces found from any of {len(all_gt_bps)} breakpoints: {all_gt_bps}"
+                )
                 raise Exception("No ground truth stacktraces found")
 
             llm_stacktraces = await self.get_stacktraces(

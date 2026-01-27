@@ -166,10 +166,32 @@ class AutoPatchingBenchmark(Benchmark):
     ) -> None:
         super().__init__(config)
         ArvoContainer.set_container_repository(config.container_repository)
+        # Set output directory for build logs
+        output_dir = config.output_dir or config.response_path.parent
+        ArvoContainer.set_output_dir(output_dir)
         prompt_path = config.prompt_path
-        assert prompt_path is not None, "Prompt path must be provided."
+
+        # Detect precomputed responses mode: no LLMs specified AND response file exists
+        use_precomputed_responses = (
+            len(config.llms_under_test) == 0
+            and config.response_path.exists()
+        )
+
+        # Determine which test cases need containers
+        if use_precomputed_responses:
+            # Only build containers for ARVO IDs that have existing LLM responses
+            test_cases = self._get_test_cases_with_precomputed_responses(
+                config.response_path
+            )
+            logging.info(
+                f"Using precomputed responses: building containers for {len(test_cases)} ARVO IDs with existing responses"
+            )
+        else:
+            assert prompt_path is not None, "Prompt path must be provided."
+            test_cases = self._get_test_cases(config.num_test_cases, Path(prompt_path))
+
         self.images_available: list[int] = ArvoContainer.build_container_images(
-            self._get_test_cases(config.num_test_cases, Path(prompt_path)),
+            test_cases,
             config.max_concurrency,
             AutoPatchingBenchmark.get_log_level(),
         )
@@ -197,6 +219,30 @@ class AutoPatchingBenchmark(Benchmark):
         """
         numbers = json.loads(dataset_path.read_text())
         return numbers[:num_test_cases] if num_test_cases > 0 else numbers
+
+    @staticmethod
+    def _get_test_cases_with_precomputed_responses(response_path: Path) -> list[int]:
+        """
+        Get the list of ARVO IDs that have existing LLM responses.
+        Used when --use-precomputed-responses is enabled to avoid building
+        containers for cases that don't have responses to evaluate.
+        """
+        if not response_path.exists():
+            logging.warning(
+                f"Response file {response_path} does not exist. No containers will be built."
+            )
+            return []
+
+        responses = json.loads(response_path.read_text())
+        # Extract unique ARVO IDs from responses
+        arvo_ids = list(
+            set(
+                response[AutoPatchingBenchmark.RESPONSES_ARVO_CHALLENGE_NUMBER_KEY]
+                for response in responses
+                if AutoPatchingBenchmark.RESPONSES_ARVO_CHALLENGE_NUMBER_KEY in response
+            )
+        )
+        return sorted(arvo_ids)
 
     def _get_output_dir(self, case_id: int, model_name: str) -> Path:
         out_dir = self.response_path.parent / "files" / f"case_{case_id}" / model_name
@@ -778,6 +824,21 @@ class AutoPatchingBenchmark(Benchmark):
                         f"[EVAL] Skipping duplicate response for ARVO #{arvo_id} with model {model}"
                     )
             model_responses = unique_model_responses
+
+            # Filter out responses for ARVO IDs that don't have container images
+            available_ids = set(self.images_available)
+            filtered_responses = []
+            for response in model_responses:
+                arvo_id = response.get(
+                    AutoPatchingBenchmark.RESPONSES_ARVO_CHALLENGE_NUMBER_KEY
+                )
+                if arvo_id in available_ids:
+                    filtered_responses.append(response)
+                else:
+                    logging.warning(
+                        f"[EVAL] Skipping ARVO #{arvo_id} - container image not available"
+                    )
+            model_responses = filtered_responses
 
             # Limit test cases if specified
             if num_test_cases > 0:

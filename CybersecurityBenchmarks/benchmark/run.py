@@ -57,6 +57,10 @@ def validate_arguments(parser: argparse.ArgumentParser) -> argparse.Namespace:
                 "The following argument is required: --llm-under-test, unless argument --use-precomputed-responses is specified."
             )
 
+    # Require either --response-path or --output-dir
+    if args.response_path is None and args.output_dir is None:
+        parser.error("Either --response-path or --output-dir must be specified.")
+
     return args
 
 
@@ -103,9 +107,9 @@ def main(
 
     parser.add_argument(
         "--response-path",
-        help="The under-test LLM(s) would store their responses in this file. This argument works for benchmarks: autocomplete, instruct, mitre.",
+        help="The under-test LLM(s) would store their responses in this file. This argument works for benchmarks: autocomplete, instruct, mitre. Not required if --output-dir is specified.",
         default=default_response_path,
-        required=default_response_path is None,
+        required=False,  # Will be validated later (required unless --output-dir is set)
     )
 
     parser.add_argument(
@@ -264,6 +268,13 @@ def main(
     )
 
     parser.add_argument(
+        "--output-dir",
+        type=str,
+        help="Output directory for benchmark results. When specified, response_path, stat_path, and judge_response_path will be derived from this directory.",
+        default=None,
+    )
+
+    parser.add_argument(
         "--input-modality",
         type=str,
         help="Optional keyword to specify the input modality/modialities for the benchmark. Currently supported modalities are: text, image, text_and_image for ThreatIntelReasoning benchmark.",
@@ -287,10 +298,20 @@ def main(
             for specification in args.llm_under_test
         ]
 
-    stat_response_path = Path(args.stat_path) if args.stat_path else None
-    judge_response_path = (
-        Path(args.judge_response_path) if args.judge_response_path else None
-    )
+    # Derive paths from output_dir if specified, otherwise use individual paths
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        response_path = output_dir / "responses.json"
+        stat_response_path = output_dir / "stats.json"
+        judge_response_path = output_dir / "judge_responses.json"
+    else:
+        response_path = Path(args.response_path)
+        stat_response_path = Path(args.stat_path) if args.stat_path else None
+        judge_response_path = (
+            Path(args.judge_response_path) if args.judge_response_path else None
+        )
+
     if args.judge_llm:
         judge_llm = default_llm_creator(args.judge_llm, 2048, None)
     if args.expansion_llm:
@@ -317,7 +338,7 @@ def main(
         llms_under_test=materialized_llms_under_test,
         judge_llm=judge_llm,
         expansion_llm=expansion_llm,
-        response_path=Path(args.response_path),
+        response_path=response_path,
         judge_prompt_path=judge_prompt_path,
         judge_response_path=judge_response_path,
         stat_path=stat_response_path,
@@ -332,6 +353,7 @@ def main(
         max_concurrency=args.run_llm_in_parallel,
         truncate_input=args.truncate_input,
         input_modality=args.input_modality,
+        output_dir=output_dir,
     )
 
     benchmark: Benchmark = Benchmark.create_instance(args.benchmark, config)
@@ -351,12 +373,30 @@ def main(
         )
 
     if args.use_precomputed_responses:
-        # Using precomputed responses require a valid response path.
-        response_path = Path(args.response_path)
-        if not response_path.exists():
+        # Using precomputed responses - determine where to read them from
+        if args.response_path:
+            precomputed_path = Path(args.response_path)
+        elif args.output_dir:
+            precomputed_path = Path(args.output_dir) / "responses.json"
+        else:
             raise ValueError(
-                f"Please provide valid path for responses. This path does not exist: {response_path}"
+                "When using --use-precomputed-responses, specify --response-path or --output-dir"
             )
+        if not precomputed_path.exists():
+            raise ValueError(
+                f"Precomputed responses file does not exist: {precomputed_path}"
+            )
+        # Copy precomputed responses to output_dir if they're from a different location
+        if args.output_dir:
+            output_response_path = Path(args.output_dir) / "responses.json"
+            if precomputed_path.resolve() != output_response_path.resolve():
+                import shutil
+
+                output_response_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(precomputed_path, output_response_path)
+                LOG.info(
+                    f"Copied precomputed responses from {precomputed_path} to {output_response_path}"
+                )
         LOG.info("Skipping LLM query and using precomputed response.")
     else:
         # If we are not using precomputed responses, then we require a valid prompt path.

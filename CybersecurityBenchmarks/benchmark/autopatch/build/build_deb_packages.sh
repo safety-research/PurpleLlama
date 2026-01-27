@@ -137,22 +137,39 @@ echo "Extracted libstdc++.so.6 ($(ls -lh libstdc++.so.6 | awk '{print $5}'))"
 echo "GLIBCXX versions available:"
 strings libstdc++.so.6 | grep GLIBCXX | sort -V | tail -3
 
-# Extract lldb runtime dependencies (libxml2 and libicu)
+# Extract lldb runtime dependencies for EACH Ubuntu version separately
+# This ensures GLIBC compatibility (16.04 has GLIBC 2.23, 20.04 has GLIBC 2.31)
+
 echo "=== Extracting lldb runtime dependencies from Ubuntu 20.04 ==="
-# Use a volume mount to extract the files properly
-rm -f libxml2.so.2 libicuuc.so.66 libicudata.so.66
-podman run --rm -v "$BUILD_DIR/shared:/output" docker.io/library/ubuntu:20.04 bash -c "
+mkdir -p "$BUILD_DIR/shared/20.04-libs"
+podman run --rm -v "$BUILD_DIR/shared/20.04-libs:/output" docker.io/library/ubuntu:20.04 bash -c "
     apt-get update -qq && 
-    apt-get install -y -qq libxml2 && 
+    apt-get install -y -qq libxml2 libncurses6 && 
     cp /usr/lib/x86_64-linux-gnu/libxml2.so.2 /output/libxml2.so.2 &&
     cp /usr/lib/x86_64-linux-gnu/libicuuc.so.66 /output/libicuuc.so.66 &&
-    cp /usr/lib/x86_64-linux-gnu/libicudata.so.66 /output/libicudata.so.66
+    cp /usr/lib/x86_64-linux-gnu/libicudata.so.66 /output/libicudata.so.66 &&
+    cp /lib/x86_64-linux-gnu/libtinfo.so.6 /output/libtinfo.so.6
 "
-echo "Extracted libxml2.so.2 ($(ls -lh libxml2.so.2 | awk '{print $5}'))"
-echo "Extracted libicuuc.so.66 ($(ls -lh libicuuc.so.66 | awk '{print $5}'))"
-echo "Extracted libicudata.so.66 ($(ls -lh libicudata.so.66 | awk '{print $5}'))"
+echo "Extracted 20.04 libs:"
+ls -lh "$BUILD_DIR/shared/20.04-libs/"
+
+echo "=== Extracting lldb runtime dependencies from Ubuntu 16.04 ==="
+mkdir -p "$BUILD_DIR/shared/16.04-libs"
+podman run --rm -v "$BUILD_DIR/shared/16.04-libs:/output" docker.io/library/ubuntu:16.04 bash -c "
+    apt-get update -qq && 
+    apt-get install -y -qq libxml2 libncurses5 libicu55 && 
+    cp /usr/lib/x86_64-linux-gnu/libxml2.so.2 /output/libxml2.so.2 &&
+    cp /usr/lib/x86_64-linux-gnu/libicuuc.so.55 /output/libicuuc.so.55 &&
+    cp /usr/lib/x86_64-linux-gnu/libicudata.so.55 /output/libicudata.so.55 &&
+    cp /lib/x86_64-linux-gnu/libtinfo.so.5 /output/libtinfo.so.5
+"
+echo "Extracted 16.04 libs:"
+ls -lh "$BUILD_DIR/shared/16.04-libs/"
+
 # Verify they are valid ELF files
-file libxml2.so.2 libicuuc.so.66 libicudata.so.66 || true
+echo "=== Verifying extracted libraries ==="
+file "$BUILD_DIR/shared/20.04-libs"/* || true
+file "$BUILD_DIR/shared/16.04-libs"/* || true
 
 # ==========================================
 # Build for Ubuntu 16.04
@@ -221,10 +238,13 @@ podman run --rm \
     docker.io/library/ubuntu:16.04 bash -c "
     set -e
     export DEBIAN_FRONTEND=noninteractive
+    export TZ=Etc/UTC
+    ln -snf /usr/share/zoneinfo/\$TZ /etc/localtime && echo \$TZ > /etc/timezone
     
     echo 'Installing LLDB build dependencies...'
     apt-get update -qq
-    apt-get install -y -qq build-essential ninja-build swig \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        build-essential ninja-build swig \
         libncurses5-dev libedit-dev libxml2-dev python3-dev \
         zlib1g-dev liblzma-dev wget curl libssl-dev software-properties-common
     
@@ -289,10 +309,16 @@ podman run --rm \
     /usr/local/python37/bin/python3.7 --version || echo 'WARNING: Python test failed'
     
     echo 'Configuring LLDB with CMake...'
+    # RPATH bakes library search paths into the binary so lldb finds its deps without LD_LIBRARY_PATH
+    # --disable-new-dtags forces RPATH (searched before LD_LIBRARY_PATH) instead of RUNPATH
     /usr/local/bin/cmake -G Ninja ../llvm \
         -DCMAKE_BUILD_TYPE=Release \
         -DLLVM_ENABLE_PROJECTS='clang;lldb' \
         -DCMAKE_INSTALL_PREFIX=/usr/local/lldb13 \
+        -DCMAKE_INSTALL_RPATH='/usr/local/lldb13/lib:/usr/local/python37/lib' \
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+        -DCMAKE_EXE_LINKER_FLAGS='-Wl,--disable-new-dtags' \
+        -DCMAKE_SHARED_LINKER_FLAGS='-Wl,--disable-new-dtags' \
         -DLLDB_ENABLE_PYTHON=ON \
         -DPython3_EXECUTABLE=/usr/local/python37/bin/python3.7 \
         -DPython3_LIBRARY=/usr/local/python37/lib/libpython3.7m.so \
@@ -344,11 +370,18 @@ echo "Installing libstdc++.so.6 from Ubuntu 20.04..."
 mkdir -p 16.04/rootfs/usr/local/lldb13/lib
 cp "$BUILD_DIR/shared/libstdc++.so.6" 16.04/rootfs/usr/local/lldb13/lib/
 
-# Copy lldb runtime dependencies (not all ARVO containers have these)
-echo "Installing libxml2.so.2, libicuuc.so.66, libicudata.so.66..."
-cp "$BUILD_DIR/shared/libxml2.so.2" 16.04/rootfs/usr/local/lldb13/lib/
-cp "$BUILD_DIR/shared/libicuuc.so.66" 16.04/rootfs/usr/local/lldb13/lib/
-cp "$BUILD_DIR/shared/libicudata.so.66" 16.04/rootfs/usr/local/lldb13/lib/
+# Copy lldb runtime dependencies from Ubuntu 16.04 (GLIBC 2.23 compatible)
+echo "Installing Ubuntu 16.04 compatible libs: libxml2.so.2, libicuuc.so.55, libicudata.so.55, libtinfo.so.5..."
+cp "$BUILD_DIR/shared/16.04-libs/libxml2.so.2" 16.04/rootfs/usr/local/lldb13/lib/
+cp "$BUILD_DIR/shared/16.04-libs/libicuuc.so.55" 16.04/rootfs/usr/local/lldb13/lib/
+cp "$BUILD_DIR/shared/16.04-libs/libicudata.so.55" 16.04/rootfs/usr/local/lldb13/lib/
+cp "$BUILD_DIR/shared/16.04-libs/libtinfo.so.5" 16.04/rootfs/usr/local/lldb13/lib/
+# Create symlinks for library version compatibility (in case lldb looks for different versions)
+cd 16.04/rootfs/usr/local/lldb13/lib/
+ln -sf libicuuc.so.55 libicuuc.so
+ln -sf libicudata.so.55 libicudata.so
+ln -sf libtinfo.so.5 libtinfo.so
+cd "$BUILD_DIR"
 
 # Install Python from Ubuntu 16.04 build
 echo "Installing Python ${PYTHON_VERSION}..."
@@ -359,7 +392,8 @@ cp -r "$PYTHON_16_04_DIR"/* 16.04/rootfs/usr/local/python37/
 mkdir -p 16.04/rootfs/usr/bin
 ln -sf /usr/local/python37/bin/python3.7 16.04/rootfs/usr/bin/python3.7
 
-# Create LLDB symlink (already has LD_LIBRARY_PATH set via ldconfig)
+# Create symlinks to LLDB (RPATH is baked into binary, no wrapper needed)
+mkdir -p 16.04/rootfs/usr/bin
 ln -sf /usr/local/lldb13/bin/lldb 16.04/rootfs/usr/bin/lldb
 ln -sf /usr/local/lldb13/bin/lldb 16.04/rootfs/usr/bin/lldb-13
 
@@ -376,16 +410,19 @@ else
     find 16.04/rootfs/usr/local/lldb13 -name "*lldb*.py" | head -5 || true
 fi
 
-# Create ldconfig entry for shared libraries
+# Create ldconfig entry for Python shared libraries ONLY
+# LLDB has RPATH baked in so it finds its libs in /usr/local/lldb13/lib automatically
 mkdir -p 16.04/rootfs/etc/ld.so.conf.d
 echo "/usr/local/python37/lib" > 16.04/rootfs/etc/ld.so.conf.d/python37.conf
-echo "/usr/local/lldb13/lib" >> 16.04/rootfs/etc/ld.so.conf.d/lldb13.conf
+# NOTE: We do NOT add /usr/local/lldb13/lib to ldconfig to avoid polluting
+# the global library namespace and breaking other tools.
 
-# Set up environment for LLDB Python bindings
+# Set up environment for PYTHONPATH (LLDB uses RPATH for its library deps)
 mkdir -p 16.04/rootfs/etc/profile.d
 cat > 16.04/rootfs/etc/profile.d/lldb-python.sh << 'ENVEOF'
+# LLDB library paths are baked in via RPATH at compile time
+# Only PYTHONPATH needs to be set for Python imports
 export PYTHONPATH="/usr/local/lldb13/lib/python3.7/site-packages:$PYTHONPATH"
-export LD_LIBRARY_PATH="/usr/local/lldb13/lib:/usr/local/python37/lib:$LD_LIBRARY_PATH"
 ENVEOF
 chmod 644 16.04/rootfs/etc/profile.d/lldb-python.sh
 
@@ -513,10 +550,13 @@ podman run --rm \
     docker.io/library/ubuntu:20.04 bash -c "
     set -e
     export DEBIAN_FRONTEND=noninteractive
+    export TZ=Etc/UTC
+    ln -snf /usr/share/zoneinfo/\$TZ /etc/localtime && echo \$TZ > /etc/timezone
     
     echo 'Installing LLDB build dependencies...'
     apt-get update -qq
-    apt-get install -y -qq build-essential cmake ninja-build swig \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        build-essential cmake ninja-build swig \
         libncurses5-dev libedit-dev libxml2-dev python3-dev \
         zlib1g-dev liblzma-dev wget curl
     
@@ -536,10 +576,16 @@ podman run --rm \
     /usr/local/python37/bin/python3.7 --version || echo 'WARNING: Python test failed'
     
     echo 'Configuring LLDB with CMake...'
+    # RPATH bakes library search paths into the binary so lldb finds its deps without LD_LIBRARY_PATH
+    # --disable-new-dtags forces RPATH (searched before LD_LIBRARY_PATH) instead of RUNPATH
     cmake -G Ninja ../llvm \
         -DCMAKE_BUILD_TYPE=Release \
         -DLLVM_ENABLE_PROJECTS='clang;lldb' \
         -DCMAKE_INSTALL_PREFIX=/usr/local/lldb13 \
+        -DCMAKE_INSTALL_RPATH='/usr/local/lldb13/lib:/usr/local/python37/lib' \
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+        -DCMAKE_EXE_LINKER_FLAGS='-Wl,--disable-new-dtags' \
+        -DCMAKE_SHARED_LINKER_FLAGS='-Wl,--disable-new-dtags' \
         -DLLDB_ENABLE_PYTHON=ON \
         -DPython3_EXECUTABLE=/usr/local/python37/bin/python3.7 \
         -DPython3_LIBRARY=/usr/local/python37/lib/libpython3.7m.so \
@@ -591,11 +637,12 @@ echo "Installing libstdc++.so.6 from Ubuntu 20.04..."
 mkdir -p 20.04/rootfs/usr/local/lldb13/lib
 cp "$BUILD_DIR/shared/libstdc++.so.6" 20.04/rootfs/usr/local/lldb13/lib/
 
-# Copy lldb runtime dependencies (not all ARVO containers have these)
-echo "Installing libxml2.so.2, libicuuc.so.66, libicudata.so.66..."
-cp "$BUILD_DIR/shared/libxml2.so.2" 20.04/rootfs/usr/local/lldb13/lib/
-cp "$BUILD_DIR/shared/libicuuc.so.66" 20.04/rootfs/usr/local/lldb13/lib/
-cp "$BUILD_DIR/shared/libicudata.so.66" 20.04/rootfs/usr/local/lldb13/lib/
+# Copy lldb runtime dependencies from Ubuntu 20.04
+echo "Installing Ubuntu 20.04 libs: libxml2.so.2, libicuuc.so.66, libicudata.so.66, libtinfo.so.6..."
+cp "$BUILD_DIR/shared/20.04-libs/libxml2.so.2" 20.04/rootfs/usr/local/lldb13/lib/
+cp "$BUILD_DIR/shared/20.04-libs/libicuuc.so.66" 20.04/rootfs/usr/local/lldb13/lib/
+cp "$BUILD_DIR/shared/20.04-libs/libicudata.so.66" 20.04/rootfs/usr/local/lldb13/lib/
+cp "$BUILD_DIR/shared/20.04-libs/libtinfo.so.6" 20.04/rootfs/usr/local/lldb13/lib/
 
 # Install Python from Ubuntu 20.04 build
 echo "Installing Python ${PYTHON_VERSION}..."
@@ -606,7 +653,8 @@ cp -r "$PYTHON_20_04_DIR"/* 20.04/rootfs/usr/local/python37/
 mkdir -p 20.04/rootfs/usr/bin
 ln -sf /usr/local/python37/bin/python3.7 20.04/rootfs/usr/bin/python3.7
 
-# Create LLDB symlink
+# Create symlinks to LLDB (RPATH is baked into binary, no wrapper needed)
+mkdir -p 20.04/rootfs/usr/bin
 ln -sf /usr/local/lldb13/bin/lldb 20.04/rootfs/usr/bin/lldb
 ln -sf /usr/local/lldb13/bin/lldb 20.04/rootfs/usr/bin/lldb-13
 
@@ -622,16 +670,17 @@ else
     find 20.04/rootfs/usr/local/lldb13 -name "*lldb*.py" | head -5 || true
 fi
 
-# Create ldconfig entry
+# Create ldconfig entry for Python ONLY
+# LLDB has RPATH baked in so it finds its libs in /usr/local/lldb13/lib automatically
 mkdir -p 20.04/rootfs/etc/ld.so.conf.d
 echo "/usr/local/python37/lib" > 20.04/rootfs/etc/ld.so.conf.d/python37.conf
-echo "/usr/local/lldb13/lib" >> 20.04/rootfs/etc/ld.so.conf.d/lldb13.conf
 
-# Set up environment for LLDB Python bindings
+# Set up environment for PYTHONPATH (LLDB uses RPATH for its library deps)
 mkdir -p 20.04/rootfs/etc/profile.d
 cat > 20.04/rootfs/etc/profile.d/lldb-python.sh << 'ENVEOF'
+# LLDB library paths are baked in via RPATH at compile time
+# Only PYTHONPATH needs to be set for Python imports
 export PYTHONPATH="/usr/local/lldb13/lib/python3.7/site-packages:$PYTHONPATH"
-export LD_LIBRARY_PATH="/usr/local/lldb13/lib:/usr/local/python37/lib:$LD_LIBRARY_PATH"
 ENVEOF
 chmod 644 20.04/rootfs/etc/profile.d/lldb-python.sh
 

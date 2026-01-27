@@ -126,6 +126,7 @@ class ArvoContainer:
         "run",
         "--platform=linux/amd64",
         "--net=none",  # running on devserver, this this seems to be necessary to avoid Error: pasta failed with exit code 1: Couldn't set IPv4 route(s) in guest: Invalid argument.
+        "--pull=never",  # Don't try to pull from registry if image doesn't exist locally
         "-d",
     ]
 
@@ -152,6 +153,9 @@ class ArvoContainer:
     _container_build_status: MutableMapping[str, BuildStatus] = {}
 
     _container_repository: Optional[str] = None
+
+    # Class variable to store output directory for build logs
+    _output_dir: Optional[Path] = None
 
     def __init__(
         self,
@@ -182,6 +186,21 @@ class ArvoContainer:
         container_repository = container_repository or cls.DEFAULT_CONTAINER_REPOSITORY
         logging.debug(f"Setting container repository to {container_repository}.")
         cls._container_repository = container_repository
+
+    @classmethod
+    def set_output_dir(cls, output_dir: Path) -> None:
+        """Set the output directory for storing build logs."""
+        logging.debug(f"Setting output directory to {output_dir}.")
+        cls._output_dir = output_dir
+
+    @classmethod
+    def _get_build_logs_dir(cls) -> Optional[Path]:
+        """Get the directory for storing build logs, creating it if necessary."""
+        if cls._output_dir is None:
+            return None
+        logs_dir = cls._output_dir / "build_logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        return logs_dir
 
     @classmethod
     def _get_container_repository(cls) -> str:
@@ -401,17 +420,29 @@ class ArvoContainer:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # Combine stdout and stderr
             )
+
+            # Save build log to file if output directory is configured
+            build_logs_dir = cls._get_build_logs_dir()
+            log_file = None
+            if build_logs_dir is not None:
+                log_file = build_logs_dir / f"{arvo_id}-{container_type}.log"
+                log_file.write_bytes(result.stdout or b"")
+
             if result.returncode != 0:
-                build_command = " ".join(build_cmd_args)
-                # Decode with error handling for binary output
-                stdout_text = (
-                    result.stdout.decode("utf-8", errors="replace")
-                    if result.stdout
-                    else ""
-                )
-                build_logger.error(
-                    f"Build command {build_command} failed with return code {result.returncode}. Command output:\n{stdout_text}"
-                )
+                if log_file:
+                    build_logger.error(
+                        f"Build failed for {arvo_id}-{container_type}. See log: {log_file}"
+                    )
+                else:
+                    # No log file, print output to terminal
+                    stdout_text = (
+                        result.stdout.decode("utf-8", errors="replace")
+                        if result.stdout
+                        else ""
+                    )
+                    build_logger.error(
+                        f"Build failed for {arvo_id}-{container_type}. Output:\n{stdout_text}"
+                    )
             else:
                 build_logger.debug(f"Image {image_tag} built successfully.")
 

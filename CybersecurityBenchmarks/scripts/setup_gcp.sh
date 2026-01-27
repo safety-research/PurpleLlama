@@ -279,6 +279,23 @@ else
 fi
 
 # ============================================
+# Step 7: Setup Safe Delete (trash & confirmation)
+# ============================================
+echo_info "Setting up safe-delete for $MOUNT_POINT..."
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SAFE_DELETE_SCRIPT="$SCRIPT_DIR/setup_safe_delete.sh"
+
+if [[ -f "$SAFE_DELETE_SCRIPT" ]]; then
+    # Run the safe-delete setup script for the data mount point
+    bash "$SAFE_DELETE_SCRIPT" "$MOUNT_POINT"
+else
+    echo_warn "Safe-delete script not found at $SAFE_DELETE_SCRIPT"
+    echo_warn "Skipping safe-delete setup. You can run it manually later."
+fi
+
+# ============================================
 # Summary
 # ============================================
 echo ""

@@ -40,6 +40,9 @@ class BenchmarkConfig:
     max_concurrency: int = 1
     truncate_input: bool = False
     input_modality: Optional[str] = None
+    output_dir: Optional[Path] = (
+        None  # If set, used as the base directory for all outputs
+    )
 
 
 class Benchmark(ABC):

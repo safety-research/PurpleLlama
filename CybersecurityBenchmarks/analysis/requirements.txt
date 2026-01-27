@@ -1,0 +1,7 @@
+anthropic
+python-dotenv
+typer[all]
+rich
+textual
+matplotlib
+pandas

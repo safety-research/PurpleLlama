@@ -680,6 +680,231 @@ class FuzzingOnlyBenchmark(Benchmark):
         await processing_task
 
     def _handle_deduplicate(self, case_key: str) -> None:
-        """Handle CASR deduplication request from TUI."""
-        # TODO: Implement CASR deduplication
+        """Handle CASR deduplication request from TUI.
+
+        Runs CASR clustering on crash files to deduplicate crashes by stack trace.
+        Updates crash_details with cluster IDs and refreshes unique crash counts.
+        """
         LOG.info(f"CASR deduplication requested for {case_key}")
+
+        state = self.case_states.get(case_key)
+        if not state:
+            LOG.warning(f"No state found for case {case_key}")
+            return
+
+        # Run deduplication in a background thread to not block TUI
+        import threading
+
+        def run_dedup():
+            try:
+                self._run_casr_deduplication(state)
+            except Exception as e:
+                LOG.error(f"CASR deduplication failed for {case_key}: {e}")
+                state.current_activity = f"Dedup failed: {e}"
+
+        thread = threading.Thread(target=run_dedup, daemon=True)
+        thread.start()
+
+    def _run_casr_deduplication(self, state: CaseState) -> None:
+        """Run CASR deduplication on crash files for a case.
+
+        This uses casr-cluster to group crashes by stack trace similarity.
+        """
+        case_dir = self._get_case_dir(state.case_id, state.model)
+        state.current_activity = "Running CASR deduplication..."
+
+        # Process GT crashes
+        if state.gt_timeline and state.gt_timeline.crashes:
+            gt_crashes_dir = case_dir / "gt_crashes"
+            if gt_crashes_dir.exists():
+                self._deduplicate_crashes_in_dir(
+                    gt_crashes_dir, state.gt_timeline, state, "GT"
+                )
+
+        # Process LLM crashes
+        if state.llm_timeline and state.llm_timeline.crashes:
+            llm_crashes_dir = case_dir / "llm_crashes"
+            if llm_crashes_dir.exists():
+                self._deduplicate_crashes_in_dir(
+                    llm_crashes_dir, state.llm_timeline, state, "LLM"
+                )
+
+        state.current_activity = "Deduplication complete"
+        LOG.info(
+            f"Case {state.case_id}: Deduplication complete. "
+            f"GT: {state.gt_timeline.unique_crashes() if state.gt_timeline else 0} unique, "
+            f"LLM: {state.llm_timeline.unique_crashes() if state.llm_timeline else 0} unique"
+        )
+
+    def _deduplicate_crashes_in_dir(
+        self,
+        crashes_dir: Path,
+        timeline: "CrashTimeline",
+        state: CaseState,
+        target_name: str,
+    ) -> None:
+        """Run CASR clustering on a directory of crash files."""
+        import subprocess
+
+        # Check if casr-cluster is available
+        try:
+            result = subprocess.run(
+                ["which", "casr-cluster"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                LOG.warning("casr-cluster not found in PATH, using hash-based deduplication")
+                self._hash_based_deduplication(timeline, state)
+                return
+        except Exception:
+            LOG.warning("Could not check for casr-cluster, using hash-based deduplication")
+            self._hash_based_deduplication(timeline, state)
+            return
+
+        # Find all CASR report files
+        casr_reports = list(crashes_dir.glob("*.casr.json"))
+        if not casr_reports:
+            LOG.info(f"No CASR reports found in {crashes_dir}, running casr-libfuzzer first")
+            # Try to generate CASR reports for crash files
+            self._generate_casr_reports(crashes_dir, state)
+            casr_reports = list(crashes_dir.glob("*.casr.json"))
+
+        if not casr_reports:
+            LOG.warning(f"No crashes to deduplicate for {target_name}")
+            return
+
+        # Create a temporary directory for clustering output
+        clusters_dir = crashes_dir.parent / f"{target_name.lower()}_clusters"
+        clusters_dir.mkdir(parents=True, exist_ok=True)
+
+        # Run casr-cluster
+        try:
+            cmd = [
+                "casr-cluster",
+                "-d",
+                str(crashes_dir),
+                "-o",
+                str(clusters_dir),
+            ]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,  # 5 minute timeout
+            )
+
+            if result.returncode != 0:
+                LOG.warning(f"casr-cluster failed: {result.stderr}")
+                self._hash_based_deduplication(timeline, state)
+                return
+
+            # Parse clustering results and update crash info
+            self._update_crash_clusters(clusters_dir, timeline, state)
+
+        except subprocess.TimeoutExpired:
+            LOG.warning("casr-cluster timed out, using hash-based deduplication")
+            self._hash_based_deduplication(timeline, state)
+        except Exception as e:
+            LOG.warning(f"casr-cluster error: {e}, using hash-based deduplication")
+            self._hash_based_deduplication(timeline, state)
+
+    def _generate_casr_reports(self, crashes_dir: Path, state: CaseState) -> None:
+        """Generate CASR reports for crash files that don't have them."""
+        import subprocess
+
+        # Find crash files without CASR reports
+        crash_files = [
+            f for f in crashes_dir.iterdir()
+            if f.is_file() and not f.name.endswith(".casr.json") and f.name.startswith("crash-")
+        ]
+
+        for crash_file in crash_files:
+            casr_report = crash_file.with_suffix(crash_file.suffix + ".casr.json")
+            if casr_report.exists():
+                continue
+
+            # We need the binary path to run casr-libfuzzer
+            binary_path = state.binary_path
+            if not binary_path:
+                LOG.warning(f"No binary path available for CASR analysis of {crash_file}")
+                continue
+
+            try:
+                cmd = [
+                    "casr-libfuzzer",
+                    "-o",
+                    str(casr_report),
+                    str(crash_file),
+                    binary_path,
+                ]
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if result.returncode != 0:
+                    LOG.debug(f"casr-libfuzzer failed for {crash_file}: {result.stderr}")
+            except Exception as e:
+                LOG.debug(f"Error generating CASR report for {crash_file}: {e}")
+
+    def _update_crash_clusters(
+        self,
+        clusters_dir: Path,
+        timeline: "CrashTimeline",
+        state: CaseState,
+    ) -> None:
+        """Update crash info with cluster IDs from CASR clustering output."""
+        # CASR creates subdirectories for each cluster
+        cluster_dirs = [d for d in clusters_dir.iterdir() if d.is_dir()]
+
+        # Build mapping from crash file to cluster ID
+        crash_to_cluster: Dict[str, str] = {}
+        for cluster_dir in cluster_dirs:
+            cluster_id = cluster_dir.name
+            for report_file in cluster_dir.glob("*.casr.json"):
+                # Extract crash filename from report name
+                crash_name = report_file.stem.replace(".casr", "")
+                crash_to_cluster[crash_name] = cluster_id
+
+        # Update crash info
+        for crash in timeline.crashes:
+            crash_name = Path(crash.corpus_file).name
+            if crash_name in crash_to_cluster:
+                crash.cluster_id = crash_to_cluster[crash_name]
+                # Also update in state.crash_details
+                if crash.crash_id in state.crash_details:
+                    state.crash_details[crash.crash_id].cluster_id = crash.cluster_id
+
+        LOG.info(
+            f"Updated {len(crash_to_cluster)} crashes with cluster IDs "
+            f"({len(cluster_dirs)} unique clusters)"
+        )
+
+    def _hash_based_deduplication(
+        self,
+        timeline: "CrashTimeline",
+        state: CaseState,
+    ) -> None:
+        """Fallback deduplication using crash type as cluster ID.
+
+        When CASR is not available, we group crashes by their crash_type.
+        """
+        # Group by crash type
+        type_to_cluster: Dict[str, str] = {}
+        cluster_counter = 0
+
+        for crash in timeline.crashes:
+            if crash.crash_type not in type_to_cluster:
+                type_to_cluster[crash.crash_type] = f"type_cluster_{cluster_counter}"
+                cluster_counter += 1
+
+            crash.cluster_id = type_to_cluster[crash.crash_type]
+            if crash.crash_id in state.crash_details:
+                state.crash_details[crash.crash_id].cluster_id = crash.cluster_id
+
+        LOG.info(
+            f"Hash-based deduplication: {len(timeline.crashes)} crashes -> "
+            f"{len(type_to_cluster)} unique types"
+        )

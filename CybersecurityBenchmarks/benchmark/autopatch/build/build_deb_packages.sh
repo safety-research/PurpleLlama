@@ -1,6 +1,9 @@
 #!/bin/bash
 # Build differential-debugging-deps .deb packages for AutoPatch benchmark
 # Creates both Ubuntu 16.04 and 20.04 versions
+#
+# CROSS-PLATFORM: Works on macOS, Linux, and Windows WSL2
+# Requirements: podman or docker (brew install podman on macOS)
 # 
 # CRITICAL: 
 # - Pre-built Python binaries require GLIBC 2.34+ but Ubuntu 16.04 has 2.23 and 20.04 has 2.31
@@ -83,9 +86,76 @@ if [ "$REBUILD_LLDB_16_04" = false ] && [ "$REBUILD_LLDB_20_04" = false ]; then
 fi
 
 echo ""
-echo "=== Installing build dependencies ==="
-apt-get update -qq
-apt-get install -y -qq wget curl podman
+echo "=== Checking build dependencies ==="
+
+# Detect OS and container runtime
+if command -v podman &> /dev/null; then
+    CONTAINER_CMD="podman"
+elif command -v docker &> /dev/null; then
+    CONTAINER_CMD="docker"
+else
+    echo "ERROR: Neither podman nor docker found. Please install one of them."
+    echo "  macOS:   brew install podman"
+    echo "  Ubuntu:  apt-get install podman"
+    echo "  Fedora:  dnf install podman"
+    exit 1
+fi
+echo "Using container runtime: $CONTAINER_CMD"
+
+# Check for required commands
+for cmd in curl; do
+    if ! command -v $cmd &> /dev/null; then
+        echo "ERROR: Required command '$cmd' not found."
+        exit 1
+    fi
+done
+
+# On Linux with apt-get, optionally install missing dependencies
+if [[ "$(uname -s)" == "Linux" ]] && command -v apt-get &> /dev/null; then
+    if ! command -v strings &> /dev/null; then
+        echo "Installing binutils for 'strings' command..."
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq binutils
+    fi
+fi
+
+# Helper function: run dpkg-deb (natively on Linux, or in container on macOS/other)
+# Usage: run_dpkg_deb <args...>
+# For --build: run_dpkg_deb --root-owner-group --build <rootfs_dir> <output.deb>
+# For --info:  run_dpkg_deb --info <deb_file>
+run_dpkg_deb() {
+    if command -v dpkg-deb &> /dev/null; then
+        # Native dpkg-deb available (Linux)
+        dpkg-deb "$@"
+    else
+        # Run dpkg-deb in an Ubuntu container (macOS/other)
+        local args=("$@")
+        local volumes=()
+        local container_args=()
+        
+        # Parse args to determine what volumes to mount
+        for arg in "${args[@]}"; do
+            if [[ "$arg" == /* ]]; then
+                # Absolute path - mount it
+                volumes+=("-v" "$arg:$arg")
+                container_args+=("$arg")
+            elif [[ "$arg" == *.deb ]] || [[ -d "$arg" ]]; then
+                # Relative path to .deb file or directory - mount current dir
+                local abs_path="$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"
+                volumes+=("-v" "$(pwd):$(pwd)")
+                container_args+=("$arg")
+            else
+                container_args+=("$arg")
+            fi
+        done
+        
+        # Always mount current working directory
+        volumes+=("-v" "$(pwd):$(pwd)" "-w" "$(pwd)")
+        
+        $CONTAINER_CMD run --rm "${volumes[@]}" docker.io/library/ubuntu:20.04 \
+            dpkg-deb "${container_args[@]}"
+    fi
+}
 
 echo "=== Creating build environment ==="
 # Don't delete shared directory - it contains cached sources
@@ -130,8 +200,8 @@ echo "Python source downloaded"
 echo "=== Extracting shared libraries from Ubuntu 20.04 ==="
 cd "$BUILD_DIR/shared"
 
-podman pull docker.io/library/ubuntu:20.04 >/dev/null 2>&1
-podman run --rm docker.io/library/ubuntu:20.04 cat /usr/lib/x86_64-linux-gnu/libstdc++.so.6 > libstdc++.so.6
+$CONTAINER_CMD pull docker.io/library/ubuntu:20.04 >/dev/null 2>&1
+$CONTAINER_CMD run --rm docker.io/library/ubuntu:20.04 cat /usr/lib/x86_64-linux-gnu/libstdc++.so.6 > libstdc++.so.6
 
 echo "Extracted libstdc++.so.6 ($(ls -lh libstdc++.so.6 | awk '{print $5}'))"
 echo "GLIBCXX versions available:"
@@ -142,7 +212,7 @@ strings libstdc++.so.6 | grep GLIBCXX | sort -V | tail -3
 
 echo "=== Extracting lldb runtime dependencies from Ubuntu 20.04 ==="
 mkdir -p "$BUILD_DIR/shared/20.04-libs"
-podman run --rm -v "$BUILD_DIR/shared/20.04-libs:/output" docker.io/library/ubuntu:20.04 bash -c "
+$CONTAINER_CMD run --rm -v "$BUILD_DIR/shared/20.04-libs:/output" docker.io/library/ubuntu:20.04 bash -c "
     apt-get update -qq && 
     apt-get install -y -qq libxml2 libncurses6 && 
     cp /usr/lib/x86_64-linux-gnu/libxml2.so.2 /output/libxml2.so.2 &&
@@ -155,7 +225,7 @@ ls -lh "$BUILD_DIR/shared/20.04-libs/"
 
 echo "=== Extracting lldb runtime dependencies from Ubuntu 16.04 ==="
 mkdir -p "$BUILD_DIR/shared/16.04-libs"
-podman run --rm -v "$BUILD_DIR/shared/16.04-libs:/output" docker.io/library/ubuntu:16.04 bash -c "
+$CONTAINER_CMD run --rm -v "$BUILD_DIR/shared/16.04-libs:/output" docker.io/library/ubuntu:16.04 bash -c "
     apt-get update -qq && 
     apt-get install -y -qq libxml2 libncurses5 libicu55 && 
     cp /usr/lib/x86_64-linux-gnu/libxml2.so.2 /output/libxml2.so.2 &&
@@ -181,7 +251,7 @@ cd "$BUILD_DIR"
 # Build or use cached Python
 if [ "$REBUILD_PYTHON_16_04" = true ]; then
     echo "=== Step 1/2: Building Python 3.7 in Ubuntu 16.04 container (~10-15 min) ==="
-    podman run --rm \
+    $CONTAINER_CMD run --rm \
         -v "$BUILD_DIR/shared/Python-${PYTHON_VERSION}.tgz:/tmp/Python-${PYTHON_VERSION}.tgz:ro" \
         -v "$BUILD_DIR:/output" \
         docker.io/library/ubuntu:16.04 bash -c "
@@ -231,7 +301,7 @@ if [ "$REBUILD_LLDB_16_04" = true ]; then
     sudo mkdir -p "$BUILD_DIR/lldb13-ubuntu16.04/usr/local/"{lldb13,include,bin,lib,share}
     sudo chmod -R 777 "$BUILD_DIR/lldb13-ubuntu16.04"
     
-podman run --rm \
+$CONTAINER_CMD run --rm \
     -v "$BUILD_DIR/shared/llvmorg-${LLVM_VERSION}.tar.gz:/tmp/llvm-source.tar.gz:ro" \
     -v "$BUILD_DIR/python37-ubuntu16.04/usr/local/python37:/usr/local/python37:ro" \
     -v "$BUILD_DIR:/output" \
@@ -468,14 +538,14 @@ chmod 755 16.04/rootfs/DEBIAN/postinst
 # Build the .deb package
 cd 16.04
 echo "Creating differential-debugging-deps-16.04.deb..."
-dpkg-deb --root-owner-group --build rootfs differential-debugging-deps-16.04.deb
+run_dpkg_deb --root-owner-group --build rootfs differential-debugging-deps-16.04.deb
 
 echo "✓ Created differential-debugging-deps-16.04.deb"
 ls -lh differential-debugging-deps-16.04.deb
 
 # Verify package
 echo "Verifying package contents..."
-dpkg-deb --info differential-debugging-deps-16.04.deb | grep -A5 "Package:"
+run_dpkg_deb --info differential-debugging-deps-16.04.deb | grep -A5 "Package:"
 
 # Copy to script directory
 cp differential-debugging-deps-16.04.deb "$DEB_16_04"
@@ -493,7 +563,7 @@ cd "$BUILD_DIR"
 # Build or use cached Python
 if [ "$REBUILD_PYTHON_20_04" = true ]; then
     echo "=== Step 1/2: Building Python 3.7 in Ubuntu 20.04 container (~10-15 min) ==="
-    podman run --rm \
+    $CONTAINER_CMD run --rm \
         -v "$BUILD_DIR/shared/Python-${PYTHON_VERSION}.tgz:/tmp/Python-${PYTHON_VERSION}.tgz:ro" \
         -v "$BUILD_DIR:/output" \
         docker.io/library/ubuntu:20.04 bash -c "
@@ -543,7 +613,7 @@ if [ "$REBUILD_LLDB_20_04" = true ]; then
     sudo mkdir -p "$BUILD_DIR/lldb13-ubuntu20.04/usr/local/"{lldb13,include,bin,lib,share}
     sudo chmod -R 777 "$BUILD_DIR/lldb13-ubuntu20.04"
     
-podman run --rm \
+$CONTAINER_CMD run --rm \
     -v "$BUILD_DIR/shared/llvmorg-${LLVM_VERSION}.tar.gz:/tmp/llvm-source.tar.gz:ro" \
     -v "$BUILD_DIR/python37-ubuntu20.04/usr/local/python37:/usr/local/python37:ro" \
     -v "$BUILD_DIR:/output" \
@@ -726,14 +796,14 @@ chmod 755 20.04/rootfs/DEBIAN/postinst
 # Build the .deb package
 cd 20.04
 echo "Creating differential-debugging-deps-20.04.deb..."
-dpkg-deb --root-owner-group --build rootfs differential-debugging-deps-20.04.deb
+run_dpkg_deb --root-owner-group --build rootfs differential-debugging-deps-20.04.deb
 
 echo "✓ Created differential-debugging-deps-20.04.deb"
 ls -lh differential-debugging-deps-20.04.deb
 
 # Verify package
 echo "Verifying package contents..."
-dpkg-deb --info differential-debugging-deps-20.04.deb | grep -A5 "Package:"
+run_dpkg_deb --info differential-debugging-deps-20.04.deb | grep -A5 "Package:"
 
 # Copy to script directory
 cp differential-debugging-deps-20.04.deb "$DEB_20_04"
@@ -763,6 +833,6 @@ echo "To clear cache and rebuild from scratch:"
 echo "  rm -rf ${CACHE_DIR}"
 echo ""
 echo "Test with:"
-echo "  podman run --rm -v $DEB_16_04:/tmp/test.deb \\"
+echo "  $CONTAINER_CMD run --rm -v $DEB_16_04:/tmp/test.deb \\"
 echo "    docker.io/n132/arvo:1236-vul bash -c \\"
 echo "    'apt-get update -qq && apt-get install -y /tmp/test.deb && lldb --version && python3.7 --version && python3.7 -c \"import lldb; print(lldb.SBDebugger.GetVersionString())\"'"

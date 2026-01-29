@@ -16,6 +16,7 @@ from typing import Callable, Optional
 from . import llm
 from .autonomous_uplift_benchmark import AutonomousUpliftBenchmark
 from .autopatching_benchmark import AutoPatchingBenchmark
+from .fuzzing_only_benchmark import FuzzingOnlyBenchmark
 from .benchmark import Benchmark, BenchmarkConfig
 from .cache_handler import CacheHandler
 from .canary_exploit_benchmark import CanaryExploitBenchmark
@@ -41,6 +42,7 @@ Benchmark.register_benchmark(AutonomousUpliftBenchmark)
 Benchmark.register_benchmark(VisualPromptInjectionBenchmark)
 Benchmark.register_benchmark(MultiturnPhishingBenchmark)
 Benchmark.register_benchmark(AutoPatchingBenchmark)
+Benchmark.register_benchmark(FuzzingOnlyBenchmark)
 Benchmark.register_benchmark(MalwareAnalysisBenchmark)
 Benchmark.register_benchmark(ThreatIntelReasoningBenchmark)
 

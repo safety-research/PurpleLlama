@@ -117,6 +117,10 @@ class ArvoContainer:
 
     DOCKERFILE_VUL_TEMPLATE_FILENAME: str = "dockerfile_vul_template"
     DOCKERFILE_FIX_TEMPLATE_FILENAME: str = "dockerfile_fix_template"
+    DOCKERFILE_FUZZING_TEMPLATE_FILENAME: str = "dockerfile_fuzzing_template"
+
+    # Template override for fix containers (used by FuzzingOnlyBenchmark)
+    _dockerfile_fix_template_override: Optional[str] = None
 
     DPKG_U2004_FILENAME: str = "differential-debugging-deps-20.04.deb"
     DPKG_U1604_FILENAME: str = "differential-debugging-deps-16.04.deb"
@@ -192,6 +196,35 @@ class ArvoContainer:
         """Set the output directory for storing build logs."""
         logging.debug(f"Setting output directory to {output_dir}.")
         cls._output_dir = output_dir
+
+    @classmethod
+    def set_dockerfile_fix_template_override(cls, template_name: Optional[str]) -> None:
+        """Set an override for the fix container dockerfile template.
+
+        This allows FuzzingOnlyBenchmark to use dockerfile_fuzzing_template
+        instead of dockerfile_fix_template.
+
+        Args:
+            template_name: The template filename to use (e.g., "dockerfile_fuzzing_template"),
+                          or None to clear the override and use the default.
+        """
+        logging.debug(f"Setting dockerfile fix template override to {template_name}.")
+        cls._dockerfile_fix_template_override = template_name
+        # Clear the lru_cache on _get_dockerfile_template to pick up the new value
+        cls._get_dockerfile_template.cache_clear()
+
+    @classmethod
+    def use_fuzzing_template(cls) -> None:
+        """Configure ArvoContainer to use dockerfile_fuzzing_template for fix containers.
+
+        This is a convenience method for FuzzingOnlyBenchmark.
+        """
+        cls.set_dockerfile_fix_template_override(cls.DOCKERFILE_FUZZING_TEMPLATE_FILENAME)
+
+    @classmethod
+    def use_default_fix_template(cls) -> None:
+        """Reset ArvoContainer to use the default dockerfile_fix_template."""
+        cls.set_dockerfile_fix_template_override(None)
 
     @classmethod
     def _get_build_logs_dir(cls) -> Optional[Path]:
@@ -270,7 +303,7 @@ class ArvoContainer:
 
         completed_count = 0
         failed_count = 0
-        with ThreadPoolExecutor(max_workers=max_concurrency // 2) as executor:
+        with ThreadPoolExecutor(max_workers=max(1, max_concurrency // 2)) as executor:
             futures = {
                 executor.submit(
                     cls._build_container_images_for_arvo_id,
@@ -451,11 +484,13 @@ class ArvoContainer:
     @classmethod
     @lru_cache()
     def _get_dockerfile_template(cls, container_type: str) -> str:
-        filename = (
-            cls.DOCKERFILE_VUL_TEMPLATE_FILENAME
-            if container_type == ArvoContainer.CONTAINER_TYPE_VUL
-            else cls.DOCKERFILE_FIX_TEMPLATE_FILENAME
-        )
+        if container_type == ArvoContainer.CONTAINER_TYPE_VUL:
+            filename = cls.DOCKERFILE_VUL_TEMPLATE_FILENAME
+        elif cls._dockerfile_fix_template_override is not None:
+            # Use the override template (e.g., for FuzzingOnlyBenchmark)
+            filename = cls._dockerfile_fix_template_override
+        else:
+            filename = cls.DOCKERFILE_FIX_TEMPLATE_FILENAME
         template_filepath = cls._get_build_dir() / filename
         with open(template_filepath, "r") as file:
             return file.read()

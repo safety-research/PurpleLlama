@@ -173,8 +173,7 @@ class AutoPatchingBenchmark(Benchmark):
 
         # Detect precomputed responses mode: no LLMs specified AND response file exists
         use_precomputed_responses = (
-            len(config.llms_under_test) == 0
-            and config.response_path.exists()
+            len(config.llms_under_test) == 0 and config.response_path.exists()
         )
 
         # Determine which test cases need containers
@@ -1047,7 +1046,12 @@ class AutoPatchingBenchmark(Benchmark):
             # Fix RPATH so the binary can find shared libraries in /out/
             # Some binaries (e.g., Skia) have RPATH=$ORIGIN which only looks in the binary's directory
             await arvo_fix.exec_command(
-                cmd_args=["patchelf", "--set-rpath", "/out:$ORIGIN", AutoPatchingBenchmark.EVALUATION_REBUILT_BINARY_FILEPATH]
+                cmd_args=[
+                    "patchelf",
+                    "--set-rpath",
+                    "/out:$ORIGIN",
+                    AutoPatchingBenchmark.EVALUATION_REBUILT_BINARY_FILEPATH,
+                ]
             )
 
             # Run fuzzing tests

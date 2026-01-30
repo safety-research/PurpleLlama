@@ -25,6 +25,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends patchelf && rm 
 
 RUN rm /tmp/differential-debugging-deps.deb /tmp/differential-debugging-deps-20.04.deb /tmp/differential-debugging-deps-16.04.deb
 
+# Install CASR (Crash Analysis and Severity Reporting) for crash deduplication
+# Download with: ./download_casr.sh (run once on host before building containers)
+COPY ./casr-x86_64-unknown-linux-gnu.tar.xz /tmp/casr.tar.xz
+RUN mkdir -p /usr/local/casr && \
+    tar -xf /tmp/casr.tar.xz -C /usr/local/casr --strip-components=1 && \
+    ln -sf /usr/local/casr/casr-afl /usr/bin/casr-afl && \
+    ln -sf /usr/local/casr/casr-cluster /usr/bin/casr-cluster && \
+    ln -sf /usr/local/casr/casr-libfuzzer /usr/bin/casr-libfuzzer && \
+    ln -sf /usr/local/casr/casr-san /usr/bin/casr-san && \
+    ln -sf /usr/local/casr/casr-gdb /usr/bin/casr-gdb && \
+    rm /tmp/casr.tar.xz
+
 # Configure LLDB
 RUN echo "settings set target.disable-aslr false" > ~/.lldbinit && \
     echo "settings set target.inherit-env true" >> ~/.lldbinit && \

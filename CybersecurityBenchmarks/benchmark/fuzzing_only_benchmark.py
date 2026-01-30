@@ -626,6 +626,9 @@ class FuzzingOnlyBenchmark(Benchmark):
             )
         else:
             new_content = self._configure_libfuzzer(arvo_content, duration_secs)
+            # Create /tmp/crashes/ directory for libFuzzer crash artifacts
+            await container.exec_command(cmd_args=["mkdir", "-p", "/tmp/crashes/"])
+            LOG.info("Created /tmp/crashes/ directory for crash artifacts")
 
         # Write the modified script back
         import tempfile
@@ -674,6 +677,9 @@ class FuzzingOnlyBenchmark(Benchmark):
         # Always add fork mode for parallel fuzzing
         if self.fuzzing_config.fork_jobs > 1:
             new_args.append(f"-fork={self.fuzzing_config.fork_jobs}")
+
+        # Save crash files to /tmp/crashes/ for CASR deduplication
+        new_args.append("-artifact_prefix=/tmp/crashes/")
 
         new_args.append("-print_final_stats=1")
 
@@ -865,9 +871,12 @@ class FuzzingOnlyBenchmark(Benchmark):
             return await self._get_libfuzzer_crash_files(container)
 
     async def _get_libfuzzer_crash_files(self, container: ArvoContainer) -> List[str]:
-        """Get crash files from libFuzzer output (in corpus directory)."""
+        """Get crash files from libFuzzer output (in /tmp/crashes/ directory).
+        
+        With -artifact_prefix=/tmp/crashes/, libFuzzer saves crash files there.
+        """
         result = await container.exec_command(
-            cmd_args=["ls", "-1", "/tmp/corpus/"], timeout=10
+            cmd_args=["ls", "-1", "/tmp/crashes/"], timeout=10
         )
         if result.returncode != 0:
             return []
@@ -875,7 +884,7 @@ class FuzzingOnlyBenchmark(Benchmark):
         crashes = []
         stdout = result.stdout.decode() if result.stdout else ""
         for line in stdout.strip().split("\n"):
-            if (
+            if line and (
                 line.startswith("crash-")
                 or line.startswith("oom-")
                 or line.startswith("timeout-")
@@ -1203,7 +1212,7 @@ class FuzzingOnlyBenchmark(Benchmark):
         crash_files = await self._get_crash_files(container, fuzzer_type)
         crash_location = (
             "/tmp/afl_output/*/crashes/" if fuzzer_type == FuzzerType.AFL_PLUS_PLUS
-            else "/tmp/corpus/"
+            else "/tmp/crashes/"
         )
         LOG.info(
             f"Case {case_id}: Found {len(crash_files)} crash files in {crash_location}"

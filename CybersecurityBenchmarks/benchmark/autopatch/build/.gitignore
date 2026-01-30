@@ -1,2 +1,3 @@
 *.deb
 .build-cache/
+casr-x86_64-unknown-linux-gnu.tar.xz

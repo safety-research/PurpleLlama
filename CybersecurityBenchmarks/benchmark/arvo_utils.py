@@ -219,7 +219,9 @@ class ArvoContainer:
 
         This is a convenience method for FuzzingOnlyBenchmark.
         """
-        cls.set_dockerfile_fix_template_override(cls.DOCKERFILE_FUZZING_TEMPLATE_FILENAME)
+        cls.set_dockerfile_fix_template_override(
+            cls.DOCKERFILE_FUZZING_TEMPLATE_FILENAME
+        )
 
     @classmethod
     def use_default_fix_template(cls) -> None:

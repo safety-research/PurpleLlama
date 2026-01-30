@@ -33,6 +33,7 @@ class CaseStatus(str, Enum):
     """Status of a fuzzing case."""
 
     PENDING = "pending"
+    GENERATING_PATCH = "generating_patch"  # LLM is generating a patch
     LOADING_RESPONSE = "loading_response"
     BUILDING_CONTAINER = "building_container"
     ANALYZING_ORIGINAL = "analyzing_original"  # Analyzing original PoC crash with CASR
@@ -222,7 +223,8 @@ class CaseState:
     gt_timeline: Optional[CrashTimeline] = None
     llm_timeline: Optional[CrashTimeline] = None
     crash_details: Dict[str, CrashInfo] = field(default_factory=dict)  # crash_id -> full info
-    streaming_output: str = ""  # For TUI
+    streaming_output: str = ""  # For TUI - activity/status info
+    container_logs: str = ""  # For TUI - tail command for log file
     current_activity: str = ""  # Current activity description
     current_executions: int = 0  # Live execution count
     error: Optional[str] = None  # Error message if failed
@@ -231,6 +233,10 @@ class CaseState:
     patch_path: Optional[str] = None
     binary_path: Optional[str] = None
     patched_function: Optional[str] = None
+
+    # Log file paths for monitoring
+    fuzzer_log_path: Optional[str] = None  # Path to fuzzer output log
+    llm_log_path: Optional[str] = None  # Path to LLM generation log
 
     def get_key(self) -> str:
         """Get unique key for this case."""
@@ -258,7 +264,7 @@ class FuzzingConfig:
     use_casr: bool = True  # Enable CASR deduplication
 
     # Polling settings
-    poll_interval_seconds: float = 5.0
+    poll_interval_seconds: float = 2.0  # Poll container logs every 2 seconds
 
     # Fuzzing targets
     fuzz_ground_truth: bool = True

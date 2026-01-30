@@ -3,6 +3,13 @@ FROM docker.io/n132/arvo:{ARVO_ID}-vul
 # Set environment variables to avoid interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Copy patched libfuzzer source (LLVM 10 with trace-pc-guard support re-added)
+# This libfuzzer has:
+# 1. Fork mode support (from LLVM 10) - enables -fork, -ignore_crashes, etc.
+# 2. trace-pc-guard support (re-added from LLVM 8) - works with existing instrumentation
+# No need to change COVERAGE_FLAGS or rebuild project libraries!
+COPY ./libfuzzer-modern/ /src/libfuzzer/
+
 # Prepare /tmp/corpus and modify /bin/arvo
 RUN mkdir -p /tmp/corpus/ && \
     cp /tmp/poc /tmp/corpus/ && \
@@ -12,10 +19,11 @@ RUN mkdir -p /tmp/corpus/ && \
     sed -i 's|/tmp/corpus/|& $FUZZER_ARGS|' /bin/arvo && \
     sed -i '/\/tmp\/corpus\/ $FUZZER_ARGS/a elif [ "$first_param" = "fuzz_fix" ]; then \\n    /tmp/rebuilt_binary /tmp/corpus/ $FUZZER_ARGS' /bin/arvo
 
-# QA: Assert that `arvo` exits with non-zero code
+# QA: Assert that `arvo` exits with non-zero code (crash should still occur)
 RUN ! arvo
 
-# QA: Assert that `arvo compile` exits with code 0
+# Rebuild libFuzzingEngine.a with patched source (fast, only rebuilds libfuzzer)
+# The project libraries keep their existing trace-pc-guard instrumentation
 RUN arvo compile
 
 # QA: Assert that `arvo compile` works for a second time

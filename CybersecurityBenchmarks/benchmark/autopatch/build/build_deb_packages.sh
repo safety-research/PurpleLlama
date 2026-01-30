@@ -193,6 +193,42 @@ fi
 echo "Python source downloaded"
 
 # ==========================================
+# Download modern libfuzzer source (LLVM 10) for fork mode support
+# Needed because ARVO VUL containers have old libfuzzer without fork/ignore flags
+# ==========================================
+LIBFUZZER_DIR="${SCRIPT_DIR}/libfuzzer-modern"
+COMPILER_RT_VERSION="10.0.0"
+
+if [ -d "$LIBFUZZER_DIR" ] && [ -f "$LIBFUZZER_DIR/FuzzerFork.cpp" ]; then
+    echo "=== Using cached modern libfuzzer source ==="
+else
+    echo "=== Downloading modern libfuzzer source (LLVM ${COMPILER_RT_VERSION}) ==="
+    
+    # Download compiler-rt source
+    COMPILER_RT_TAR="compiler-rt-${COMPILER_RT_VERSION}.src.tar.xz"
+    if [ ! -f "$BUILD_DIR/shared/$COMPILER_RT_TAR" ]; then
+        curl -L -o "$BUILD_DIR/shared/$COMPILER_RT_TAR" \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-${COMPILER_RT_VERSION}/$COMPILER_RT_TAR"
+    fi
+    
+    # Extract just the fuzzer directory
+    rm -rf "$LIBFUZZER_DIR"
+    mkdir -p "$LIBFUZZER_DIR"
+    tar -xf "$BUILD_DIR/shared/$COMPILER_RT_TAR" -C "$BUILD_DIR/shared/"
+    cp -r "$BUILD_DIR/shared/compiler-rt-${COMPILER_RT_VERSION}.src/lib/fuzzer/"* "$LIBFUZZER_DIR/"
+    
+    # Verify FuzzerFork.cpp exists (required for fork mode)
+    if [ -f "$LIBFUZZER_DIR/FuzzerFork.cpp" ]; then
+        echo "Modern libfuzzer source extracted successfully"
+        echo "  - FuzzerFork.cpp: $(ls -lh "$LIBFUZZER_DIR/FuzzerFork.cpp" | awk '{print $5}')"
+        echo "  - Total files: $(ls "$LIBFUZZER_DIR" | wc -l)"
+    else
+        echo "ERROR: FuzzerFork.cpp not found in extracted source!"
+        exit 1
+    fi
+fi
+
+# ==========================================
 # Extract libstdc++.so.6 and libxml2.so.2 from Ubuntu 20.04
 # LLDB needs GLIBCXX_3.4.22+ but Ubuntu 16.04 only has 3.4.21
 # LLDB also needs libxml2.so.2 at runtime

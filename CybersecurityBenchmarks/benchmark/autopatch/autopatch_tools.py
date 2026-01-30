@@ -62,12 +62,14 @@ class AutoPatchAgent:
         llm_under_test: LLM,
         patch_filepath: Path,
         binary_filepath: Path,
+        message_callback: Optional[callable] = None,
     ) -> None:
         self.container: ArvoContainer = container
         self.llm_under_test: LLM = llm_under_test
         self.patch_filepath: Path = patch_filepath
         self.binary_filepath: Path = binary_filepath
         self._patched_function_name: Optional[str] = None
+        self._message_callback: Optional[callable] = message_callback
 
     async def generate_and_persist_patch_and_binary(self) -> PatchGenerationReport:
         """
@@ -75,7 +77,7 @@ class AutoPatchAgent:
         """
         autopatch_source_utils = get_autopatch_source_utils(self.container)
         pg = PatchGenerator(
-            llm_class=get_autopatch_llm(self.llm_under_test),
+            llm_class=get_autopatch_llm(self.llm_under_test, self._message_callback),
             source_utils=autopatch_source_utils,
             patch_verifier=AutoPatchVerifier(self.container),
             patcher=AutoPatcher(self.container, autopatch_source_utils),
@@ -157,7 +159,18 @@ class AutoPatchAgent:
         return self._patched_function_name
 
 
-def get_autopatch_llm(llm_under_test: LLM) -> Type[LLMInterface]:
+def get_autopatch_llm(
+    llm_under_test: LLM,
+    message_callback: Optional[callable] = None,
+) -> Type[LLMInterface]:
+    """Create an LLM interface class for autopatch.
+
+    Args:
+        llm_under_test: The LLM to use for queries.
+        message_callback: Optional callback called with (role, content) for each message.
+                         Role is "human" or "assistant".
+    """
+
     class AutoPatchLLM(LLMInterface):
         # With a backoff rate of 2, this allows up to about an hour of retries before escalating the exception.
         MAX_RETRIES: int = 11
@@ -167,10 +180,19 @@ def get_autopatch_llm(llm_under_test: LLM) -> Type[LLMInterface]:
         def __init__(self, system_prompt: str) -> None:
             self._model: str = llm_under_test.model
             self._messages: List[BaseMessage] = [SystemMessage(content=system_prompt)]
+            if message_callback:
+                message_callback("system", system_prompt[:500] + "..." if len(system_prompt) > 500 else system_prompt)
 
         async def query(self, message: str, temperature: Optional[float] = None) -> str:
             system_message, history = self._get_message_history_in_str()
             new_message = HumanMessage(content=message)
+
+            # Notify callback about the human message
+            if message_callback:
+                # Truncate very long messages for display
+                display_msg = message[:1000] + "..." if len(message) > 1000 else message
+                message_callback("human", display_msg)
+
             delay = AutoPatchLLM.INITIAL_RETRY_DELAY
             for attempt in range(AutoPatchLLM.MAX_RETRIES):
                 try:
@@ -189,10 +211,18 @@ def get_autopatch_llm(llm_under_test: LLM) -> Type[LLMInterface]:
                     self.set_context(
                         self.get_context() + [new_message, AIMessage(content=response)]
                     )
+
+                    # Notify callback about the assistant response
+                    if message_callback:
+                        display_resp = response[:1500] + "..." if len(response) > 1500 else response
+                        message_callback("assistant", display_resp)
+
                     # ensure string type
                     return response or ""
                 except Exception as e:
                     logging.warning(f"Exception raised: {e}")
+                    if message_callback:
+                        message_callback("error", f"Attempt {attempt + 1}/{AutoPatchLLM.MAX_RETRIES}: {e}")
                     if attempt == AutoPatchLLM.MAX_RETRIES - 1:
                         raise RuntimeError(
                             f"LLM query failed after {AutoPatchLLM.MAX_RETRIES} retries."

@@ -27,6 +27,13 @@ RUN echo "settings set target.disable-aslr false" > ~/.lldbinit && \
     echo "settings set target.inherit-env true" >> ~/.lldbinit && \
     echo "settings set target.process.thread.step-avoid-regexp ''" >> ~/.lldbinit
 
+# Copy patched libfuzzer source (LLVM 10 with trace-pc-guard support re-added)
+# This libfuzzer has:
+# 1. Fork mode support (from LLVM 10) - enables -fork, -ignore_crashes, etc.
+# 2. trace-pc-guard support (re-added from LLVM 8) - works with existing instrumentation
+# No need to change COVERAGE_FLAGS or rebuild project libraries!
+COPY ./libfuzzer-modern/ /src/libfuzzer/
+
 # Prepare /tmp/corpus and modify /bin/arvo
 RUN mkdir -p /tmp/corpus/ && \
     cp /tmp/poc /tmp/corpus/ && \
@@ -43,7 +50,8 @@ COPY ./microsnapshots/ /microsnapshots/
 # QA: Assert that `arvo` exits with code 0
 RUN arvo
 
-# QA: Assert that `arvo compile` exits with code 0
+# Rebuild libFuzzingEngine.a with patched source (fast, only rebuilds libfuzzer)
+# The project libraries keep their existing trace-pc-guard instrumentation
 RUN arvo compile
 
 # QA: assert that "arvo run" (10 mins of fuzzing on GT patch) exits with code 0

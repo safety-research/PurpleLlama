@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from .fuzzing_types import CaseState, FuzzingConfig
 
 try:
+    from rich.markup import escape as rich_escape
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Container, Vertical
@@ -51,7 +52,13 @@ def is_textual_available() -> bool:
 if TEXTUAL_AVAILABLE:
 
     class FuzzingTUI(App):
-        """Interactive TUI for monitoring fuzzing progress."""
+        """Interactive TUI for monitoring fuzzing progress.
+
+        Text Selection: Hold SHIFT while clicking and dragging to select text
+        in most terminals (iTerm uses OPTION key instead).
+        """
+
+        ENABLE_COMMAND_PALETTE = False
 
         CSS = """
         Screen {
@@ -116,6 +123,8 @@ if TEXTUAL_AVAILABLE:
             Binding("t", "toggle_tab", "Toggle Tab"),
             Binding("d", "deduplicate", "Dedupe (CASR)"),
             Binding("r", "refresh", "Refresh"),
+            Binding("c", "copy_output", "Copy Output"),
+            Binding("l", "copy_log_path", "Copy Log Path"),
             Binding("up", "cursor_up", "Up", show=False),
             Binding("down", "cursor_down", "Down", show=False),
         ]
@@ -148,8 +157,8 @@ if TEXTUAL_AVAILABLE:
                 yield Static(
                     f"[bold]Fuzzing Benchmark[/] | {len(self.case_states)} cases | "
                     f"Budget: {budget_str} | "
-                    "[dim]up/down[/] navigate | [dim]t[/] toggle tab | "
-                    "[dim]d[/] dedupe | [dim]q[/] quit",
+                    "[dim]l[/] copy log cmd | [dim]c[/] copy output | [dim]t[/] tab | "
+                    "[dim]SHIFT+drag[/] select | [dim]q[/] quit",
                     id="title",
                 )
 
@@ -160,6 +169,10 @@ if TEXTUAL_AVAILABLE:
                     with TabPane("Fuzzing Output", id="tab-output"):
                         yield RichLog(
                             id="fuzzing-output", wrap=True, highlight=True, markup=True
+                        )
+                    with TabPane("Container Logs", id="tab-container"):
+                        yield RichLog(
+                            id="container-logs", wrap=True, highlight=True, markup=False
                         )
                     with TabPane("Timeline (Time)", id="tab-timeline-time"):
                         yield RichLog(
@@ -244,6 +257,7 @@ if TEXTUAL_AVAILABLE:
                     # Status with indicator
                     status_display = {
                         CaseStatus.PENDING: "pending",
+                        CaseStatus.GENERATING_PATCH: "gen patch",
                         CaseStatus.LOADING_RESPONSE: "loading",
                         CaseStatus.BUILDING_CONTAINER: "building",
                         CaseStatus.ANALYZING_ORIGINAL: "analyzing",
@@ -289,9 +303,7 @@ if TEXTUAL_AVAILABLE:
                         state.gt_timeline.unique_crashes() if state.gt_timeline else 0
                     )
                     llm_unique = (
-                        state.llm_timeline.unique_crashes()
-                        if state.llm_timeline
-                        else 0
+                        state.llm_timeline.unique_crashes() if state.llm_timeline else 0
                     )
                     unique_str = (
                         f"G:{gt_unique} L:{llm_unique}"
@@ -351,7 +363,58 @@ if TEXTUAL_AVAILABLE:
             if state.error:
                 output_log.write(f"[red]Error: {state.error}[/]\n")
             if state.streaming_output:
-                output_log.write(f"\n{state.streaming_output[-2000:]}")
+                output_log.write(f"\n{rich_escape(state.streaming_output[-2000:])}")
+
+            # Container logs - show tail command for monitoring
+            container_log = self.query_one("#container-logs", RichLog)
+            container_log.clear()
+            container_log.write(
+                f"[bold]=== Log Monitoring for Case {state.case_id} ===[/bold]\n\n"
+            )
+
+            from .fuzzing_types import CaseStatus
+
+            if state.status in (CaseStatus.FUZZING_GT, CaseStatus.FUZZING_LLM):
+                # During fuzzing, show the tail command
+                container_log.write("[cyan]Fuzzing is in progress.[/cyan]\n\n")
+                if state.container_logs:
+                    container_log.write(
+                        "To monitor fuzzer output in another terminal:\n\n"
+                    )
+                    container_log.write(
+                        f"  [green]{rich_escape(state.container_logs)}[/green]\n\n"
+                    )
+                container_log.write(
+                    "Or open the log file in your code editor for live updates.\n"
+                )
+            elif state.status == CaseStatus.COMPLETED:
+                container_log.write("[green]Fuzzing completed.[/green]\n\n")
+                if state.container_logs:
+                    container_log.write("To view the full fuzzer log:\n\n")
+                    container_log.write(
+                        f"  [green]{rich_escape(state.container_logs)}[/green]\n\n"
+                    )
+            elif state.status == CaseStatus.GENERATING_PATCH:
+                container_log.write(
+                    "[yellow]LLM patch generation in progress...[/yellow]\n\n"
+                )
+                if state.llm_log_path:
+                    container_log.write("To monitor LLM generation:\n\n")
+                    container_log.write(
+                        f"  [green]tail -f {rich_escape(state.llm_log_path)}[/green]\n\n"
+                    )
+                else:
+                    container_log.write(
+                        "Check the 'Fuzzing Output' tab for LLM generation progress.\n"
+                    )
+            else:
+                if state.container_logs:
+                    container_log.write(
+                        f"  [green]{rich_escape(state.container_logs)}[/green]\n\n"
+                    )
+                else:
+                    container_log.write("[dim]No log file available yet...[/dim]\n\n")
+                    container_log.write("Logs will be available once fuzzing starts.")
 
             # Timeline (Time) view
             time_log = self.query_one("#timeline-time", RichLog)
@@ -387,10 +450,12 @@ if TEXTUAL_AVAILABLE:
                     crash_log.write(f"[yellow]{name} Crashes:[/]\n")
                     for i, crash in enumerate(timeline.crashes[:10]):
                         match_str = (
-                            " [red]*MATCHES ORIGINAL*[/]" if crash.matches_original else ""
+                            " [red]*MATCHES ORIGINAL*[/]"
+                            if crash.matches_original
+                            else ""
                         )
                         crash_log.write(
-                            f"  {i+1}. [{crash.first_seen_time:.1f}s] "
+                            f"  {i + 1}. [{crash.first_seen_time:.1f}s] "
                             f"{crash.crash_type}{match_str}\n"
                         )
                     if len(timeline.crashes) > 10:
@@ -433,9 +498,14 @@ if TEXTUAL_AVAILABLE:
                             x_unit = ""
 
                         log.write(f"\n  Crashes over {x_label}:\n  ")
-                        max_count = max(data["crash_count"]) if data["crash_count"] else 0
+                        max_count = (
+                            max(data["crash_count"]) if data["crash_count"] else 0
+                        )
                         for i, (x, c) in enumerate(
-                            zip(data.get(x_label, data.get("time", [])), data["crash_count"])
+                            zip(
+                                data.get(x_label, data.get("time", [])),
+                                data["crash_count"],
+                            )
                         ):
                             if i % 4 == 0 and max_count > 0:
                                 bar_len = int(c / max_count * 10) if max_count else 0
@@ -446,7 +516,13 @@ if TEXTUAL_AVAILABLE:
         def action_toggle_tab(self) -> None:
             """Toggle between tabs."""
             tabbed = self.query_one(TabbedContent)
-            tabs = ["tab-output", "tab-timeline-time", "tab-timeline-execs", "tab-crashes"]
+            tabs = [
+                "tab-output",
+                "tab-container",
+                "tab-timeline-time",
+                "tab-timeline-execs",
+                "tab-crashes",
+            ]
             current_idx = tabs.index(tabbed.active) if tabbed.active in tabs else 0
             next_idx = (current_idx + 1) % len(tabs)
             tabbed.active = tabs[next_idx]
@@ -454,7 +530,9 @@ if TEXTUAL_AVAILABLE:
         def action_deduplicate(self) -> None:
             """Trigger CASR deduplication on selected case."""
             if self.selected_case_key and self.on_deduplicate:
-                self.notify(f"Running CASR deduplication on {self.selected_case_key}...")
+                self.notify(
+                    f"Running CASR deduplication on {self.selected_case_key}..."
+                )
                 self.on_deduplicate(self.selected_case_key)
 
         def action_refresh(self) -> None:
@@ -463,15 +541,80 @@ if TEXTUAL_AVAILABLE:
             self.update_details()
             self.notify("Refreshed")
 
+        def action_copy_output(self) -> None:
+            """Copy the current fuzzing output to clipboard."""
+            if not self.selected_case_key:
+                self.notify("No case selected", severity="warning")
+                return
+
+            state = self.case_states.get(self.selected_case_key)
+            if not state:
+                self.notify("Case not found", severity="warning")
+                return
+
+            # Build the text to copy
+            lines = [
+                f"Case {state.case_id} - {state.model}",
+                f"Status: {state.status.value}",
+            ]
+            if state.current_activity:
+                lines.append(f"Activity: {state.current_activity}")
+            if state.error:
+                lines.append(f"Error: {state.error}")
+            if state.streaming_output:
+                lines.append("")
+                # Strip markup for clean copy
+                import re
+
+                clean_output = re.sub(
+                    r"\[/?[^\]]+\]", "", state.streaming_output[-4000:]
+                )
+                lines.append(clean_output)
+
+            text = "\n".join(lines)
+            self.copy_to_clipboard(text)
+            self.notify(f"Copied {len(text)} chars to clipboard")
+
+        def action_copy_log_path(self) -> None:
+            """Copy the log file path to clipboard for easy terminal access."""
+            if not self.selected_case_key:
+                self.notify("No case selected", severity="warning")
+                return
+
+            state = self.case_states.get(self.selected_case_key)
+            if not state:
+                self.notify("Case not found", severity="warning")
+                return
+
+            # Determine which log path to copy based on current status
+            from .fuzzing_types import CaseStatus
+
+            log_path = None
+            if state.status in (CaseStatus.FUZZING_GT, CaseStatus.FUZZING_LLM):
+                log_path = state.fuzzer_log_path
+            elif state.status == CaseStatus.GENERATING_PATCH:
+                log_path = state.llm_log_path
+            elif state.status == CaseStatus.COMPLETED:
+                # Prefer fuzzer log if available
+                log_path = state.fuzzer_log_path or state.llm_log_path
+            else:
+                log_path = state.llm_log_path or state.fuzzer_log_path
+
+            if log_path:
+                # Copy the tail command for convenience
+                tail_cmd = f"tail -f {log_path}"
+                self.copy_to_clipboard(tail_cmd)
+                self.notify(f"Copied: {tail_cmd}")
+            else:
+                self.notify("No log file available yet", severity="warning")
+
 else:
     # Stub class when Textual is not available
     class FuzzingTUI:  # type: ignore
         """Stub TUI class when Textual is not installed."""
 
         def __init__(self, *args, **kwargs):
-            raise ImportError(
-                "Textual library not installed. Run: pip install textual"
-            )
+            raise ImportError("Textual library not installed. Run: pip install textual")
 
         def run(self):
             pass

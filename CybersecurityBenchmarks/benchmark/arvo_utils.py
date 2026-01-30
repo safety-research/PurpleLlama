@@ -1180,15 +1180,24 @@ class ArvoContainer:
         self.logger.debug(f"Patch applied with return code: {result.returncode}.")
         return result.stdout
 
-    async def recompile(self, combine_outputs: bool = False) -> CompletedProcess[bytes]:
-        """Recompile the repo."""
-        self.logger.debug("Recompiling...")
+    async def recompile(
+        self, combine_outputs: bool = False, use_debug_flags: bool = True
+    ) -> CompletedProcess[bytes]:
+        """Recompile the repo.
+        
+        Args:
+            combine_outputs: Whether to combine stdout and stderr.
+            use_debug_flags: If True, use -O0 and -g2 flags for differential debugging.
+                           If False, use the original container flags (for continuous fuzzing).
+        """
+        self.logger.debug(f"Recompiling (use_debug_flags={use_debug_flags})...")
+        
         result = await self.exec_command(
             cmd_args=["arvo", "compile"],
             combine_outputs=combine_outputs,
             env_vars={
-                "CFLAGS": await self._get_updated_compiler_flags("CFLAGS"),
-                "CXXFLAGS": await self._get_updated_compiler_flags("CXXFLAGS"),
+                "CFLAGS": await self._get_updated_compiler_flags("CFLAGS", use_debug_flags),
+                "CXXFLAGS": await self._get_updated_compiler_flags("CXXFLAGS", use_debug_flags),
             },
         )
         self.logger.debug(f"Recompile completed with return code: {result.returncode}.")
@@ -1572,9 +1581,14 @@ class ArvoContainer:
             f"Image cleanup completed for {self.arvo_id}-{self.container_type}."
         )
 
-    async def qa_checks(self) -> bool:
-        """Run QA checks on the container."""
-        self.logger.debug("Running QA checks...")
+    async def qa_checks(self, use_debug_flags: bool = True) -> bool:
+        """Run QA checks on the container.
+        
+        Args:
+            use_debug_flags: If True, use -O0 and -g2 flags for differential debugging.
+                           If False, use the original container flags (for continuous fuzzing).
+        """
+        self.logger.debug(f"Running QA checks (use_debug_flags={use_debug_flags})...")
         if self.container_id == ArvoContainer.CONTAINER_ID_NOT_INITIALIZED:
             self.logger.debug("Failed QA checks as container is not initialized.")
             return False
@@ -1583,7 +1597,7 @@ class ArvoContainer:
             if self.container_type == ArvoContainer.CONTAINER_TYPE_VUL
             else not await self.does_program_crash()
         )
-        recompile_results = await self.recompile()
+        recompile_results = await self.recompile(use_debug_flags=use_debug_flags)
         compiles_successfully = recompile_results.returncode == 0
         qa_passed = crash_reproduces_expectedly and compiles_successfully
         self.logger.debug(f"QA checks completed. Passed? {qa_passed}.")
@@ -1666,20 +1680,32 @@ class ArvoContainer:
         return Path(__file__).parent.resolve() / "autopatch" / "build"
 
     @alru_cache()
-    async def _get_updated_compiler_flags(self, env_name: str) -> str:
+    async def _get_updated_compiler_flags(
+        self, env_name: str, use_debug_flags: bool = True
+    ) -> str:
+        """Get compiler flags, optionally modified for debugging.
+        
+        Args:
+            env_name: The environment variable name (CFLAGS or CXXFLAGS).
+            use_debug_flags: If True, override with -O0 and -g2 for differential debugging.
+                           If False, return the original container flags.
+        """
         flags = (
             (await self.exec_command(cmd_args=["printenv", env_name]))
             .stdout.decode()
             .strip()
         )
-        # Set optimization flag to `-O0``
-        flags = self._update_flags(
-            flags, self.OPT_FLAG_PATTERN, self.OPT_FLAG_FOR_BINARIES
-        )
-        # Set debug flag to `-g2`
-        flags = self._update_flags(
-            flags, self.DEBUG_FLAG_PATTERN, self.DEBUG_FLAG_FOR_BINARIES
-        )
+        
+        if use_debug_flags:
+            # Set optimization flag to `-O0`
+            flags = self._update_flags(
+                flags, self.OPT_FLAG_PATTERN, self.OPT_FLAG_FOR_BINARIES
+            )
+            # Set debug flag to `-g2`
+            flags = self._update_flags(
+                flags, self.DEBUG_FLAG_PATTERN, self.DEBUG_FLAG_FOR_BINARIES
+            )
+        
         return flags
 
     @staticmethod

@@ -112,15 +112,20 @@ class FuzzingOnlyBenchmark(Benchmark):
         return [cls.BENCHMARK_NAME]
 
     def _determine_test_cases(self, config: BenchmarkConfig) -> List[int]:
-        """Determine which test cases to run based on config."""
-        if config.response_path.exists():
-            # Use existing responses
-            return self._get_test_cases_from_responses(config.response_path)
-        elif config.prompt_path:
-            # Use prompt path for test case list
+        """Determine which test cases to run based on config.
+        
+        Priority:
+        1. If prompt_path is provided, use it (user explicitly specified which cases to run)
+        2. Otherwise, if response_path exists, use it (resuming a previous run)
+        """
+        if config.prompt_path:
+            # Prompt path takes priority - user explicitly specified which cases to run
             return self._get_test_cases_from_prompt(
                 config.num_test_cases, Path(config.prompt_path)
             )
+        elif config.response_path.exists():
+            # Fall back to existing responses (for resuming without prompt path)
+            return self._get_test_cases_from_responses(config.response_path)
         return []
 
     def _get_test_cases_from_responses(self, response_path: Path) -> List[int]:
@@ -305,9 +310,9 @@ class FuzzingOnlyBenchmark(Benchmark):
         )
         await fix_container.start_container()
 
-        # QA checks of vul and fix containers
-        containers_pass_qa_checks = (await vul_container.qa_checks()) and (
-            await fix_container.qa_checks()
+        # QA checks of vul and fix containers (use original flags, not debug flags)
+        containers_pass_qa_checks = (await vul_container.qa_checks(use_debug_flags=False)) and (
+            await fix_container.qa_checks(use_debug_flags=False)
         )
 
         patch_success = False
@@ -322,6 +327,7 @@ class FuzzingOnlyBenchmark(Benchmark):
                     llm_under_test,
                     patch_filepath,
                     binary_filepath,
+                    use_debug_flags=False,  # Use original flags for continuous fuzzing
                 )
                 LOG.info(f"Starting patch generation agent for case #{case_id}")
                 report = await asyncio.wait_for(
@@ -938,8 +944,9 @@ class FuzzingOnlyBenchmark(Benchmark):
         state.current_activity = "Running QA checks..."
         update_streaming_output("Running QA checks on containers...")
 
-        vul_qa = await vul_container.qa_checks()
-        fix_qa = await fix_container.qa_checks()
+        # Use original flags (not debug flags like -O0/-g2) for continuous fuzzing
+        vul_qa = await vul_container.qa_checks(use_debug_flags=False)
+        fix_qa = await fix_container.qa_checks(use_debug_flags=False)
         containers_pass_qa_checks = vul_qa and fix_qa
 
         update_streaming_output(f"QA checks: vul={vul_qa}, fix={fix_qa}")
@@ -974,6 +981,7 @@ class FuzzingOnlyBenchmark(Benchmark):
                     patch_filepath,
                     binary_filepath,
                     message_callback=llm_message_callback,
+                    use_debug_flags=False,  # Use original flags for continuous fuzzing
                 )
                 state.current_activity = "LLM generating patch..."
                 update_streaming_output("Starting LLM patch generation agent...")
@@ -1116,9 +1124,9 @@ class FuzzingOnlyBenchmark(Benchmark):
             
             LOG.info(f"Case {case_id}: Patch applied successfully")
             
-            # Recompile
+            # Recompile (use original flags, not debug flags like -O0/-g2)
             state.current_activity = "Recompiling with patch..."
-            recompile_result = await vul_container.recompile()
+            recompile_result = await vul_container.recompile(use_debug_flags=False)
             
             if recompile_result.returncode != 0:
                 LOG.error(f"Case {case_id}: Recompilation failed: {recompile_result.stderr.decode()}")

@@ -63,6 +63,7 @@ class AutoPatchAgent:
         patch_filepath: Path,
         binary_filepath: Path,
         message_callback: Optional[callable] = None,
+        use_debug_flags: bool = True,
     ) -> None:
         self.container: ArvoContainer = container
         self.llm_under_test: LLM = llm_under_test
@@ -70,6 +71,7 @@ class AutoPatchAgent:
         self.binary_filepath: Path = binary_filepath
         self._patched_function_name: Optional[str] = None
         self._message_callback: Optional[callable] = message_callback
+        self._use_debug_flags: bool = use_debug_flags
 
     async def generate_and_persist_patch_and_binary(self) -> PatchGenerationReport:
         """
@@ -79,7 +81,7 @@ class AutoPatchAgent:
         pg = PatchGenerator(
             llm_class=get_autopatch_llm(self.llm_under_test, self._message_callback),
             source_utils=autopatch_source_utils,
-            patch_verifier=AutoPatchVerifier(self.container),
+            patch_verifier=AutoPatchVerifier(self.container, use_debug_flags=self._use_debug_flags),
             patcher=AutoPatcher(self.container, autopatch_source_utils),
             # TODO: Make these configurable
             config=PatchGenConfig(
@@ -292,8 +294,11 @@ def get_autopatch_source_utils(container: ArvoContainer) -> SourceUtilsInterface
 
 
 class AutoPatchVerifier(PatchVerifierInterface):
-    def __init__(self, container: ArvoContainer) -> None:
+    def __init__(
+        self, container: ArvoContainer, use_debug_flags: bool = True
+    ) -> None:
         self.container: ArvoContainer = container
+        self.use_debug_flags: bool = use_debug_flags
 
     async def reproduce_crash(self, crash_id: int) -> CrashReproduceResult:
         """
@@ -306,7 +311,9 @@ class AutoPatchVerifier(PatchVerifierInterface):
 
         if self.container.build_status == BuildStatus.UNBUILT:
             # Attempt to recompile the repo
-            recompilation_result = await self.container.recompile(combine_outputs=True)
+            recompilation_result = await self.container.recompile(
+                combine_outputs=True, use_debug_flags=self.use_debug_flags
+            )
             if recompilation_result.returncode != 0:
                 logs = recompilation_result.stdout.decode()
                 self.container.logger.debug(f"Build failed with error: {logs}")

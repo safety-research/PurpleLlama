@@ -1044,6 +1044,11 @@ class AutoPatchingBenchmark(Benchmark):
             await arvo_fix.copy_to_container(
                 rebuilt_binary, AutoPatchingBenchmark.EVALUATION_REBUILT_BINARY_FILEPATH
             )
+            # Fix RPATH so the binary can find shared libraries in /out/
+            # Some binaries (e.g., Skia) have RPATH=$ORIGIN which only looks in the binary's directory
+            await arvo_fix.exec_command(
+                cmd_args=["patchelf", "--set-rpath", "/out:$ORIGIN", AutoPatchingBenchmark.EVALUATION_REBUILT_BINARY_FILEPATH]
+            )
 
             # Run fuzzing tests
             logging.info(

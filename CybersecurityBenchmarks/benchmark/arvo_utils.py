@@ -192,6 +192,79 @@ class ArvoContainer:
         cls._container_repository = container_repository
 
     @classmethod
+    def check_podman_login_status(cls, container_repository: str) -> bool:
+        """Check if the user is logged into podman for the given repository.
+
+        Args:
+            container_repository: The container repository URL to check.
+
+        Returns:
+            True if logged in or using localhost, False if not logged in to a remote registry.
+        """
+        # Skip check for local repositories
+        if "localhost" in container_repository:
+            return True
+
+        # Extract registry hostname from repository URL
+        # e.g., "docker.io/myrepo" -> "docker.io"
+        # e.g., "ghcr.io/org/repo" -> "ghcr.io"
+        registry = container_repository.split("/")[0]
+
+        # Check if logged in using podman login --get-login
+        try:
+            result = subprocess.run(
+                ["podman", "login", "--get-login", registry],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                logging.info(
+                    f"[PODMAN] Logged into {registry} as {result.stdout.strip()}"
+                )
+                return True
+        except Exception as e:
+            logging.debug(f"Error checking podman login status: {e}")
+
+        # Also check auth.json for stored credentials
+        auth_paths = [
+            Path.home() / ".config" / "containers" / "auth.json",
+            Path("/run/containers/0/auth.json"),
+        ]
+        for auth_path in auth_paths:
+            if auth_path.exists():
+                try:
+                    with open(auth_path) as f:
+                        auth_data = json.load(f)
+                        if "auths" in auth_data and registry in auth_data["auths"]:
+                            logging.info(
+                                f"[PODMAN] Found stored credentials for {registry}"
+                            )
+                            return True
+                except Exception as e:
+                    logging.debug(f"Error reading auth file {auth_path}: {e}")
+
+        return False
+
+    @classmethod
+    def warn_if_not_logged_in(cls, container_repository: str) -> None:
+        """Warn the user if they are not logged into podman for the given repository.
+
+        This helps avoid rate limiting issues when pulling images from remote registries.
+        """
+        if not cls.check_podman_login_status(container_repository):
+            registry = container_repository.split("/")[0]
+            logging.warning(
+                f"[PODMAN] Not logged into {registry}. You may experience rate limiting "
+                f"when pulling images. Consider running: podman login {registry}"
+            )
+            print(
+                f"\n⚠️  Warning: Not logged into {registry}. "
+                f"You may experience rate limiting when pulling images."
+            )
+            print(f"   Consider running: podman login {registry}\n")
+
+    @classmethod
     def set_output_dir(cls, output_dir: Path) -> None:
         """Set the output directory for storing build logs."""
         logging.debug(f"Setting output directory to {output_dir}.")
@@ -265,6 +338,10 @@ class ArvoContainer:
                 f"Skipping container image build for repository {container_repository}."
             )
             return test_cases
+
+        # Check if user is logged into remote registry to avoid rate limiting
+        if "localhost" not in container_repository:
+            cls.warn_if_not_logged_in(container_repository)
 
         # Otherwise, build images that are missing from the container repository
         # to build images, we need to check/download required dpkgs first
@@ -449,24 +526,57 @@ class ArvoContainer:
                 "linux/amd64",
                 str(cls._get_build_dir()),
             ]
-            # Run the build command synchronously using subprocess
-            result = subprocess.run(
-                build_cmd_args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # Combine stdout and stderr
+
+            # Set up log file for streaming output
+            build_logs_dir = cls._get_build_logs_dir()
+            log_file_path = None
+            if build_logs_dir is not None:
+                log_file_path = build_logs_dir / f"{arvo_id}-{container_type}.log"
+
+            # Run build with streaming output to log file
+            output_lines: list[bytes] = []
+            with (
+                open(log_file_path, "wb")
+                if log_file_path
+                else open("/dev/null", "wb") as log_file
+            ):
+                # Write header
+                header = f"=== Building {image_tag} ===\n"
+                log_file.write(header.encode())
+                log_file.flush()
+
+                # Start the build process
+                process = subprocess.Popen(
+                    build_cmd_args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # Combine stdout and stderr
+                )
+
+                # Stream output line by line
+                while True:
+                    line = process.stdout.readline()
+                    if not line and process.poll() is not None:
+                        break
+                    if line:
+                        output_lines.append(line)
+                        log_file.write(line)
+                        log_file.flush()  # Flush to make visible to TUI immediately
+
+                # Wait for process to complete and get return code
+                returncode = process.wait()
+
+            # Create CompletedProcess for compatibility with existing code
+            result = subprocess.CompletedProcess(
+                args=build_cmd_args,
+                returncode=returncode,
+                stdout=b"".join(output_lines),
+                stderr=None,
             )
 
-            # Save build log to file if output directory is configured
-            build_logs_dir = cls._get_build_logs_dir()
-            log_file = None
-            if build_logs_dir is not None:
-                log_file = build_logs_dir / f"{arvo_id}-{container_type}.log"
-                log_file.write_bytes(result.stdout or b"")
-
             if result.returncode != 0:
-                if log_file:
+                if log_file_path:
                     build_logger.error(
-                        f"Build failed for {arvo_id}-{container_type}. See log: {log_file}"
+                        f"Build failed for {arvo_id}-{container_type}. See log: {log_file_path}"
                     )
                 else:
                     # No log file, print output to terminal
@@ -1184,20 +1294,24 @@ class ArvoContainer:
         self, combine_outputs: bool = False, use_debug_flags: bool = True
     ) -> CompletedProcess[bytes]:
         """Recompile the repo.
-        
+
         Args:
             combine_outputs: Whether to combine stdout and stderr.
             use_debug_flags: If True, use -O0 and -g2 flags for differential debugging.
                            If False, use the original container flags (for continuous fuzzing).
         """
         self.logger.debug(f"Recompiling (use_debug_flags={use_debug_flags})...")
-        
+
         result = await self.exec_command(
             cmd_args=["arvo", "compile"],
             combine_outputs=combine_outputs,
             env_vars={
-                "CFLAGS": await self._get_updated_compiler_flags("CFLAGS", use_debug_flags),
-                "CXXFLAGS": await self._get_updated_compiler_flags("CXXFLAGS", use_debug_flags),
+                "CFLAGS": await self._get_updated_compiler_flags(
+                    "CFLAGS", use_debug_flags
+                ),
+                "CXXFLAGS": await self._get_updated_compiler_flags(
+                    "CXXFLAGS", use_debug_flags
+                ),
             },
         )
         self.logger.debug(f"Recompile completed with return code: {result.returncode}.")
@@ -1583,7 +1697,7 @@ class ArvoContainer:
 
     async def qa_checks(self, use_debug_flags: bool = True) -> bool:
         """Run QA checks on the container.
-        
+
         Args:
             use_debug_flags: If True, use -O0 and -g2 flags for differential debugging.
                            If False, use the original container flags (for continuous fuzzing).
@@ -1684,7 +1798,7 @@ class ArvoContainer:
         self, env_name: str, use_debug_flags: bool = True
     ) -> str:
         """Get compiler flags, optionally modified for debugging.
-        
+
         Args:
             env_name: The environment variable name (CFLAGS or CXXFLAGS).
             use_debug_flags: If True, override with -O0 and -g2 for differential debugging.
@@ -1695,7 +1809,7 @@ class ArvoContainer:
             .stdout.decode()
             .strip()
         )
-        
+
         if use_debug_flags:
             # Set optimization flag to `-O0`
             flags = self._update_flags(
@@ -1705,7 +1819,7 @@ class ArvoContainer:
             flags = self._update_flags(
                 flags, self.DEBUG_FLAG_PATTERN, self.DEBUG_FLAG_FOR_BINARIES
             )
-        
+
         return flags
 
     @staticmethod

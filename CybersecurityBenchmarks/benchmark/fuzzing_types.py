@@ -29,6 +29,14 @@ class FuzzingTarget(str, Enum):
     LLM_PATCH = "llm_patch"
 
 
+class FuzzerType(str, Enum):
+    """Type of fuzzer the binary was built for."""
+
+    LIBFUZZER = "libfuzzer"  # Standard libFuzzer (runs binary directly)
+    AFL_PLUS_PLUS = "afl++"  # AFL++ (requires afl-fuzz driver)
+    UNKNOWN = "unknown"  # Unable to detect
+
+
 class CaseStatus(str, Enum):
     """Status of a fuzzing case."""
 
@@ -238,6 +246,14 @@ class CaseState:
     fuzzer_log_path: Optional[str] = None  # Path to fuzzer output log
     llm_log_path: Optional[str] = None  # Path to LLM generation log
 
+    # PTY-related fields for v2 TUI
+    pty_command: Optional[List[str]] = None  # Current command running in PTY
+    container_id: Optional[str] = None  # Container ID for this case
+    pty_output_buffer: str = ""  # Captured PTY output for logging
+
+    # Fuzzer type detection
+    fuzzer_type: Optional["FuzzerType"] = None  # Detected fuzzer type (libFuzzer or AFL++)
+
     def get_key(self) -> str:
         """Get unique key for this case."""
         return f"{self.case_id}_{self.model}"
@@ -276,6 +292,7 @@ class FuzzingConfig:
 
     # TUI settings
     enable_tui: bool = True
+    use_tui_v2: bool = False  # Use v2 TUI with PTY-based terminal widget
 
     @classmethod
     def from_additional_args(cls, args_str: Optional[str]) -> "FuzzingConfig":
@@ -335,12 +352,33 @@ class FuzzingConfig:
             elif arg == "--no-enable-tui":
                 config.enable_tui = False
                 i += 1
+            elif arg == "--use-tui-v2":
+                config.use_tui_v2 = True
+                i += 1
+            elif arg == "--no-use-tui-v2":
+                config.use_tui_v2 = False
+                i += 1
             else:
                 i += 1
 
         return config
 
-    def get_fuzzer_args(self) -> str:
+    def get_fuzzer_args(self, fuzzer_type: "FuzzerType" = None) -> str:
+        """Get fuzzer arguments string based on fuzzer type.
+        
+        Args:
+            fuzzer_type: The type of fuzzer (libFuzzer or AFL++).
+                        Defaults to libFuzzer for backward compatibility.
+        """
+        if fuzzer_type is None:
+            fuzzer_type = FuzzerType.LIBFUZZER
+            
+        if fuzzer_type == FuzzerType.AFL_PLUS_PLUS:
+            return self._get_afl_plus_plus_args()
+        else:
+            return self._get_libfuzzer_args()
+    
+    def _get_libfuzzer_args(self) -> str:
         """Get LibFuzzer arguments string."""
         args = ["-rss_limit_mb=2560", "-timeout=25"]
 
@@ -362,6 +400,68 @@ class FuzzingConfig:
         args.append("-print_final_stats=1")
 
         return " ".join(args)
+    
+    def _get_afl_plus_plus_args(self) -> str:
+        """Get AFL++ afl-fuzz arguments string.
+        
+        AFL++ requires different flags than libFuzzer:
+        - Uses -V for time limit (in seconds)
+        - Uses -i for input directory, -o for output directory
+        - Uses -t for per-execution timeout (in ms)
+        - Uses -m for memory limit
+        """
+        args = []
+        
+        # Time limit for fuzzing session
+        if self.budget_type == BudgetType.TIME:
+            duration_secs = self.fuzzing_duration_minutes * 60
+            args.append(f"-V {duration_secs}")
+        # Note: AFL++ doesn't have a direct equivalent to -runs for execution count
+        # We use time-based limit as the primary constraint
+        
+        # Per-execution timeout (in milliseconds)
+        args.append("-t 25000")  # 25 seconds, matching libFuzzer timeout
+        
+        # Memory limit (0 = no limit, like rss_limit_mb behavior)
+        args.append("-m none")
+        
+        # Continuous mode - AFL++ handles crashes differently
+        # By default, AFL++ stops on first unique crash unless we configure it otherwise
+        # AFL_BENCH_UNTIL_CRASH or AFL_EXIT_WHEN_DONE can be used
+        # For continuous fuzzing, we want it to keep running
+        
+        return " ".join(args)
+    
+    def get_afl_environment_vars(self) -> dict:
+        """Get environment variables for AFL++ fuzzing.
+        
+        Note: ASAN_OPTIONS is handled specially - we append to existing value
+        rather than replacing it, to preserve container-specific settings.
+        """
+        env = {}
+        
+        # Continue fuzzing after finding crashes (don't exit early)
+        if self.ignore_crashes:
+            env["AFL_AUTORESUME"] = "1"
+        
+        # Performance optimizations
+        env["AFL_SKIP_CPUFREQ"] = "1"
+        env["AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES"] = "1"
+        env["AFL_NO_UI"] = "1"  # Disable AFL's TUI since we have our own
+        
+        return env
+    
+    def get_afl_asan_options_fix(self) -> str:
+        """Get shell command to fix ASAN_OPTIONS for AFL++.
+        
+        AFL++ requires abort_on_error=1 in ASAN_OPTIONS. We unconditionally
+        prepend it to ensure it's always present (duplicates are harmless).
+        """
+        return '''
+# Ensure ASAN_OPTIONS has abort_on_error=1 (required by AFL++)
+# Unconditionally prepend to handle all cases - duplicates are harmless
+export ASAN_OPTIONS="abort_on_error=1:${ASAN_OPTIONS:-symbolize=0:detect_leaks=0}"
+'''
 
 
 @dataclass

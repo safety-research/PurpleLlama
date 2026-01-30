@@ -20,6 +20,9 @@ RUN OSVER=$(cat /etc/os-release |grep VERSION_ID | cut -c13-17) && \
 
 RUN apt -f -y install /tmp/differential-debugging-deps.deb && echo '/usr/local/lib' > /etc/ld.so.conf.d/local.conf && ldconfig
 
+# Install patchelf for fixing RPATH of rebuilt binaries
+RUN apt-get update && apt-get install -y --no-install-recommends patchelf && rm -rf /var/lib/apt/lists/*
+
 RUN rm /tmp/differential-debugging-deps.deb /tmp/differential-debugging-deps-20.04.deb /tmp/differential-debugging-deps-16.04.deb
 
 # Configure LLDB

@@ -81,7 +81,9 @@ class AutoPatchAgent:
         pg = PatchGenerator(
             llm_class=get_autopatch_llm(self.llm_under_test, self._message_callback),
             source_utils=autopatch_source_utils,
-            patch_verifier=AutoPatchVerifier(self.container, use_debug_flags=self._use_debug_flags),
+            patch_verifier=AutoPatchVerifier(
+                self.container, use_debug_flags=self._use_debug_flags
+            ),
             patcher=AutoPatcher(self.container, autopatch_source_utils),
             # TODO: Make these configurable
             config=PatchGenConfig(
@@ -183,7 +185,12 @@ def get_autopatch_llm(
             self._model: str = llm_under_test.model
             self._messages: List[BaseMessage] = [SystemMessage(content=system_prompt)]
             if message_callback:
-                message_callback("system", system_prompt[:500] + "..." if len(system_prompt) > 500 else system_prompt)
+                message_callback(
+                    "system",
+                    system_prompt[:500] + "..."
+                    if len(system_prompt) > 500
+                    else system_prompt,
+                )
 
         async def query(self, message: str, temperature: Optional[float] = None) -> str:
             system_message, history = self._get_message_history_in_str()
@@ -216,7 +223,11 @@ def get_autopatch_llm(
 
                     # Notify callback about the assistant response
                     if message_callback:
-                        display_resp = response[:1500] + "..." if len(response) > 1500 else response
+                        display_resp = (
+                            response[:1500] + "..."
+                            if len(response) > 1500
+                            else response
+                        )
                         message_callback("assistant", display_resp)
 
                     # ensure string type
@@ -224,7 +235,10 @@ def get_autopatch_llm(
                 except Exception as e:
                     logging.warning(f"Exception raised: {e}")
                     if message_callback:
-                        message_callback("error", f"Attempt {attempt + 1}/{AutoPatchLLM.MAX_RETRIES}: {e}")
+                        message_callback(
+                            "error",
+                            f"Attempt {attempt + 1}/{AutoPatchLLM.MAX_RETRIES}: {e}",
+                        )
                     if attempt == AutoPatchLLM.MAX_RETRIES - 1:
                         raise RuntimeError(
                             f"LLM query failed after {AutoPatchLLM.MAX_RETRIES} retries."
@@ -294,9 +308,7 @@ def get_autopatch_source_utils(container: ArvoContainer) -> SourceUtilsInterface
 
 
 class AutoPatchVerifier(PatchVerifierInterface):
-    def __init__(
-        self, container: ArvoContainer, use_debug_flags: bool = True
-    ) -> None:
+    def __init__(self, container: ArvoContainer, use_debug_flags: bool = True) -> None:
         self.container: ArvoContainer = container
         self.use_debug_flags: bool = use_debug_flags
 

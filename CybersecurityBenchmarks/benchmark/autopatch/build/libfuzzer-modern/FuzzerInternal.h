@@ -107,6 +107,9 @@ private:
   void DumpCurrentUnit(const char *Prefix);
   void DeathCallback();
 
+  // Redirect stderr to a per-crash log file for CASR-based deduplication
+  void RedirectStderrToCrashLog(const char *Prefix);
+
   void AllocateCurrentUnitData();
   uint8_t *CurrentUnitData = nullptr;
   std::atomic<size_t> CurrentUnitSize;

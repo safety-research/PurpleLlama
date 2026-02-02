@@ -118,7 +118,7 @@ if TEXTUAL_AVAILABLE:
             from .fuzzing_types import CaseStatus
 
             table = self.query_one("#cases-table", DataTable)
-            cols = table.add_columns("Case", "Model", "Status", "Execs", "Crashes")
+            cols = table.add_columns("Case", "Model", "Status", "Execs", "Clusters")
             self._col_keys = {
                 "case_id": cols[0],
                 "model": cols[1],
@@ -215,12 +215,12 @@ if TEXTUAL_AVAILABLE:
 
                 try:
                     ex = f"{s.current_executions:,}" if s.current_executions else ""
-                    gt = len(s.gt_timeline.crashes) if s.gt_timeline else 0
-                    llm = len(s.llm_timeline.crashes) if s.llm_timeline else 0
-                    cr = f"G:{gt} L:{llm}" if gt or llm else ""
+                    gt = s.gt_timeline.unique_crashes() if s.gt_timeline else 0
+                    llm = s.llm_timeline.unique_crashes() if s.llm_timeline else 0
+                    cl = f"G:{gt} L:{llm}" if gt or llm else ""
                     table.update_cell(k, self._col_keys["status"], self._fmt(s))
                     table.update_cell(k, self._col_keys["execs"], ex)
-                    table.update_cell(k, self._col_keys["crashes"], cr)
+                    table.update_cell(k, self._col_keys["crashes"], cl)
                     # During build phase, hide model column (containers aren't model-specific)
                     if (
                         s.status in (CaseStatus.BUILDING_CONTAINER, CaseStatus.PENDING)
@@ -354,11 +354,11 @@ if TEXTUAL_AVAILABLE:
                 pv.write("\n[dim]--- Summary ---[/dim]\n")
                 if s.gt_timeline:
                     pv.write(
-                        f"[cyan]GT:[/] {s.gt_timeline.duration_seconds:.1f}s {s.gt_timeline.total_executions:,}ex {len(s.gt_timeline.crashes)}cr\n"
+                        f"[cyan]GT:[/] {s.gt_timeline.duration_seconds:.1f}s {s.gt_timeline.total_executions:,}ex {s.gt_timeline.unique_crashes()}cl ({len(s.gt_timeline.crashes)}cr)\n"
                     )
                 if s.llm_timeline:
                     pv.write(
-                        f"[yellow]LLM:[/] {s.llm_timeline.duration_seconds:.1f}s {s.llm_timeline.total_executions:,}ex {len(s.llm_timeline.crashes)}cr\n"
+                        f"[yellow]LLM:[/] {s.llm_timeline.duration_seconds:.1f}s {s.llm_timeline.total_executions:,}ex {s.llm_timeline.unique_crashes()}cl ({len(s.llm_timeline.crashes)}cr)\n"
                     )
 
         def _tail(self, lp, n=30) -> str:

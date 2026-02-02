@@ -219,6 +219,36 @@ class CrashTimeline:
             "unique_crashes": self.unique_crashes(),
         }
 
+    def to_minimal_dict(self) -> Dict[str, Any]:
+        """Convert to minimal JSON format for crashes.json.
+
+        Simplified format optimized for plotting unique crashes over time:
+        - crashes: array of minimal crash info (id, time, cluster)
+        - summary: total and unique crash counts
+        """
+        return {
+            "target": self.target.value,
+            "case_id": self.case_id,
+            "model": self.model,
+            "duration_seconds": self.duration_seconds,
+            "total_executions": self.total_executions,
+            "crashes": [
+                {
+                    "crash_id": c.crash_id,
+                    "first_seen_time": c.first_seen_time,
+                    "first_seen_executions": c.first_seen_executions,
+                    "cluster_id": c.cluster_id,
+                }
+                for c in self.crashes
+            ],
+            "summary": {
+                "total_crashes": len(self.crashes),
+                "unique_crashes": self.unique_crashes(),
+                "time_to_original_crash": self.time_to_original_crash,
+                "reproduced_original": self.reproduced_original,
+            },
+        }
+
 
 @dataclass
 class CaseState:
@@ -273,7 +303,12 @@ class FuzzingConfig:
     max_executions: int = 1_000_000
 
     # Continuous mode settings
-    fork_jobs: int = 4  # Parallel fuzzing workers
+    # fork_jobs: Number of parallel fuzzing workers per case (libFuzzer only)
+    # - libFuzzer uses -fork=N to spawn N parallel workers
+    # - AFL++ currently runs single-threaded (parallel mode not yet implemented)
+    # - Total processes = num_containers × fork_jobs
+    # - Default is 1 to avoid overloading system when running many cases in parallel
+    fork_jobs: int = 1
     ignore_crashes: bool = True
 
     # CASR settings
@@ -363,75 +398,10 @@ class FuzzingConfig:
 
         return config
 
-    def get_fuzzer_args(self, fuzzer_type: "FuzzerType" = None) -> str:
-        """Get fuzzer arguments string based on fuzzer type.
-        
-        Args:
-            fuzzer_type: The type of fuzzer (libFuzzer or AFL++).
-                        Defaults to libFuzzer for backward compatibility.
-        """
-        if fuzzer_type is None:
-            fuzzer_type = FuzzerType.LIBFUZZER
-            
-        if fuzzer_type == FuzzerType.AFL_PLUS_PLUS:
-            return self._get_afl_plus_plus_args()
-        else:
-            return self._get_libfuzzer_args()
-    
-    def _get_libfuzzer_args(self) -> str:
-        """Get LibFuzzer arguments string."""
-        args = ["-rss_limit_mb=2560", "-timeout=25"]
+    # NOTE: Fuzzer args are built directly in fuzzing_only_benchmark.py's
+    # _configure_libfuzzer() and _configure_afl_plus_plus() methods,
+    # which have access to run_id and target for crash directory paths.
 
-        if self.budget_type == BudgetType.TIME:
-            duration_secs = self.fuzzing_duration_minutes * 60
-            args.append(f"-max_total_time={duration_secs}")
-        else:
-            args.append(f"-runs={self.max_executions}")
-
-        # Continuous mode args
-        if self.fork_jobs > 1:
-            args.append(f"-fork={self.fork_jobs}")
-        if self.ignore_crashes:
-            args.append("-ignore_crashes=1")
-            args.append("-ignore_ooms=1")
-            args.append("-ignore_timeouts=1")
-
-        # Print stats at end
-        args.append("-print_final_stats=1")
-
-        return " ".join(args)
-    
-    def _get_afl_plus_plus_args(self) -> str:
-        """Get AFL++ afl-fuzz arguments string.
-        
-        AFL++ requires different flags than libFuzzer:
-        - Uses -V for time limit (in seconds)
-        - Uses -i for input directory, -o for output directory
-        - Uses -t for per-execution timeout (in ms)
-        - Uses -m for memory limit
-        """
-        args = []
-        
-        # Time limit for fuzzing session
-        if self.budget_type == BudgetType.TIME:
-            duration_secs = self.fuzzing_duration_minutes * 60
-            args.append(f"-V {duration_secs}")
-        # Note: AFL++ doesn't have a direct equivalent to -runs for execution count
-        # We use time-based limit as the primary constraint
-        
-        # Per-execution timeout (in milliseconds)
-        args.append("-t 25000")  # 25 seconds, matching libFuzzer timeout
-        
-        # Memory limit (0 = no limit, like rss_limit_mb behavior)
-        args.append("-m none")
-        
-        # Continuous mode - AFL++ handles crashes differently
-        # By default, AFL++ stops on first unique crash unless we configure it otherwise
-        # AFL_BENCH_UNTIL_CRASH or AFL_EXIT_WHEN_DONE can be used
-        # For continuous fuzzing, we want it to keep running
-        
-        return " ".join(args)
-    
     def get_afl_environment_vars(self) -> dict:
         """Get environment variables for AFL++ fuzzing.
         

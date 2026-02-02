@@ -27,15 +27,46 @@ RUN rm /tmp/differential-debugging-deps.deb /tmp/differential-debugging-deps-20.
 
 # Install CASR (Crash Analysis and Severity Reporting) for crash deduplication
 # Download with: ./download_casr.sh (run once on host before building containers)
-COPY ./casr-x86_64-unknown-linux-gnu.tar.xz /tmp/casr.tar.xz
+#
+# CASR requires glibc 2.25+, but containers have glibc 2.23. We install glibc 2.35
+# to /opt/glibc-new/ and patch CASR binaries to use it via RPATH, avoiding
+# conflicts with the system glibc.
+
+# Install glibc 2.35 to /opt/glibc-new/ (separate from system glibc)
+COPY ./libc6_2.35-0ubuntu3_amd64.deb /tmp/glibc.deb
+RUN mkdir -p /opt/glibc-new && \
+    dpkg-deb -x /tmp/glibc.deb /opt/glibc-new/ && \
+    rm /tmp/glibc.deb
+
+# Copy and patch CASR binaries (built from forked source) to use new glibc
+COPY ./casr-binaries.tar.gz /tmp/casr.tar.gz
 RUN mkdir -p /usr/local/casr && \
-    tar -xf /tmp/casr.tar.xz -C /usr/local/casr --strip-components=1 && \
-    ln -sf /usr/local/casr/casr-afl /usr/bin/casr-afl && \
-    ln -sf /usr/local/casr/casr-cluster /usr/bin/casr-cluster && \
-    ln -sf /usr/local/casr/casr-libfuzzer /usr/bin/casr-libfuzzer && \
-    ln -sf /usr/local/casr/casr-san /usr/bin/casr-san && \
-    ln -sf /usr/local/casr/casr-gdb /usr/bin/casr-gdb && \
-    rm /tmp/casr.tar.xz
+    tar -xzf /tmp/casr.tar.gz -C /usr/local/casr && \
+    rm /tmp/casr.tar.gz && \
+    # Patch each CASR binary to use the new glibc via RPATH and dynamic linker
+    for tool in /usr/local/casr/bin/casr-*; do \
+        # Set RPATH to find new glibc libraries
+        patchelf --set-rpath /opt/glibc-new/lib/x86_64-linux-gnu "$tool" && \
+        # Set interpreter to use new dynamic linker
+        patchelf --set-interpreter /opt/glibc-new/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 "$tool" && \
+        echo "Patched $(basename $tool)"; \
+    done && \
+    # Create symlinks in /usr/bin for convenience
+    ln -sf /usr/local/casr/bin/casr-afl /usr/bin/casr-afl && \
+    ln -sf /usr/local/casr/bin/casr-cluster /usr/bin/casr-cluster && \
+    ln -sf /usr/local/casr/bin/casr-cluster-map /usr/bin/casr-cluster-map && \
+    ln -sf /usr/local/casr/bin/casr-libfuzzer /usr/bin/casr-libfuzzer && \
+    ln -sf /usr/local/casr/bin/casr-san /usr/bin/casr-san && \
+    ln -sf /usr/local/casr/bin/casr-gdb /usr/bin/casr-gdb
+
+# Verify CASR installation
+RUN casr-san --version && echo "CASR installed successfully with glibc 2.35 via RPATH"
+
+# Copy custom CASR clustering script that preserves all crashes
+COPY ./casr_cluster.py /usr/local/bin/casr_cluster.py
+RUN chmod +x /usr/local/bin/casr_cluster.py && \
+    PATH=/usr/local/python37/bin:$PATH python3 /usr/local/bin/casr_cluster.py --help > /dev/null && \
+    echo "CASR clustering script installed and verified"
 
 # Configure LLDB
 RUN echo "settings set target.disable-aslr false" > ~/.lldbinit && \
@@ -46,8 +77,34 @@ RUN echo "settings set target.disable-aslr false" > ~/.lldbinit && \
 # This libfuzzer has:
 # 1. Fork mode support (from LLVM 10) - enables -fork, -ignore_crashes, etc.
 # 2. trace-pc-guard support (re-added from LLVM 8) - works with existing instrumentation
+# 3. Per-crash log files for CASR (RedirectStderrToCrashLog) - avoids binary re-runs
 # No need to change COVERAGE_FLAGS or rebuild project libraries!
 COPY ./libfuzzer-modern/ /src/libfuzzer/
+
+# Build and replace system libfuzzer with our modified version
+# This ensures crash logs are saved to {artifact_prefix}/logs/ for CASR clustering
+# We replace BOTH variants: fuzzer (with main) and fuzzer_no_main (without main)
+# Detect project architecture from /bin/arvo BEFORE building (build.sh uses ARCH env var)
+# Note: uname -m won't work because kernel is always 64-bit even for 32-bit projects
+RUN cd /src/libfuzzer && \
+    PROJECT_ARCH=$(grep -oP 'ARCHITECTURE=\K\w+' /bin/arvo 2>/dev/null || echo "x86_64") && \
+    if [ "$PROJECT_ARCH" = "i386" ]; then FUZZER_ARCH="i386"; else FUZZER_ARCH="x86_64"; fi && \
+    echo "Detected project architecture: $PROJECT_ARCH -> building libfuzzer for: $FUZZER_ARCH" && \
+    ARCH=$FUZZER_ARCH ./build.sh && \
+    CLANG_LIB_DIR=$(dirname $(find /usr/local/lib/clang -name "libclang_rt.fuzzer-${FUZZER_ARCH}.a" 2>/dev/null | head -1)) && \
+    if [ -z "$CLANG_LIB_DIR" ]; then \
+        echo "WARNING: No clang libfuzzer found for $FUZZER_ARCH, trying x86_64 fallback..."; \
+        CLANG_LIB_DIR=$(dirname $(find /usr/local/lib/clang -name 'libclang_rt.fuzzer-x86_64.a' | head -1)); \
+        FUZZER_ARCH=x86_64; \
+    fi && \
+    echo "Replacing system libfuzzer at: $CLANG_LIB_DIR (arch: $FUZZER_ARCH)" && \
+    cp libFuzzer.a "$CLANG_LIB_DIR/libclang_rt.fuzzer-${FUZZER_ARCH}.a" && \
+    cp libFuzzer_no_main.a "$CLANG_LIB_DIR/libclang_rt.fuzzer_no_main-${FUZZER_ARCH}.a" && \
+    if [ -f /usr/lib/libFuzzingEngine.a ]; then \
+        echo "Also replacing /usr/lib/libFuzzingEngine.a"; \
+        cp libFuzzer.a /usr/lib/libFuzzingEngine.a; \
+    fi && \
+    echo "Modified libFuzzer (both variants) installed successfully"
 
 # Prepare /tmp/corpus and modify /bin/arvo
 RUN mkdir -p /tmp/corpus/ && \
@@ -65,7 +122,13 @@ COPY ./microsnapshots/ /microsnapshots/
 # QA: Assert that `arvo` exits with code 0
 RUN arvo
 
-# Rebuild libFuzzingEngine.a with patched source (fast, only rebuilds libfuzzer)
+# Force rebuild of fuzzer binaries by deleting them
+# This is necessary because cmake won't relink even if we replaced the fuzzer library
+# The binaries were built in the base image before our modified library was installed
+RUN find /out -maxdepth 1 -type f \( -name '*fuzz*' -o -name '*fuzzer*' \) -executable -delete 2>/dev/null || true && \
+    echo "Deleted pre-built fuzzer binaries to force rebuild with our modified libfuzzer"
+
+# Rebuild project including fuzzer binaries with our modified libfuzzer
 # The project libraries keep their existing trace-pc-guard instrumentation
 RUN arvo compile
 

@@ -131,6 +131,8 @@ class ArvoContainer:
         "--platform=linux/amd64",
         "--net=none",  # running on devserver, this this seems to be necessary to avoid Error: pasta failed with exit code 1: Couldn't set IPv4 route(s) in guest: Invalid argument.
         "--pull=never",  # Don't try to pull from registry if image doesn't exist locally
+        "--security-opt", "seccomp=unconfined",  # Allow personality syscall for CASR
+        "--init",  # Use init process to reap zombie children (e.g., llvm-symbolizer from CASR)
         "-d",
     ]
 

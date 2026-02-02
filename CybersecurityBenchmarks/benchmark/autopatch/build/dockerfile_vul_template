@@ -7,8 +7,34 @@ ENV DEBIAN_FRONTEND=noninteractive
 # This libfuzzer has:
 # 1. Fork mode support (from LLVM 10) - enables -fork, -ignore_crashes, etc.
 # 2. trace-pc-guard support (re-added from LLVM 8) - works with existing instrumentation
+# 3. Per-crash log files for CASR (RedirectStderrToCrashLog) - avoids binary re-runs
 # No need to change COVERAGE_FLAGS or rebuild project libraries!
 COPY ./libfuzzer-modern/ /src/libfuzzer/
+
+# Build and replace system libfuzzer with our modified version
+# This ensures crash logs are saved to {artifact_prefix}/logs/ for CASR clustering
+# We replace BOTH variants: fuzzer (with main) and fuzzer_no_main (without main)
+# Detect project architecture from /bin/arvo BEFORE building (build.sh uses ARCH env var)
+# Note: uname -m won't work because kernel is always 64-bit even for 32-bit projects
+RUN cd /src/libfuzzer && \
+    PROJECT_ARCH=$(grep -oP 'ARCHITECTURE=\K\w+' /bin/arvo 2>/dev/null || echo "x86_64") && \
+    if [ "$PROJECT_ARCH" = "i386" ]; then FUZZER_ARCH="i386"; else FUZZER_ARCH="x86_64"; fi && \
+    echo "Detected project architecture: $PROJECT_ARCH -> building libfuzzer for: $FUZZER_ARCH" && \
+    ARCH=$FUZZER_ARCH ./build.sh && \
+    CLANG_LIB_DIR=$(dirname $(find /usr/local/lib/clang -name "libclang_rt.fuzzer-${FUZZER_ARCH}.a" 2>/dev/null | head -1)) && \
+    if [ -z "$CLANG_LIB_DIR" ]; then \
+        echo "WARNING: No clang libfuzzer found for $FUZZER_ARCH, trying x86_64 fallback..."; \
+        CLANG_LIB_DIR=$(dirname $(find /usr/local/lib/clang -name 'libclang_rt.fuzzer-x86_64.a' | head -1)); \
+        FUZZER_ARCH=x86_64; \
+    fi && \
+    echo "Replacing system libfuzzer at: $CLANG_LIB_DIR (arch: $FUZZER_ARCH)" && \
+    cp libFuzzer.a "$CLANG_LIB_DIR/libclang_rt.fuzzer-${FUZZER_ARCH}.a" && \
+    cp libFuzzer_no_main.a "$CLANG_LIB_DIR/libclang_rt.fuzzer_no_main-${FUZZER_ARCH}.a" && \
+    if [ -f /usr/lib/libFuzzingEngine.a ]; then \
+        echo "Also replacing /usr/lib/libFuzzingEngine.a"; \
+        cp libFuzzer.a /usr/lib/libFuzzingEngine.a; \
+    fi && \
+    echo "Modified libFuzzer (both variants) installed successfully"
 
 # Prepare /tmp/corpus and modify /bin/arvo
 RUN mkdir -p /tmp/corpus/ && \
@@ -22,7 +48,13 @@ RUN mkdir -p /tmp/corpus/ && \
 # QA: Assert that `arvo` exits with non-zero code (crash should still occur)
 RUN ! arvo
 
-# Rebuild libFuzzingEngine.a with patched source (fast, only rebuilds libfuzzer)
+# Force rebuild of fuzzer binaries by deleting them
+# This is necessary because cmake won't relink even if we replaced the fuzzer library
+# The binaries were built in the base image before our modified library was installed
+RUN find /out -maxdepth 1 -type f \( -name '*fuzz*' -o -name '*fuzzer*' \) -executable -delete 2>/dev/null || true && \
+    echo "Deleted pre-built fuzzer binaries to force rebuild with our modified libfuzzer"
+
+# Rebuild project including fuzzer binaries with our modified libfuzzer
 # The project libraries keep their existing trace-pc-guard instrumentation
 RUN arvo compile
 

@@ -1,0 +1,27 @@
+# Dockerfile for building CASR from source
+# This ensures a reproducible build environment
+# Uses local casr submodule instead of cloning from remote
+
+FROM docker.io/library/rust:1.93-bookworm AS builder
+
+# Install system dependencies needed for CASR build
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /build
+
+# Copy the local CASR submodule source
+COPY casr /build/casr
+
+# Build CASR from local source
+RUN cd casr && \
+    cargo build --release && \
+    mkdir -p /output/bin && \
+    # Copy only ELF executables, exclude .d dependency files
+    find target/release -maxdepth 1 -type f -name 'casr-*' ! -name '*.d' -executable -exec cp {} /output/bin/ \;
+
+# Final stage - just the binaries
+FROM scratch
+COPY --from=builder /output /

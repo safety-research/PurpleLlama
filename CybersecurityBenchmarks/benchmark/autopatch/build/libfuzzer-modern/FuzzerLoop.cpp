@@ -13,12 +13,15 @@
 #include "FuzzerInternal.h"
 #include "FuzzerMutate.h"
 #include "FuzzerRandom.h"
+#include "FuzzerSHA1.h"
 #include "FuzzerTracePC.h"
 #include <algorithm>
 #include <cstring>
+#include <fcntl.h>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <unistd.h>
 
 #if defined(__has_include)
 #if __has_include(<sanitizer / lsan_interface.h>)
@@ -124,6 +127,8 @@ void FreeHook(const volatile void *ptr) {
 void Fuzzer::HandleMalloc(size_t Size) {
   if (!Options.MallocLimitMb || (Size >> 20) < (size_t)Options.MallocLimitMb)
     return;
+  // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
+  RedirectStderrToCrashLog("oom-");
   Printf("==%d== ERROR: libFuzzer: out-of-memory (malloc(%zd))\n", GetPid(),
          Size);
   Printf("   To change the out-of-memory limit use -rss_limit_mb=<N>\n\n");
@@ -187,10 +192,40 @@ void Fuzzer::DumpCurrentUnit(const char *Prefix) {
                             Prefix);
 }
 
+// Redirect stderr to a per-crash log file for CASR-based stack trace deduplication.
+// This allows CASR to read stack traces from logs instead of re-running binaries.
+// Must be called BEFORE PrintStackTrace() so ASAN output goes to the log file.
+void Fuzzer::RedirectStderrToCrashLog(const char *Prefix) {
+  if (!CurrentUnitData || CurrentUnitSize == 0)
+    return;
+
+  // Compute crash filename using same hash as WriteUnitToFileWithPrefix
+  std::string CrashName = std::string(Prefix) +
+                          Hash({CurrentUnitData, CurrentUnitData + CurrentUnitSize});
+
+  // Create logs subdirectory under artifact prefix
+  std::string LogsDir = Options.ArtifactPrefix + "logs";
+  MkDir(LogsDir);
+
+  // Open per-crash log file
+  std::string LogPath = DirPlusFile(LogsDir, CrashName + ".log");
+  int LogFd = open(LogPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (LogFd < 0)
+    return;  // If we can't create log, continue without redirect
+
+  // Redirect stderr to the log file
+  // Note: We don't restore stderr since the process will exit after crash handling
+  dup2(LogFd, STDERR_FILENO);
+  close(LogFd);
+}
+
 NO_SANITIZE_MEMORY
 void Fuzzer::DeathCallback() {
+  // Redirect stderr to per-crash log for CASR (ASAN output already on stderr)
+  RedirectStderrToCrashLog("crash-");
   DumpCurrentUnit("crash-");
   PrintFinalStats();
+  _Exit(Options.ErrorExitCode); // Ensure proper exit code for sanitizer-detected bugs
 }
 
 void Fuzzer::StaticAlarmCallback() {
@@ -228,6 +263,8 @@ void Fuzzer::CrashCallback() {
   if (EF->__sanitizer_acquire_crash_state &&
       !EF->__sanitizer_acquire_crash_state())
     return;
+  // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
+  RedirectStderrToCrashLog("crash-");
   Printf("==%lu== ERROR: libFuzzer: deadly signal\n", GetPid());
   PrintStackTrace();
   Printf("NOTE: libFuzzer has rudimentary signal handlers.\n"
@@ -245,6 +282,8 @@ void Fuzzer::ExitCallback() {
   if (EF->__sanitizer_acquire_crash_state &&
       !EF->__sanitizer_acquire_crash_state())
     return;
+  // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
+  RedirectStderrToCrashLog("crash-");
   Printf("==%lu== ERROR: libFuzzer: fuzz target exited\n", GetPid());
   PrintStackTrace();
   Printf("SUMMARY: libFuzzer: fuzz target exited\n");
@@ -291,6 +330,8 @@ void Fuzzer::AlarmCallback() {
     if (EF->__sanitizer_acquire_crash_state &&
         !EF->__sanitizer_acquire_crash_state())
       return;
+    // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
+    RedirectStderrToCrashLog("timeout-");
     Printf("ALARM: working on the last Unit for %zd seconds\n", Seconds);
     Printf("       and the timeout value is %d (use -timeout=N to change)\n",
            Options.UnitTimeoutSec);
@@ -308,6 +349,8 @@ void Fuzzer::RssLimitCallback() {
   if (EF->__sanitizer_acquire_crash_state &&
       !EF->__sanitizer_acquire_crash_state())
     return;
+  // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
+  RedirectStderrToCrashLog("oom-");
   Printf(
       "==%lu== ERROR: libFuzzer: out-of-memory (used: %zdMb; limit: %zdMb)\n",
       GetPid(), GetPeakRSSMb(), Options.RssLimitMb);
@@ -513,6 +556,8 @@ size_t Fuzzer::GetCurrentUnitInFuzzingThead(const uint8_t **Data) const {
 }
 
 void Fuzzer::CrashOnOverwrittenData() {
+  // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
+  RedirectStderrToCrashLog("crash-");
   Printf("==%d== ERROR: libFuzzer: fuzz target overwrites its const input\n",
          GetPid());
   PrintStackTrace();
@@ -647,10 +692,12 @@ void Fuzzer::TryDetectingAMemoryLeak(const uint8_t *Data, size_t Size,
   // Now perform the actual lsan pass. This is expensive and we must ensure
   // we don't call it too often.
   if (EF->__lsan_do_recoverable_leak_check()) { // Leak is found, report it.
+    // Redirect stderr to per-crash log for CASR
+    CurrentUnitSize = Size;  // Set size before redirect so hash is computed
+    RedirectStderrToCrashLog("leak-");
     if (DuringInitialCorpusExecution)
       Printf("\nINFO: a leak has been found in the initial corpus.\n\n");
     Printf("INFO: to ignore leaks on libFuzzer side use -detect_leaks=0.\n\n");
-    CurrentUnitSize = Size;
     DumpCurrentUnit("leak-");
     PrintFinalStats();
     _Exit(Options.ErrorExitCode); // not exit() to disable lsan further on.

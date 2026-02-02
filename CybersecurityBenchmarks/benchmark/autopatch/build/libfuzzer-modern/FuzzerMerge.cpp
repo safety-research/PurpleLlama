@@ -363,22 +363,60 @@ void CrashResistantMerge(const Vector<std::string> &Args,
   BaseCmd.removeFlag("merge");
   BaseCmd.removeFlag("fork");
   BaseCmd.removeFlag("collect_data_flow");
+
+  // Extract artifact_prefix from Args for crash log saving
+  std::string ArtifactPrefix;
+  for (const auto &Arg : Args) {
+    if (Arg.find("-artifact_prefix=") == 0)
+      ArtifactPrefix = Arg.substr(17);
+    else if (Arg.find("artifact_prefix=") == 0)
+      ArtifactPrefix = Arg.substr(16);
+  }
+
+  // Create a temp log file path for capturing crash output
+  auto LogFilePath = TempPath(".merge-log");
+
   for (size_t Attempt = 1; Attempt <= NumAttempts; Attempt++) {
     Fuzzer::MaybeExitGracefully();
     VPrintf(V, "MERGE-OUTER: attempt %zd\n", Attempt);
     Command Cmd(BaseCmd);
     Cmd.addFlag("merge_control_file", CFPath);
     Cmd.addFlag("merge_inner", "1");
-    if (!V) {
-      Cmd.setOutputFile(getDevNull());
-      Cmd.combineOutAndErr();
-    }
+    // Always capture output to temp file so we can save crash logs for CASR
+    Cmd.setOutputFile(LogFilePath);
+    Cmd.combineOutAndErr();
     auto ExitCode = ExecuteCommand(Cmd);
     if (!ExitCode) {
       VPrintf(V, "MERGE-OUTER: succesfull in %zd attempt(s)\n", Attempt);
       break;
     }
+    // Crash detected - save the log content to per-crash log for CASR
+    if (!ArtifactPrefix.empty()) {
+      std::string LogContent = FileToString(LogFilePath);
+      if (!LogContent.empty()) {
+        // Create logs directory and save to each crash file's log
+        std::string LogsDir = ArtifactPrefix + "logs";
+        MkDir(LogsDir);
+        Vector<std::string> CrashFiles;
+        ListFilesInDirRecursive(ArtifactPrefix, nullptr, &CrashFiles, false);
+        for (const auto &CrashPath : CrashFiles) {
+          size_t LastSlash = CrashPath.rfind('/');
+          std::string CrashName = (LastSlash != std::string::npos)
+                                      ? CrashPath.substr(LastSlash + 1)
+                                      : CrashPath;
+          // Only process crash/oom/timeout/leak files, skip .log files
+          if ((CrashName.find("crash-") != 0 && CrashName.find("oom-") != 0 &&
+               CrashName.find("timeout-") != 0 && CrashName.find("leak-") != 0) ||
+              (CrashName.size() > 4 &&
+               CrashName.substr(CrashName.size() - 4) == ".log"))
+            continue;
+          std::string CrashLogPath = DirPlusFile(LogsDir, CrashName + ".log");
+          WriteToFile(LogContent, CrashLogPath);
+        }
+      }
+    }
   }
+  RemoveFile(LogFilePath);
   // Read the control file and do the merge.
   Merger M;
   std::ifstream IF(CFPath);

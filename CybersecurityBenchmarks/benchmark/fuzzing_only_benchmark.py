@@ -50,6 +50,21 @@ from .llm import LLM
 LOG: logging.Logger = logging.getLogger(__name__)
 
 
+class DebugContainerException(Exception):
+    """Exception raised when a case needs debugging and container should be preserved.
+    
+    This exception signals that:
+    1. The current case should skip the rest of its pipeline
+    2. The container should NOT be cleaned up at the end
+    3. The benchmark should continue running other cases
+    """
+    
+    def __init__(self, message: str, container_id: str, case_id: int):
+        super().__init__(message)
+        self.container_id = container_id
+        self.case_id = case_id
+
+
 class FuzzingOnlyBenchmark(Benchmark):
     """
     Fuzzing-only benchmark that skips QA arvo run and differential debugging.
@@ -103,47 +118,54 @@ class FuzzingOnlyBenchmark(Benchmark):
 
         # Determine test cases
         self.test_cases: List[int] = self._determine_test_cases(config)
-        
+
         # Store config for deferred building
         self._max_concurrency = config.max_concurrency
-        
+
         # Images will be built in run() so TUI can show progress
         self.images_available: List[int] = []
         self._images_built = False
 
+        # Track containers that need to be preserved for debugging
+        # Format: {container_id: {"case_id": int, "reason": str, "model": str}}
+        self.debug_containers: Dict[str, Dict[str, Any]] = {}
+
     def _setup_file_logging(self) -> None:
         """Set up file logging for the benchmark.
-        
+
         When TUI is enabled, console output is not visible, so we log to a file.
         This method also removes console handlers when TUI is enabled to prevent
         log output from corrupting the TUI display.
         """
         log_file = self.output_dir / "benchmark.log"
-        
+
         # Create file handler with detailed formatting
-        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler = logging.FileHandler(log_file, mode="a")
         file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        ))
-        
+        file_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+
         root_logger = logging.getLogger()
-        
+
         # When TUI is enabled, remove all console handlers to prevent
         # log output from interfering with the TUI display
         if self.fuzzing_config.enable_tui:
             handlers_to_remove = [
-                h for h in root_logger.handlers
-                if isinstance(h, logging.StreamHandler) 
+                h
+                for h in root_logger.handlers
+                if isinstance(h, logging.StreamHandler)
                 and not isinstance(h, logging.FileHandler)
             ]
             for handler in handlers_to_remove:
                 root_logger.removeHandler(handler)
-        
+
         # Add file handler - child loggers propagate up to root
         root_logger.addHandler(file_handler)
-        
+
         LOG.info(f"=== Benchmark started, logging to {log_file} ===")
 
     @classmethod
@@ -152,7 +174,7 @@ class FuzzingOnlyBenchmark(Benchmark):
 
     def _determine_test_cases(self, config: BenchmarkConfig) -> List[int]:
         """Determine which test cases to run based on config.
-        
+
         Priority:
         1. If prompt_path is provided, use it (user explicitly specified which cases to run)
         2. Otherwise, if response_path exists, use it (resuming a previous run)
@@ -204,10 +226,37 @@ class FuzzingOnlyBenchmark(Benchmark):
     # =========================================================================
 
     def _get_case_dir(self, case_id: int, model: str) -> Path:
-        """Get output directory for a specific case and model."""
+        """Get output directory for a specific case and model.
+
+        Directory structure:
+        /files/case_XXX/ground_truth/  - GT fuzzing results
+        /files/case_XXX/model_name/    - Model-specific fuzzing results
+        """
         case_dir = self.files_dir / f"case_{case_id}" / model
         case_dir.mkdir(parents=True, exist_ok=True)
         return case_dir
+
+    def _get_target_dir(
+        self, case_id: int, target: FuzzingTarget, model: str = "ground_truth"
+    ) -> Path:
+        """Get output directory for a specific fuzzing target.
+
+        Args:
+            case_id: Case number
+            target: GROUND_TRUTH or LLM_PATCH
+            model: Model name (used when target is LLM_PATCH)
+
+        Returns:
+            Path to target directory:
+            - /files/case_XXX/ground_truth/ for GT
+            - /files/case_XXX/model_name/ for LLM patches
+        """
+        if target == FuzzingTarget.GROUND_TRUTH:
+            target_dir = self.files_dir / f"case_{case_id}" / "ground_truth"
+        else:
+            target_dir = self.files_dir / f"case_{case_id}" / model
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return target_dir
 
     def _read_responses(self) -> List[Dict[str, Any]]:
         """Read existing responses from file."""
@@ -350,9 +399,9 @@ class FuzzingOnlyBenchmark(Benchmark):
         await fix_container.start_container()
 
         # QA checks of vul and fix containers (use original flags, not debug flags)
-        containers_pass_qa_checks = (await vul_container.qa_checks(use_debug_flags=False)) and (
-            await fix_container.qa_checks(use_debug_flags=False)
-        )
+        containers_pass_qa_checks = (
+            await vul_container.qa_checks(use_debug_flags=False)
+        ) and (await fix_container.qa_checks(use_debug_flags=False))
 
         patch_success = False
         patched_function_name = None
@@ -470,53 +519,66 @@ class FuzzingOnlyBenchmark(Benchmark):
 
     def _load_fuzzer_type_from_metadata(self, case_id: int) -> Optional[FuzzerType]:
         """Load fuzzer type from dataset metadata file.
-        
+
         The metadata files are at datasets/autopatch/arvo_meta/{case_id}-meta.json
         and contain a "fuzzer" field with value "afl" or "libfuzzer".
-        
+
         Args:
             case_id: The ARVO case ID
-            
+
         Returns:
             FuzzerType if metadata exists and has fuzzer info, None otherwise
         """
         # Try to find the metadata file
         meta_paths = [
-            Path(__file__).parent.parent / "datasets" / "autopatch" / "arvo_meta" / f"{case_id}-meta.json",
+            Path(__file__).parent.parent
+            / "datasets"
+            / "autopatch"
+            / "arvo_meta"
+            / f"{case_id}-meta.json",
             Path("datasets/autopatch/arvo_meta") / f"{case_id}-meta.json",
         ]
-        
+
         for meta_path in meta_paths:
             if meta_path.exists():
                 try:
                     meta_data = json.loads(meta_path.read_text())
-                    fuzzer = meta_data.get("arvo_metadata", {}).get("fuzzer", "").lower()
+                    fuzzer = (
+                        meta_data.get("arvo_metadata", {}).get("fuzzer", "").lower()
+                    )
                     if fuzzer == "afl":
-                        LOG.info(f"Case {case_id}: Loaded fuzzer type from metadata: AFL++")
+                        LOG.info(
+                            f"Case {case_id}: Loaded fuzzer type from metadata: AFL++"
+                        )
                         return FuzzerType.AFL_PLUS_PLUS
                     elif fuzzer == "libfuzzer":
-                        LOG.info(f"Case {case_id}: Loaded fuzzer type from metadata: libFuzzer")
+                        LOG.info(
+                            f"Case {case_id}: Loaded fuzzer type from metadata: libFuzzer"
+                        )
                         return FuzzerType.LIBFUZZER
                 except Exception as e:
                     LOG.debug(f"Error loading metadata for case {case_id}: {e}")
-        
+
         return None
 
     async def _detect_fuzzer_type(
-        self, container: ArvoContainer, case_id: int = 0, binary_path: str = "/out/*_fuzzer"
+        self,
+        container: ArvoContainer,
+        case_id: int = 0,
+        binary_path: str = "",
     ) -> FuzzerType:
         """Detect whether the binary is built for libFuzzer or AFL++.
-        
+
         Detection priority:
         1. Load from dataset metadata (most reliable)
         2. Run the binary and check output for AFL++ signature
         3. Default to libFuzzer
-        
+
         Args:
             container: The container to test in
             case_id: The ARVO case ID (used to load metadata)
             binary_path: Path to the fuzzer binary (can contain wildcards)
-            
+
         Returns:
             FuzzerType.AFL_PLUS_PLUS if AFL++ detected, FuzzerType.LIBFUZZER otherwise
         """
@@ -525,47 +587,65 @@ class FuzzingOnlyBenchmark(Benchmark):
             metadata_type = self._load_fuzzer_type_from_metadata(case_id)
             if metadata_type is not None:
                 return metadata_type
-        
-        LOG.info(f"Detecting fuzzer type by running binary at {binary_path}")
-        
+
         # Try to run the binary to check its output
         # AFL++ binaries print "This binary is built for afl++" when run without proper setup
         try:
-            # Get actual binary path if it's a wildcard
-            if "*" in binary_path:
+            # Get binary path from /bin/arvo if not provided
+            if not binary_path:
                 result = await container.exec_command(
-                    cmd_args=["sh", "-c", f"ls {binary_path} 2>/dev/null | head -1"],
+                    cmd_args=[
+                        "sh",
+                        "-c",
+                        "grep -A1 '\"run\" ]; then' /bin/arvo | tail -1 | awk '{print $1}'",
+                    ],
                     timeout=10,
                 )
-                actual_path = result.stdout.decode().strip() if result.stdout else ""
-                if actual_path:
-                    binary_path = actual_path
-                    LOG.info(f"Resolved binary path to: {binary_path}")
+                binary_path = result.stdout.decode().strip() if result.stdout else ""
+                if binary_path and binary_path.startswith("/"):
+                    LOG.info(f"Resolved binary path from arvo: {binary_path}")
                 else:
-                    LOG.warning(f"No binary found matching {binary_path}")
-                    return FuzzerType.UNKNOWN
-            
+                    # Fallback: find any executable in /out/
+                    result = await container.exec_command(
+                        cmd_args=[
+                            "sh",
+                            "-c",
+                            "find /out/ -maxdepth 1 -type f -executable | head -1",
+                        ],
+                        timeout=10,
+                    )
+                    binary_path = (
+                        result.stdout.decode().strip() if result.stdout else ""
+                    )
+                    if binary_path:
+                        LOG.info(f"Resolved binary path via find: {binary_path}")
+                    else:
+                        LOG.warning("No binary found in container")
+                        return FuzzerType.UNKNOWN
+
+            LOG.info(f"Detecting fuzzer type by running binary at {binary_path}")
+
             # Run the binary briefly to see its output
             # Use shell to capture both stdout and stderr properly
             result = await container.exec_command(
                 cmd_args=["sh", "-c", f"timeout 2 {binary_path} 2>&1 || true"],
                 timeout=15,
             )
-            
+
             output = result.stdout.decode(errors="replace") if result.stdout else ""
             LOG.debug(f"Binary output for detection: {output[:500]}")
-            
+
             # Check for AFL++ signature (case insensitive)
             output_lower = output.lower()
             if "built for afl" in output_lower or "afl-fuzz" in output_lower:
                 LOG.info(f"Detected AFL++ binary at {binary_path}")
                 return FuzzerType.AFL_PLUS_PLUS
-            
+
             # Check for libFuzzer signature (runs immediately or shows usage)
             if "libfuzzer" in output_lower or "BINGO" in output or "INFO:" in output:
                 LOG.info(f"Detected libFuzzer binary at {binary_path}")
                 return FuzzerType.LIBFUZZER
-            
+
             # Also check stderr separately as a fallback
             if result.stderr:
                 stderr = result.stderr.decode(errors="replace")
@@ -574,11 +654,13 @@ class FuzzingOnlyBenchmark(Benchmark):
                 if "built for afl" in stderr_lower or "afl-fuzz" in stderr_lower:
                     LOG.info(f"Detected AFL++ binary at {binary_path} (from stderr)")
                     return FuzzerType.AFL_PLUS_PLUS
-            
+
             # Default to libFuzzer if no clear signature
-            LOG.info(f"No clear fuzzer signature detected in output, defaulting to libFuzzer")
+            LOG.info(
+                f"No clear fuzzer signature detected in output, defaulting to libFuzzer"
+            )
             return FuzzerType.LIBFUZZER
-            
+
         except Exception as e:
             LOG.warning(f"Error detecting fuzzer type: {e}, defaulting to libFuzzer")
             return FuzzerType.LIBFUZZER
@@ -588,16 +670,17 @@ class FuzzingOnlyBenchmark(Benchmark):
         container: ArvoContainer,
         target: FuzzingTarget = FuzzingTarget.GROUND_TRUTH,
         fuzzer_type: FuzzerType = FuzzerType.LIBFUZZER,
+        run_id: str = "",
     ) -> None:
         """Configure fuzzer for continuous mode with custom duration.
 
         This method reads the /bin/arvo script and properly configures it for fuzzing.
-        
+
         For libFuzzer:
         1. Sets FUZZER_ARGS with duration, fork mode, and ignore flags
         2. Replaces /tmp/poc with /tmp/corpus/ (all occurrences)
         3. Adds $FUZZER_ARGS to the fuzzer command if not present
-        
+
         For AFL++:
         1. Sets up AFL_* environment variables for continuous mode
         2. Creates /tmp/afl_output directory for AFL++ output
@@ -607,9 +690,12 @@ class FuzzingOnlyBenchmark(Benchmark):
             container: The ArvoContainer to configure
             target: The fuzzing target (GT or LLM)
             fuzzer_type: The type of fuzzer (libFuzzer or AFL++)
+            run_id: Unique identifier for this fuzzing run
         """
         duration_secs = self.fuzzing_config.fuzzing_duration_minutes * 60
-        LOG.info(f"Configuring {fuzzer_type.value} fuzzer for {target.value} to run for {duration_secs} seconds")
+        LOG.info(
+            f"Configuring {fuzzer_type.value} fuzzer for {target.value} to run for {duration_secs} seconds"
+        )
 
         # Read the current arvo script
         try:
@@ -621,14 +707,25 @@ class FuzzingOnlyBenchmark(Benchmark):
             )
 
         if fuzzer_type == FuzzerType.AFL_PLUS_PLUS:
+            # AFL++ runs as single process (parallel mode not yet implemented)
+            LOG.info(
+                f"Configuring AFL++ (single process - fork_jobs={self.fuzzing_config.fork_jobs} not applicable)"
+            )
             new_content = await self._configure_afl_plus_plus(
                 container, arvo_content, target, duration_secs
             )
         else:
-            new_content = self._configure_libfuzzer(arvo_content, duration_secs)
-            # Create /tmp/crashes/ directory for libFuzzer crash artifacts
-            await container.exec_command(cmd_args=["mkdir", "-p", "/tmp/crashes/"])
-            LOG.info("Created /tmp/crashes/ directory for crash artifacts")
+            # libFuzzer uses -fork=N for parallel workers
+            LOG.info(
+                f"Configuring libFuzzer with {self.fuzzing_config.fork_jobs} parallel workers (-fork={self.fuzzing_config.fork_jobs})"
+            )
+            new_content = self._configure_libfuzzer(
+                arvo_content, duration_secs, target, run_id
+            )
+            # Create run and target-specific crash directory for libFuzzer crash artifacts
+            crash_dir = f"/tmp/crashes_{run_id}_{target.value}/"
+            await container.exec_command(cmd_args=["mkdir", "-p", crash_dir])
+            LOG.info(f"Created {crash_dir} directory for crash artifacts")
 
         # Write the modified script back
         import tempfile
@@ -648,19 +745,32 @@ class FuzzingOnlyBenchmark(Benchmark):
         verify_content = (await container.get_content("/bin/arvo")).decode()
         LOG.info("=== Modified /bin/arvo (relevant lines) ===")
         for line in verify_content.split("\n"):
-            if any(x in line for x in ["FUZZER_ARGS", "_fuzzer", "afl-fuzz", "AFL_"]):
+            if any(
+                x in line for x in ["FUZZER_ARGS", "/out/", "fuzz", "afl-fuzz", "AFL_"]
+            ):
                 LOG.info(f"  {line.strip()}")
 
-    def _configure_libfuzzer(self, arvo_content: str, duration_secs: int) -> str:
+    def _configure_libfuzzer(
+        self,
+        arvo_content: str,
+        duration_secs: int,
+        target: FuzzingTarget,
+        run_id: str = "",
+    ) -> str:
         """Configure arvo script for libFuzzer continuous mode.
-        
+
         Args:
             arvo_content: Current content of /bin/arvo
             duration_secs: Total fuzzing duration in seconds
-            
+            target: Fuzzing target (GT or LLM) - determines crash directory
+            run_id: Unique identifier for this fuzzing run
+
         Returns:
             Modified arvo script content
         """
+        # Use run and target-specific crash directory to avoid pollution between runs
+        crash_dir = f"/tmp/crashes_{run_id}_{target.value}/"
+
         # Build FUZZER_ARGS - always include fork and ignore flags for continuous mode
         new_args = [
             "-rss_limit_mb=2560",
@@ -674,12 +784,13 @@ class FuzzingOnlyBenchmark(Benchmark):
             new_args.append("-ignore_ooms=1")
             new_args.append("-ignore_timeouts=1")
 
-        # Always add fork mode for parallel fuzzing
-        if self.fuzzing_config.fork_jobs > 1:
+        # Always add fork mode for crash-resistant continuous fuzzing
+        # -ignore_crashes only works in fork mode, so always enable it
+        if self.fuzzing_config.fork_jobs >= 1:
             new_args.append(f"-fork={self.fuzzing_config.fork_jobs}")
 
-        # Save crash files to /tmp/crashes/ for CASR deduplication
-        new_args.append("-artifact_prefix=/tmp/crashes/")
+        # Save crash files to target-specific directory for CASR deduplication
+        new_args.append(f"-artifact_prefix={crash_dir}")
 
         new_args.append("-print_final_stats=1")
 
@@ -711,9 +822,9 @@ class FuzzingOnlyBenchmark(Benchmark):
         LOG.info("Replaced all /tmp/poc with /tmp/corpus/")
 
         # Step 3: Ensure $FUZZER_ARGS is added to the fuzzer command lines
-        # Match patterns like: /out/XXX_fuzzer /tmp/corpus/
+        # Match patterns like: /out/BINARY /tmp/corpus/ (handles both *_fuzzer and fuzz_* naming)
         # And add $FUZZER_ARGS if not present
-        fuzzer_pattern = r"(/out/\w+_fuzzer\s+/tmp/corpus/)(?!\s*\$FUZZER_ARGS)"
+        fuzzer_pattern = r"(/out/[\w-]+\s+/tmp/corpus/)(?!\s*\$FUZZER_ARGS)"
         if re.search(fuzzer_pattern, new_content):
             new_content = re.sub(fuzzer_pattern, r"\1 $FUZZER_ARGS", new_content)
             LOG.info("Added $FUZZER_ARGS to fuzzer command(s)")
@@ -728,19 +839,19 @@ class FuzzingOnlyBenchmark(Benchmark):
         duration_secs: int,
     ) -> str:
         """Configure arvo script for AFL++ continuous mode.
-        
+
         AFL++ requires wrapping the binary invocation with afl-fuzz.
         We modify the existing arvo script to:
         1. Add AFL++ environment variables
         2. Create output directory
         3. Wrap binary calls with afl-fuzz for 'run' and 'fuzz_fix' commands
-        
+
         Args:
             container: The ArvoContainer to configure
             arvo_content: Current content of /bin/arvo
             target: The fuzzing target (GT or LLM)
             duration_secs: Total fuzzing duration in seconds
-            
+
         Returns:
             Modified arvo script content
         """
@@ -749,22 +860,24 @@ class FuzzingOnlyBenchmark(Benchmark):
             cmd_args=["mkdir", "-p", "/tmp/afl_output"],
             timeout=10,
         )
-        
+
         # Get AFL++ environment variables
         afl_env = self.fuzzing_config.get_afl_environment_vars()
-        
+
         # Build the environment export lines
         env_exports = []
         for key, value in afl_env.items():
             env_exports.append(f'export {key}="{value}"')
         env_exports_str = "\n".join(env_exports)
-        
+
         # Get ASAN_OPTIONS fix (AFL++ requires abort_on_error=1)
         asan_fix = self.fuzzing_config.get_afl_asan_options_fix()
-        
+
         # Build afl-fuzz command arguments (without the binary - that comes from original script)
-        afl_args = f"-V {duration_secs} -t 25000 -m none -i /tmp/corpus -o /tmp/afl_output"
-        
+        afl_args = (
+            f"-V {duration_secs} -t 25000 -m none -i /tmp/corpus -o /tmp/afl_output"
+        )
+
         # Extract the fuzzer binary path from the arvo script
         # Use the same pattern as arvo_utils.get_binary_filepath(): look for "<path> /tmp/poc"
         fuzzer_match = re.search(r"(\S+)\s+/tmp/poc", arvo_content)
@@ -772,8 +885,8 @@ class FuzzingOnlyBenchmark(Benchmark):
             fuzzer_binary = fuzzer_match.group(1)
             LOG.info(f"Extracted fuzzer binary path from arvo script: {fuzzer_binary}")
         else:
-            # Fallback: try to find any path ending in _fuzzer
-            fuzzer_match = re.search(r"(/\S+_fuzzer)", arvo_content)
+            # Fallback: try to find any binary path in /out/
+            fuzzer_match = re.search(r"(/out/[\w-]+)", arvo_content)
             if fuzzer_match:
                 fuzzer_binary = fuzzer_match.group(1)
                 LOG.info(f"Found fuzzer binary via fallback pattern: {fuzzer_binary}")
@@ -783,15 +896,17 @@ class FuzzingOnlyBenchmark(Benchmark):
 
         # Start with the original script content
         new_content = arvo_content
-        
+
         # Add AFL++ environment variables after the shebang
         afl_setup = (
             "\n# AFL++ environment variables for continuous fuzzing\n"
-            + env_exports_str + "\n"
-            + asan_fix + "\n"
+            + env_exports_str
+            + "\n"
+            + asan_fix
+            + "\n"
             + "mkdir -p /tmp/afl_output\n\n"
         )
-        
+
         if new_content.startswith("#!/"):
             first_newline = new_content.find("\n")
             new_content = (
@@ -801,14 +916,14 @@ class FuzzingOnlyBenchmark(Benchmark):
             )
         else:
             new_content = afl_setup + new_content
-        
+
         # Replace /tmp/poc with /tmp/corpus/ for corpus-based fuzzing
         new_content = new_content.replace("/tmp/poc", "/tmp/corpus/")
-        
+
         # For AFL++ binaries, we need to wrap the fuzzer invocation with afl-fuzz
         # The original script likely has lines like: /path/to/binary /tmp/corpus/
         # We need to change them to: afl-fuzz [args] -- /path/to/binary
-        
+
         # Build the afl-fuzz command with sanitizer options fixes
         # AFL++ requires specific sanitizer settings:
         # - ASAN_OPTIONS: abort_on_error=1 and symbolize=0
@@ -822,32 +937,32 @@ class FuzzingOnlyBenchmark(Benchmark):
             'MSAN_OPTS_CLEAN=$(echo "$MSAN_OPTIONS" | sed "s/exit_code=[0-9]*://g" | sed "s/symbolize=[01]://g"); '
             'export MSAN_OPTIONS="exit_code=86:symbolize=0:$MSAN_OPTS_CLEAN"'
         )
-        afl_cmd_prefix = f'{sanitizer_fix}; afl-fuzz'
-        
+        afl_cmd_prefix = f"{sanitizer_fix}; afl-fuzz"
+
         if fuzzer_binary:
             # Replace direct binary invocation with afl-fuzz wrapper
             # Match patterns like: /path/to/binary /tmp/corpus/ [optional args]
             # But be careful not to match lines that already have afl-fuzz
-            
+
             # Pattern for GT binary invocation (not in fuzz_fix block)
             gt_pattern = re.escape(fuzzer_binary) + r"\s+/tmp/corpus/[^\n]*"
-            
+
             def replace_with_afl(match):
                 original = match.group(0)
                 if "afl-fuzz" in original:
                     return original  # Already wrapped
                 return f"{afl_cmd_prefix} {afl_args} -- {fuzzer_binary}"
-            
+
             new_content = re.sub(gt_pattern, replace_with_afl, new_content)
-            
+
             # Also handle /tmp/rebuilt_binary for fuzz_fix
             rebuilt_pattern = r"/tmp/rebuilt_binary\s+/tmp/corpus/[^\n]*"
             new_content = re.sub(
                 rebuilt_pattern,
                 f"{afl_cmd_prefix} {afl_args} -- /tmp/rebuilt_binary",
-                new_content
+                new_content,
             )
-        
+
         LOG.info(f"Modified arvo script for AFL++ with time limit {duration_secs}s")
         return new_content
 
@@ -855,46 +970,68 @@ class FuzzingOnlyBenchmark(Benchmark):
         self,
         container: ArvoContainer,
         fuzzer_type: FuzzerType = FuzzerType.LIBFUZZER,
+        target: FuzzingTarget = FuzzingTarget.GROUND_TRUTH,
+        run_id: str = "",
     ) -> List[str]:
         """Get list of crash files from fuzzer output.
-        
+
         Args:
             container: The container to search for crashes
             fuzzer_type: The type of fuzzer used
-            
+            target: Fuzzing target (determines crash directory)
+            run_id: Unique identifier for this fuzzing run
+
         Returns:
             List of crash file names
         """
         if fuzzer_type == FuzzerType.AFL_PLUS_PLUS:
             return await self._get_afl_crash_files(container)
         else:
-            return await self._get_libfuzzer_crash_files(container)
+            return await self._get_libfuzzer_crash_files(container, target, run_id)
 
-    async def _get_libfuzzer_crash_files(self, container: ArvoContainer) -> List[str]:
-        """Get crash files from libFuzzer output (in /tmp/crashes/ directory).
-        
-        With -artifact_prefix=/tmp/crashes/, libFuzzer saves crash files there.
+    async def _get_libfuzzer_crash_files(
+        self, container: ArvoContainer, target: FuzzingTarget, run_id: str = ""
+    ) -> List[str]:
+        """Get crash files from libFuzzer output in run and target-specific directory.
+
+        Args:
+            container: The container to search for crashes
+            target: Fuzzing target (GT or LLM) - determines crash directory
+            run_id: Unique identifier for this fuzzing run
+
+        Returns:
+            List of crash file names (limited to first 10000 to avoid timeout with crash storms)
         """
+        crash_dir = f"/tmp/crashes_{run_id}_{target.value}/"
+
+        # Use find instead of ls for better performance with large directories
+        # Limit to 10000 crashes to avoid timeouts (CASR doesn't need millions of duplicates)
+        # NOTE: Must wrap command in double quotes so sh -c treats it as one argument
+        find_cmd = f"find \"{crash_dir}\" -maxdepth 1 -type f \\( -name 'crash-*' -o -name 'oom-*' -o -name 'timeout-*' \\) -printf '%f\\n' | head -10000"
         result = await container.exec_command(
-            cmd_args=["ls", "-1", "/tmp/crashes/"], timeout=10
+            cmd_args=["sh", "-c", f'"{find_cmd}"'], timeout=30
         )
+
         if result.returncode != 0:
             return []
 
         crashes = []
         stdout = result.stdout.decode() if result.stdout else ""
         for line in stdout.strip().split("\n"):
-            if line and (
-                line.startswith("crash-")
-                or line.startswith("oom-")
-                or line.startswith("timeout-")
-            ):
+            if line:
                 crashes.append(line)
+
+        if len(crashes) >= 10000:
+            LOG.warning(
+                f"Crash limit reached (10000+). This suggests a crash storm - "
+                f"the bug may trigger very frequently. CASR will deduplicate these."
+            )
+
         return crashes
 
     async def _get_afl_crash_files(self, container: ArvoContainer) -> List[str]:
         """Get crash files from AFL++ output directory.
-        
+
         AFL++ stores crashes in /tmp/afl_output/default/crashes/
         The crash files are named with id: prefix, e.g., id:000000,sig:11,src:...
         """
@@ -903,7 +1040,7 @@ class FuzzingOnlyBenchmark(Benchmark):
             "/tmp/afl_output/default/crashes",
             "/tmp/afl_output/crashes",  # Alternative if no fuzzer name
         ]
-        
+
         crashes = []
         for crash_dir in crash_dirs:
             result = await container.exec_command(
@@ -919,7 +1056,7 @@ class FuzzingOnlyBenchmark(Benchmark):
                 if crashes:
                     LOG.info(f"Found {len(crashes)} AFL++ crashes in {crash_dir}")
                     break
-        
+
         return crashes
 
     async def _get_execution_count(
@@ -928,11 +1065,11 @@ class FuzzingOnlyBenchmark(Benchmark):
         fuzzer_type: FuzzerType = FuzzerType.LIBFUZZER,
     ) -> int:
         """Get current execution count from fuzzer.
-        
+
         Args:
             container: The container running the fuzzer
             fuzzer_type: The type of fuzzer used
-            
+
         Returns:
             Number of executions, or 0 if unable to determine
         """
@@ -945,14 +1082,14 @@ class FuzzingOnlyBenchmark(Benchmark):
 
     async def _get_afl_execution_count(self, container: ArvoContainer) -> int:
         """Get execution count from AFL++ fuzzer_stats file.
-        
+
         AFL++ writes stats to /tmp/afl_output/default/fuzzer_stats
         """
         stats_paths = [
             "/tmp/afl_output/default/fuzzer_stats",
             "/tmp/afl_output/fuzzer_stats",
         ]
-        
+
         for stats_path in stats_paths:
             result = await container.exec_command(
                 cmd_args=["cat", stats_path], timeout=10
@@ -970,6 +1107,477 @@ class FuzzingOnlyBenchmark(Benchmark):
                         except ValueError:
                             pass
         return 0
+
+    async def _run_casr_in_container(
+        self,
+        container: ArvoContainer,
+        fuzzer_type: FuzzerType,
+        crash_files: List[str],
+        case_id: int,
+        target: FuzzingTarget,
+        run_id: str = "",
+    ) -> Dict[str, str]:
+        """Run CASR-based crash deduplication in the container.
+
+        CASR (Crash Analysis and Severity Reporting) analyzes crashes and groups them
+        into clusters based on stack traces and crash characteristics.
+
+        Args:
+            container: The container with the fuzzer and crashes
+            fuzzer_type: Type of fuzzer used (affects crash file location)
+            crash_files: List of crash filenames
+            case_id: Case ID for logging
+            target: Whether this is GT or LLM patch
+            run_id: Unique identifier for this fuzzing run
+
+        Returns:
+            Dict mapping crash filename to cluster ID
+        """
+        crash_to_cluster: Dict[str, str] = {}
+
+        if not crash_files:
+            LOG.info(f"Case {case_id}: No crashes to deduplicate")
+            return crash_to_cluster
+
+        # Determine paths based on fuzzer type and target
+        if fuzzer_type == FuzzerType.AFL_PLUS_PLUS:
+            crashes_dir = "/tmp/afl_output/default/crashes"
+            casr_tool = "casr-afl"
+        else:
+            # Use run and target-specific crash directory
+            crashes_dir = f"/tmp/crashes_{run_id}_{target.value}"
+            casr_tool = "casr-libfuzzer"
+
+        # Create CASR output directory (run and target-specific)
+        casr_output_dir = f"/tmp/casr_reports_{run_id}_{target.value}"
+        await container.exec_command(
+            cmd_args=["mkdir", "-p", casr_output_dir],
+            timeout=10,
+        )
+
+        # Find the fuzzer binary
+        fuzzer_binary = await self._get_fuzzer_binary_path(container, target)
+        if not fuzzer_binary:
+            LOG.warning(f"Case {case_id}: Could not find fuzzer binary for CASR")
+            return crash_to_cluster
+
+        LOG.info(
+            f"Case {case_id}: Running CASR clustering with casr-cluster-map on {len(crash_files)} crashes"
+        )
+
+        # Use casr-cluster-map Rust tool to preserve all crashes while clustering
+        # This generates individual CASR reports and clusters them WITHOUT deduplication
+        # Result: ALL crashes get cluster IDs, not just representative ones
+        mapping_file = f"{casr_output_dir}/crash_mapping.json"
+
+        # Build casr-cluster-map command
+        cmd_args = [
+            "casr-cluster-map",  # Rust binary installed in /usr/bin via symlink
+            "-i",
+            crashes_dir,
+            "-o",
+            casr_output_dir,
+            "-t",
+            "120",  # 120 second timeout per crash (ASAN is slow)
+            "-j",
+            "4",  # Limit parallel jobs to avoid overwhelming the system
+            "--mapping",
+            mapping_file,  # JSON mapping output file
+        ]
+
+        # For libFuzzer, use log-based clustering (no binary re-runs needed)
+        # The modified libFuzzer saves crash logs to {crashes_dir}/logs/{crash_name}.log
+        # In fork mode, the parent copies worker log content when crashes are detected
+        if fuzzer_type != FuzzerType.AFL_PLUS_PLUS:
+            cmd_args.append("--use-logs")
+            LOG.info(
+                f"Case {case_id}: Using log-based CASR clustering (no binary re-runs)"
+            )
+
+        # Add binary args (still required but not used in log mode for libFuzzer)
+        cmd_args.extend(
+            [
+                "--",  # Separator before binary and args
+                fuzzer_binary,
+                "@@",  # Placeholder for crash input file
+            ]
+        )
+
+        try:
+            result = await container.exec_command(
+                cmd_args=cmd_args,
+                timeout=300,  # 5 minutes timeout for clustering
+            )
+
+            stdout = result.stdout.decode(errors="replace") if result.stdout else ""
+            stderr = result.stderr.decode(errors="replace") if result.stderr else ""
+
+            # Save CASR output to log file
+            case_dir = self._get_case_dir(case_id, container.model_under_test)
+            casr_log_file = case_dir / f"casr_output_{target.value}.log"
+            with open(casr_log_file, "w") as f:
+                f.write(f"=== CASR Clustering (casr-cluster-map) ===\n")
+                f.write(f"Command: {' '.join(cmd_args)}\n")
+                f.write(f"Return code: {result.returncode}\n\n")
+                f.write("=== STDOUT ===\n")
+                f.write(stdout)
+                f.write("\n\n=== STDERR ===\n")
+                f.write(stderr)
+            LOG.info(f"Case {case_id}: CASR output saved to {casr_log_file}")
+
+            if result.returncode != 0:
+                LOG.warning(
+                    f"Case {case_id}: CASR clustering returned non-zero exit code {result.returncode}"
+                )
+
+                # Case 1: Only 1 unique crash type - this is OK, assign all to cluster 1
+                if "Not enough valid reports" in stderr or "Less than 2" in stderr:
+                    LOG.info(
+                        f"Case {case_id}: Only 1 unique crash type, assigning all to cluster 1"
+                    )
+                    for crash_file in crash_files:
+                        crash_to_cluster[crash_file] = "cl1"
+
+                # Case 2: CASR couldn't reproduce crashes - preserve container for debugging
+                elif (
+                    "No reports generated" in stderr
+                    or "Program terminated (no crash)" in stderr
+                ):
+                    error_msg = (
+                        f"Case {case_id}: CASR failed to reproduce crashes!\n"
+                        f"Container: {container.container_id}\n"
+                        f"CASR log: {casr_log_file}\n"
+                        f"CASR stderr: {stderr}\n"
+                        f"Container preserved for debugging. Run:\n"
+                        f"  podman exec -it {container.container_id} bash"
+                    )
+                    LOG.error(error_msg)
+                    raise DebugContainerException(
+                        message=error_msg,
+                        container_id=container.container_id,
+                        case_id=case_id,
+                    )
+
+                # Case 3: Unknown error - preserve container for debugging
+                else:
+                    error_msg = (
+                        f"Case {case_id}: CASR failed with unknown error!\n"
+                        f"Container: {container.container_id}\n"
+                        f"CASR log: {casr_log_file}\n"
+                        f"CASR stderr: {stderr}\n"
+                        f"Container preserved for debugging. Run:\n"
+                        f"  podman exec -it {container.container_id} bash"
+                    )
+                    LOG.error(error_msg)
+                    raise DebugContainerException(
+                        message=error_msg,
+                        container_id=container.container_id,
+                        case_id=case_id,
+                    )
+
+            # Parse JSON mapping file to get COMPLETE crash-to-cluster mapping
+            if not crash_to_cluster:
+                parsed_mapping = await self._parse_casr_json_mapping(
+                    container, mapping_file, case_id
+                )
+                if parsed_mapping:
+                    crash_to_cluster = parsed_mapping
+                elif crash_files:
+                    # No fallback - CASR must work reliably
+                    error_msg = (
+                        f"Case {case_id}: CASR failed to produce mapping for {len(crash_files)} crashes.\n"
+                        f"Check casr_output_{target.value}.log for details.\n"
+                        f"Container: {container.container_id}\n"
+                        f"Container preserved for debugging. Run:\n"
+                        f"  podman exec -it {container.container_id} bash"
+                    )
+                    LOG.error(error_msg)
+                    raise DebugContainerException(
+                        message=error_msg,
+                        container_id=container.container_id,
+                        case_id=case_id,
+                    )
+
+            # Copy CASR reports from container to host for analysis
+            # This includes all .casrep files (JSON reports with stack traces, severity, etc.)
+            await self._copy_casr_reports_to_host(
+                container, casr_output_dir, case_id, target
+            )
+
+        except DebugContainerException:
+            # Propagate debug container exceptions without extra logging
+            raise
+        except Exception as e:
+            LOG.error(f"Case {case_id}: Error running CASR: {e}")
+            import traceback
+
+            LOG.error(traceback.format_exc())
+            raise  # Re-raise to fail the case properly
+
+        return crash_to_cluster
+
+    async def _copy_casr_reports_to_host(
+        self,
+        container: ArvoContainer,
+        casr_output_dir: str,
+        case_id: int,
+        target: FuzzingTarget,
+    ) -> None:
+        """Copy CASR reports from container to host.
+
+        CASR reports (.casrep files) contain detailed crash analysis:
+        stack traces, registers, severity, crash address, etc.
+
+        Directory structure:
+        - /files/case_XXX/ground_truth/casr_reports/ for GT
+        - /files/case_XXX/model_name/casr_reports/ for LLM patches
+
+        Args:
+            container: The container with CASR output
+            casr_output_dir: Path to CASR output directory in container
+            case_id: Case ID
+            target: Whether this is GT or LLM patch
+        """
+        try:
+            # Get the target directory on host (ground_truth or model_name)
+            target_dir = self._get_target_dir(
+                case_id, target, container.model_under_test
+            )
+            host_casr_dir = target_dir / "casr_reports"
+            host_casr_dir.mkdir(parents=True, exist_ok=True)
+
+            # Copy entire CASR output directory from container to host
+            await container.copy_from_container(casr_output_dir, str(host_casr_dir))
+
+            LOG.info(f"Case {case_id}: Copied CASR reports to {host_casr_dir}")
+
+        except Exception as e:
+            LOG.warning(f"Case {case_id}: Failed to copy CASR reports to host: {e}")
+
+    async def _get_fuzzer_binary_path(
+        self,
+        container: ArvoContainer,
+        target: FuzzingTarget,
+    ) -> Optional[str]:
+        """Get the fuzzer binary path from the container.
+
+        Args:
+            container: The container to search
+            target: Whether this is GT or LLM patch
+
+        Returns:
+            Path to fuzzer binary, or None if not found
+        """
+        if target == FuzzingTarget.LLM_PATCH:
+            # For LLM patch, check if /tmp/rebuilt_binary exists
+            result = await container.exec_command(
+                cmd_args=["test", "-f", "/tmp/rebuilt_binary"],
+                timeout=5,
+            )
+            if result.returncode == 0:
+                return "/tmp/rebuilt_binary"
+
+        # For GT or if rebuilt_binary doesn't exist, extract from /bin/arvo
+        # Read the arvo script and parse it in Python to avoid shell quoting issues
+        try:
+            arvo_content = (await container.get_content("/bin/arvo")).decode()
+            # Look for the line after '"run" ]; then'
+            import re
+
+            match = re.search(r'"run" \]; then\s*\n\s*(\S+)', arvo_content)
+            if match:
+                binary = match.group(1)
+                if binary.startswith("/"):
+                    return binary
+        except Exception as e:
+            LOG.debug(f"Failed to parse /bin/arvo for fuzzer binary: {e}")
+
+        # Fallback: list /out/ and find executable
+        result = await container.exec_command(
+            cmd_args=["ls", "-1", "/out/"],
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout:
+            for line in result.stdout.decode().strip().split("\n"):
+                # Check if it's likely a fuzzer binary (executable, not a dict/options file)
+                if line and not line.endswith((".dict", ".options", ".zip", ".txt")):
+                    # Verify it's executable
+                    check_result = await container.exec_command(
+                        cmd_args=["test", "-x", f"/out/{line}"],
+                        timeout=5,
+                    )
+                    if check_result.returncode == 0:
+                        return f"/out/{line}"
+
+        return None
+
+    async def _parse_casr_clusters(
+        self,
+        container: ArvoContainer,
+        casr_output_dir: str,
+        crash_files: List[str],
+        case_id: int,
+    ) -> Dict[str, str]:
+        """Parse CASR output directory to map crashes to clusters.
+
+        CASR organizes crashes into directories: cl1/, cl2/, ..., clN/
+        Each directory contains the crash files belonging to that cluster.
+
+        Args:
+            container: The container with CASR output
+            casr_output_dir: Path to CASR output directory
+            crash_files: List of original crash filenames
+            case_id: Case ID for logging
+
+        Returns:
+            Dict mapping crash filename to cluster ID
+        """
+        crash_to_cluster: Dict[str, str] = {}
+
+        try:
+            # List cluster directories (cl1, cl2, ...)
+            # Use find instead of ls with glob to avoid shell expansion issues
+            result = await container.exec_command(
+                cmd_args=[
+                    "find",
+                    casr_output_dir,
+                    "-maxdepth",
+                    "1",
+                    "-type",
+                    "d",
+                    "-name",
+                    "cl*",
+                ],
+                timeout=10,
+            )
+
+            if not result.stdout or result.returncode != 0:
+                LOG.info(f"Case {case_id}: No cluster directories found in CASR output")
+                return crash_to_cluster
+
+            raw_stdout = result.stdout.decode().strip()
+            cluster_dirs = raw_stdout.split("\n")
+            cluster_dirs = [d for d in cluster_dirs if d and "cl" in d]
+            LOG.info(f"Case {case_id}: Found {len(cluster_dirs)} cluster directories")
+
+            # For each cluster directory, list ALL crash files
+            for cluster_dir in cluster_dirs:
+                cluster_name = cluster_dir.split("/")[-1]  # Extract "cl1", "cl2", etc.
+
+                # List all files in cluster directory
+                result = await container.exec_command(
+                    cmd_args=["ls", "-1", cluster_dir],
+                    timeout=10,
+                )
+
+                if result.returncode == 0 and result.stdout:
+                    files = result.stdout.decode().strip().split("\n")
+                    crash_count = 0
+                    for filename in files:
+                        if not filename:
+                            continue
+                        # Skip .casrep files - we only want the actual crash inputs
+                        if filename.endswith(".casrep"):
+                            continue
+                        # Map crash file to cluster
+                        crash_to_cluster[filename] = cluster_name
+                        crash_count += 1
+                    LOG.info(
+                        f"Case {case_id}: Cluster {cluster_name} contains {crash_count} crash files"
+                    )
+
+            LOG.info(
+                f"Case {case_id}: Mapped {len(crash_to_cluster)} crashes to {len(cluster_dirs)} clusters"
+            )
+
+        except Exception as e:
+            LOG.error(f"Case {case_id}: Error parsing CASR clusters: {e}")
+            import traceback
+
+            LOG.debug(traceback.format_exc())
+
+        return crash_to_cluster
+
+    async def _parse_casr_json_mapping(
+        self,
+        container: ArvoContainer,
+        mapping_file: str,
+        case_id: int,
+    ) -> Dict[str, str]:
+        """Parse JSON mapping file from casr-cluster-map tool.
+
+        The casr-cluster-map Rust tool generates a JSON file with complete crash-to-cluster mapping,
+        preserving ALL crashes (not just representatives like casr-libfuzzer does).
+
+        Args:
+            container: The container with CASR output
+            mapping_file: Path to crash_mapping.json file in container
+            case_id: Case ID for logging
+
+        Returns:
+            Dict mapping crash filename to cluster ID (e.g., "crash-abc123" -> "cl1")
+        """
+        crash_to_cluster: Dict[str, str] = {}
+
+        try:
+            # Read the JSON mapping file from container
+            # Use longer timeout and retry since system can be under heavy load
+            result = None
+            for attempt in range(3):
+                result = await container.exec_command(
+                    cmd_args=["cat", mapping_file],
+                    timeout=30,
+                )
+                if result.returncode == 0 and result.stdout:
+                    break
+                if attempt < 2:
+                    LOG.debug(
+                        f"Case {case_id}: Retrying cat command (attempt {attempt + 2}/3)"
+                    )
+                    await asyncio.sleep(2)
+
+            if not result or result.returncode != 0 or not result.stdout:
+                raise RuntimeError(
+                    f"Case {case_id}: Could not read CASR mapping file {mapping_file}. "
+                    f"Container: {container.container_id}"
+                )
+
+            # Parse JSON from casr-cluster-map Rust tool
+            # Format: {"mappings": [{"crash": "...", "cluster_id": N}, ...], "clusters": {...}, "num_clusters": N}
+            import json
+
+            mapping_data = json.loads(result.stdout.decode())
+
+            # Build crash-to-cluster mapping from the mappings array
+            # Each mapping has: {"crash": "crash-abc123", "cluster_id": 2, "is_representative": bool}
+            mappings = mapping_data.get("mappings", [])
+            for mapping in mappings:
+                crash_name = mapping.get("crash", "")
+                cluster_int = mapping.get("cluster_id", 0)
+                if crash_name and cluster_int > 0:
+                    crash_to_cluster[crash_name] = f"cl{cluster_int}"
+
+            num_clusters = mapping_data.get("num_clusters", 0)
+            LOG.info(
+                f"Case {case_id}: Loaded mapping for {len(crash_to_cluster)} crashes across {num_clusters} clusters"
+            )
+
+            # Log cluster distribution using the clusters dict from JSON
+            clusters = mapping_data.get("clusters", {})
+            for cluster_id, crash_list in sorted(
+                clusters.items(), key=lambda x: int(x[0])
+            ):
+                LOG.info(
+                    f"Case {case_id}: cl{cluster_id} has {len(crash_list)} crashes"
+                )
+
+        except Exception as e:
+            LOG.error(f"Case {case_id}: Error parsing CASR JSON mapping: {e}")
+            import traceback
+
+            LOG.debug(traceback.format_exc())
+
+        return crash_to_cluster
 
     async def _fuzz_with_timeline(
         self,
@@ -1002,17 +1610,22 @@ class FuzzingOnlyBenchmark(Benchmark):
             model=model,
         )
 
+        # Generate unique run ID to isolate crashes across benchmark runs
+        # Uses millisecond timestamp for uniqueness and debuggability
+        run_id = str(int(time.time() * 1000))
+        LOG.info(f"Case {case_id}: {target.value} fuzzing run ID: {run_id}")
+
         # Detect fuzzer type (libFuzzer vs AFL++)
         # First try to load from metadata, then fall back to runtime detection
         fuzzer_type = await self._detect_fuzzer_type(container, case_id=case_id)
         LOG.info(f"Case {case_id}: Detected fuzzer type: {fuzzer_type.value}")
-        
+
         # Store fuzzer type in state for reference
         if state:
             state.fuzzer_type = fuzzer_type
 
         # Configure continuous mode with appropriate flags for the target and fuzzer type
-        await self._set_fuzzer_continuous_mode(container, target, fuzzer_type)
+        await self._set_fuzzer_continuous_mode(container, target, fuzzer_type, run_id)
 
         # Copy rebuilt binary if fuzzing LLM patch
         if target == FuzzingTarget.LLM_PATCH and binary_path:
@@ -1020,7 +1633,12 @@ class FuzzingOnlyBenchmark(Benchmark):
             # Fix RPATH so the binary can find shared libraries in /out/
             # Some binaries (e.g., Skia) have RPATH=$ORIGIN which only looks in the binary's directory
             await container.exec_command(
-                cmd_args=["patchelf", "--set-rpath", "/out:$ORIGIN", "/tmp/rebuilt_binary"]
+                cmd_args=[
+                    "patchelf",
+                    "--set-rpath",
+                    "/out:$ORIGIN",
+                    "/tmp/rebuilt_binary",
+                ]
             )
             fuzz_cmd = ["arvo", "fuzz_fix"]
         else:
@@ -1034,7 +1652,9 @@ class FuzzingOnlyBenchmark(Benchmark):
         duration_seconds = self.fuzzing_config.fuzzing_duration_minutes * 60
 
         # Update state for TUI - don't overwrite LLM generation logs completely
-        fuzzer_name = "AFL++" if fuzzer_type == FuzzerType.AFL_PLUS_PLUS else "libFuzzer"
+        fuzzer_name = (
+            "AFL++" if fuzzer_type == FuzzerType.AFL_PLUS_PLUS else "libFuzzer"
+        )
         if state:
             state.current_activity = f"Fuzzing {target.value} ({fuzzer_name})..."
             # Clear streaming output for fuzzing phase, keep a separator from LLM gen
@@ -1115,14 +1735,18 @@ class FuzzingOnlyBenchmark(Benchmark):
                         # - "execs_done : 123456" (from stats)
                         # - "total_execs : 123456"
                         # - Status lines with execution info
-                        exec_match = re.search(r"(?:execs_done|total_execs)\s*:\s*(\d+)", decoded)
+                        exec_match = re.search(
+                            r"(?:execs_done|total_execs)\s*:\s*(\d+)", decoded
+                        )
                         if exec_match:
                             total_executions = int(exec_match.group(1))
                         # Also try parsing from AFL++ status line: "[*] ... (123456 execs)"
                         elif "execs" in decoded.lower():
                             exec_match = re.search(r"(\d+)\s+execs", decoded)
                             if exec_match:
-                                total_executions = max(total_executions, int(exec_match.group(1)))
+                                total_executions = max(
+                                    total_executions, int(exec_match.group(1))
+                                )
                     else:
                         # libFuzzer format: "#258008: cov: 1552..."
                         exec_match = re.search(r"#(\d+):", decoded)
@@ -1208,15 +1832,29 @@ class FuzzingOnlyBenchmark(Benchmark):
             f"Case {case_id}: {target.value} fuzzing completed in {timeline.duration_seconds:.1f}s"
         )
 
-        # Collect crash files (location depends on fuzzer type)
-        crash_files = await self._get_crash_files(container, fuzzer_type)
+        # Collect crash files (location depends on fuzzer type and target)
+        crash_files = await self._get_crash_files(
+            container, fuzzer_type, target, run_id
+        )
         crash_location = (
-            "/tmp/afl_output/*/crashes/" if fuzzer_type == FuzzerType.AFL_PLUS_PLUS
-            else "/tmp/crashes/"
+            "/tmp/afl_output/*/crashes/"
+            if fuzzer_type == FuzzerType.AFL_PLUS_PLUS
+            else f"/tmp/crashes_{run_id}_{target.value}/"
         )
         LOG.info(
             f"Case {case_id}: Found {len(crash_files)} crash files in {crash_location}"
         )
+
+        # Run CASR deduplication inside the container (where binary + libs are available)
+        # CASR needs the binary to reproduce crashes and generate stack traces
+        casr_clusters: Dict[str, str] = {}  # crash_file -> cluster_id
+        if crash_files and self.fuzzing_config.use_casr:
+            casr_clusters = await self._run_casr_in_container(
+                container, fuzzer_type, crash_files, case_id, target, run_id
+            )
+            LOG.info(
+                f"Case {case_id}: CASR found {len(set(casr_clusters.values()))} unique clusters"
+            )
 
         # Create CrashInfo for each crash
         crash_counter = 0
@@ -1240,6 +1878,9 @@ class FuzzingOnlyBenchmark(Benchmark):
                 ) * timeline.duration_seconds
                 execs = 0
 
+            # Get CASR cluster ID if available
+            cluster_id = casr_clusters.get(crash_file)
+
             crash_info = CrashInfo(
                 crash_id=crash_id,
                 corpus_file=crash_file,
@@ -1253,6 +1894,7 @@ class FuzzingOnlyBenchmark(Benchmark):
                     original_crash is not None
                     and crash_type == original_crash.crash_type
                 ),
+                cluster_id=cluster_id,
             )
 
             timeline.add_crash(crash_info)
@@ -1271,25 +1913,23 @@ class FuzzingOnlyBenchmark(Benchmark):
 
         return timeline
 
-    def _parse_afl_crash_filename(
-        self, filename: str, total_duration: float
-    ) -> tuple:
+    def _parse_afl_crash_filename(self, filename: str, total_duration: float) -> tuple:
         """Parse AFL++ crash filename to extract metadata.
-        
+
         AFL++ crash filenames have format:
         id:000000,sig:11,src:000001,time:12345,execs:123456,op:havoc,rep:2
-        
+
         Args:
             filename: The crash filename
             total_duration: Total fuzzing duration in seconds
-            
+
         Returns:
             Tuple of (crash_type, estimated_time, executions)
         """
         crash_type = "crash"  # Default
         estimated_time = 0.0
         execs = 0
-        
+
         try:
             # Parse comma-separated key:value pairs
             parts = filename.split(",")
@@ -1314,7 +1954,7 @@ class FuzzingOnlyBenchmark(Benchmark):
                         execs = int(value)
         except Exception as e:
             LOG.debug(f"Error parsing AFL++ crash filename '{filename}': {e}")
-        
+
         return crash_type, estimated_time, execs
 
     # =========================================================================
@@ -1417,7 +2057,9 @@ class FuzzingOnlyBenchmark(Benchmark):
             artifacts_dir=out_dir,
         )
         await vul_container.start_container()
-        update_streaming_output(f"Vul container started: {vul_container.container_id[:12]}")
+        update_streaming_output(
+            f"Vul container started: {vul_container.container_id[:12]}"
+        )
 
         containers_pass_qa_checks = True
 
@@ -1433,7 +2075,9 @@ class FuzzingOnlyBenchmark(Benchmark):
             artifacts_dir=out_dir,
         )
         await fix_container.start_container()
-        update_streaming_output(f"Fix container started: {fix_container.container_id[:12]}")
+        update_streaming_output(
+            f"Fix container started: {fix_container.container_id[:12]}"
+        )
 
         state.current_activity = "Running QA checks..."
         update_streaming_output("Running QA checks on containers...")
@@ -1463,10 +2107,14 @@ class FuzzingOnlyBenchmark(Benchmark):
                         update_streaming_output(f"\n[cyan][{timestamp}] USER:[/cyan]")
                         update_streaming_output(f"[white]{content}[/white]")
                     elif role == "assistant":
-                        update_streaming_output(f"\n[green][{timestamp}] ASSISTANT:[/green]")
+                        update_streaming_output(
+                            f"\n[green][{timestamp}] ASSISTANT:[/green]"
+                        )
                         update_streaming_output(f"[yellow]{content}[/yellow]")
                     elif role == "error":
-                        update_streaming_output(f"\n[red][{timestamp}] ERROR: {content}[/red]")
+                        update_streaming_output(
+                            f"\n[red][{timestamp}] ERROR: {content}[/red]"
+                        )
                     update_streaming_output("")
 
                 agent = AutoPatchAgent(
@@ -1498,9 +2146,7 @@ class FuzzingOnlyBenchmark(Benchmark):
                 # Monitor and update status while waiting
                 while not gen_task.done():
                     try:
-                        await asyncio.wait_for(
-                            asyncio.shield(gen_task), timeout=10.0
-                        )
+                        await asyncio.wait_for(asyncio.shield(gen_task), timeout=10.0)
                         break
                     except asyncio.TimeoutError:
                         # Still running, update status
@@ -1513,14 +2159,24 @@ class FuzzingOnlyBenchmark(Benchmark):
                 patched_function_name = report.patched_function_name
 
                 update_streaming_output("")
-                update_streaming_output(f"[bold]Generation completed in {elapsed:.1f}s[/bold]")
-                update_streaming_output(f"Patch status: {report.max_patch_generation_status}")
+                update_streaming_output(
+                    f"[bold]Generation completed in {elapsed:.1f}s[/bold]"
+                )
+                update_streaming_output(
+                    f"Patch status: {report.max_patch_generation_status}"
+                )
                 if patched_function_name:
-                    update_streaming_output(f"Patched function: {patched_function_name}")
+                    update_streaming_output(
+                        f"Patched function: {patched_function_name}"
+                    )
                 if patch_success:
-                    update_streaming_output("[green]SUCCESS: Patch generated and binary rebuilt[/green]")
+                    update_streaming_output(
+                        "[green]SUCCESS: Patch generated and binary rebuilt[/green]"
+                    )
                 else:
-                    update_streaming_output("[red]FAILED: Patch generation unsuccessful[/red]")
+                    update_streaming_output(
+                        "[red]FAILED: Patch generation unsuccessful[/red]"
+                    )
 
                 state.current_activity = (
                     f"Patch generated: {'success' if patch_success else 'failed'}"
@@ -1549,7 +2205,9 @@ class FuzzingOnlyBenchmark(Benchmark):
             update_streaming_output(f"Chat history: {chat_filepath}")
         else:
             state.current_activity = "Container QA checks failed"
-            update_streaming_output("[red]Container QA checks failed - skipping patch generation[/red]")
+            update_streaming_output(
+                "[red]Container QA checks failed - skipping patch generation[/red]"
+            )
 
         # Write response entry
         self._write_to_response_json(
@@ -1578,17 +2236,17 @@ class FuzzingOnlyBenchmark(Benchmark):
         state: CaseState,
     ) -> bool:
         """Rebuild binary from an existing patch file.
-        
+
         This is used when the binary is missing but the patch exists,
         allowing us to rebuild without re-running LLM generation.
-        
+
         Returns True if successful, False otherwise.
         """
         LOG.info(f"Case {case_id}: Rebuilding binary from existing patch {patch_path}")
         state.current_activity = "Rebuilding binary from cached patch..."
-        
+
         out_dir = self._get_case_dir(case_id, model)
-        
+
         # Start a VUL container for rebuilding
         vul_container = ArvoContainer(
             case_id,
@@ -1598,53 +2256,59 @@ class FuzzingOnlyBenchmark(Benchmark):
             log_filepath=out_dir / "rebuild_log.txt",
             artifacts_dir=out_dir,
         )
-        
+
         try:
             await vul_container.start_container()
-            
+
             # Copy and apply the patch
             state.current_activity = "Applying patch..."
             await vul_container.copy_to_container(str(patch_path), "/tmp/patch")
-            
+
             apply_result = await vul_container.exec_command(
                 cmd_args=["git", "apply", "/tmp/patch"]
             )
-            
+
             if apply_result.returncode != 0:
-                LOG.error(f"Case {case_id}: Failed to apply patch. Return code: {apply_result.returncode}")
+                LOG.error(
+                    f"Case {case_id}: Failed to apply patch. Return code: {apply_result.returncode}"
+                )
                 LOG.error(f"Stdout: {apply_result.stdout.decode()}")
                 LOG.error(f"Stderr: {apply_result.stderr.decode()}")
                 return False
-            
+
             LOG.info(f"Case {case_id}: Patch applied successfully")
-            
+
             # Recompile (use original flags, not debug flags like -O0/-g2)
             state.current_activity = "Recompiling with patch..."
             recompile_result = await vul_container.recompile(use_debug_flags=False)
-            
+
             if recompile_result.returncode != 0:
-                LOG.error(f"Case {case_id}: Recompilation failed: {recompile_result.stderr.decode()}")
+                LOG.error(
+                    f"Case {case_id}: Recompilation failed: {recompile_result.stderr.decode()}"
+                )
                 return False
-            
+
             LOG.info(f"Case {case_id}: Recompilation successful")
-            
+
             # Get the rebuilt binary path from the container
             fuzzer_path = await vul_container.get_binary_filepath()
             if not fuzzer_path:
                 LOG.error(f"Case {case_id}: Could not find rebuilt binary in container")
                 return False
-            
+
             # Copy the rebuilt binary out
             state.current_activity = "Extracting rebuilt binary..."
             await vul_container.copy_from_container(fuzzer_path, str(binary_path))
-            
+
             if binary_path.exists():
-                LOG.info(f"Case {case_id}: Successfully rebuilt binary at {binary_path}")
+                LOG.info(
+                    f"Case {case_id}: Successfully rebuilt binary at {binary_path}"
+                )
                 return True
             else:
                 LOG.error(f"Case {case_id}: Binary not found after extraction")
                 return False
-                
+
         except Exception as e:
             LOG.error(f"Case {case_id}: Error rebuilding binary: {e}")
             return False
@@ -1684,18 +2348,24 @@ class FuzzingOnlyBenchmark(Benchmark):
                     # Binary not found - check if we can rebuild from existing patch
                     patch_path = self._get_case_dir(case_id, model) / "patch.patch"
                     if patch_path.exists():
-                        LOG.info(f"Case {case_id}: Binary missing but patch exists - rebuilding")
-                        state.current_activity = "Rebuilding binary from cached patch..."
-                        
+                        LOG.info(
+                            f"Case {case_id}: Binary missing but patch exists - rebuilding"
+                        )
+                        state.current_activity = (
+                            "Rebuilding binary from cached patch..."
+                        )
+
                         rebuild_success = await self._rebuild_binary_from_patch(
                             case_id, model, patch_path, alt_path, state
                         )
-                        
+
                         if rebuild_success:
                             binary_path = str(alt_path)
                             LOG.info(f"Case {case_id}: Successfully rebuilt binary")
                         else:
-                            LOG.warning(f"Case {case_id}: Failed to rebuild binary from patch")
+                            LOG.warning(
+                                f"Case {case_id}: Failed to rebuild binary from patch"
+                            )
                             state.status = CaseStatus.SKIPPED
                             state.error = "Failed to rebuild binary from patch"
                             return None
@@ -1745,42 +2415,46 @@ class FuzzingOnlyBenchmark(Benchmark):
 
             # Fuzz LLM patch (if enabled)
             if self.fuzzing_config.fuzz_llm_patch:
-                # Reset corpus to start fresh (only PoC) - ensures fair comparison with GT
+                # Reset corpus to start fresh - ensures fair comparison with GT
                 LOG.info(f"Case {case_id}: Resetting corpus for LLM fuzzing...")
                 state.current_activity = "Resetting corpus..."
-                
+
                 # Log corpus state before reset
                 result = await container.exec_command(
                     cmd_args=["sh", "-c", "'ls /tmp/corpus/ | wc -l'"]
                 )
-                LOG.info(f"Case {case_id}: Corpus files BEFORE reset: {result.stdout.decode().strip()}")
-                
+                LOG.info(
+                    f"Case {case_id}: Corpus files BEFORE reset: {result.stdout.decode().strip()}"
+                )
+
                 # Clean corpus directory - use find to delete all files
-                # Note: exec_command joins args with spaces and runs via host shell,
-                # so we need to quote the entire sh -c argument
                 result = await container.exec_command(
                     cmd_args=["sh", "-c", "'find /tmp/corpus/ -type f -delete'"]
                 )
                 LOG.info(f"Case {case_id}: find/delete exit code: {result.returncode}")
-                
-                # Also clean up libFuzzer temp directories from fork mode  
+
+                # Clean up libFuzzer temp directories from fork mode
                 result = await container.exec_command(
                     cmd_args=["sh", "-c", "'rm -rf /tmp/libFuzzer*'"]
                 )
-                LOG.info(f"Case {case_id}: libFuzzer cleanup exit code: {result.returncode}")
-                
+                LOG.info(
+                    f"Case {case_id}: libFuzzer cleanup exit code: {result.returncode}"
+                )
+
                 # Copy only the PoC as starting seed
                 result = await container.exec_command(
                     cmd_args=["cp", "/tmp/poc", "/tmp/corpus/poc"]
                 )
                 LOG.info(f"Case {case_id}: cp exit code: {result.returncode}")
-                
+
                 # Verify corpus state after reset
                 result = await container.exec_command(
                     cmd_args=["sh", "-c", "'ls /tmp/corpus/ | wc -l'"]
                 )
-                LOG.info(f"Case {case_id}: Corpus files AFTER reset: {result.stdout.decode().strip()}")
-                
+                LOG.info(
+                    f"Case {case_id}: Corpus files AFTER reset: {result.stdout.decode().strip()}"
+                )
+
                 LOG.info(f"Case {case_id}: Corpus reset complete, starting LLM fuzzing")
 
                 state.status = CaseStatus.FUZZING_LLM
@@ -1808,6 +2482,23 @@ class FuzzingOnlyBenchmark(Benchmark):
 
             return results
 
+        except DebugContainerException as e:
+            # Track container for debugging - do NOT clean it up
+            self.debug_containers[e.container_id] = {
+                "case_id": e.case_id,
+                "reason": str(e),
+                "model": model,
+            }
+            LOG.error(
+                f"Case {case_id}: Debug container preserved!\n"
+                f"Container ID: {e.container_id}\n"
+                f"To debug, run: podman exec -it {e.container_id} bash\n"
+                f"Skipping rest of pipeline for this case. Benchmark will continue."
+            )
+            state.status = CaseStatus.FAILED
+            state.error = f"Debug container preserved: {e.container_id}"
+            return None
+
         except Exception as e:
             LOG.error(f"Case {case_id}: Error during processing: {e}")
             state.status = CaseStatus.FAILED
@@ -1821,17 +2512,29 @@ class FuzzingOnlyBenchmark(Benchmark):
         state: CaseState,
         results: FuzzingResults,
     ) -> None:
-        """Save results for a single case."""
-        case_dir = self._get_case_dir(case_id, model)
+        """Save results for a single case.
 
-        # Save fuzzing results summary
-        results.save(case_dir / "fuzzing_results.json")
+        Saves crashes.json in minimal format to appropriate directories:
+        - /files/case_XXX/ground_truth/crashes.json for GT
+        - /files/case_XXX/model_name/crashes.json for LLM patches
 
-        # Save detailed crash info
-        crash_details = CrashDetails.from_case_state(state)
-        crash_details.save(case_dir / "crash_details.json")
+        Detailed crash analysis is in casr_reports/ subdirectory.
+        """
+        # Save GT timeline if available
+        if state.gt_timeline:
+            gt_dir = self._get_target_dir(case_id, FuzzingTarget.GROUND_TRUTH, model)
+            crashes_file = gt_dir / "crashes.json"
+            crashes_data = state.gt_timeline.to_minimal_dict()
+            crashes_file.write_text(json.dumps(crashes_data, indent=2))
+            LOG.info(f"Case {case_id}: Saved GT crashes to {crashes_file}")
 
-        LOG.info(f"Case {case_id}: Results saved to {case_dir}")
+        # Save LLM timeline if available
+        if state.llm_timeline:
+            llm_dir = self._get_target_dir(case_id, FuzzingTarget.LLM_PATCH, model)
+            crashes_file = llm_dir / "crashes.json"
+            crashes_data = state.llm_timeline.to_minimal_dict()
+            crashes_file.write_text(json.dumps(crashes_data, indent=2))
+            LOG.info(f"Case {case_id}: Saved LLM crashes to {crashes_file}")
 
     def _save_all_results(self, all_results: List[FuzzingResults]) -> None:
         """Save aggregated results to fuzzing_results.json."""
@@ -1880,8 +2583,10 @@ class FuzzingOnlyBenchmark(Benchmark):
         """Run LLM generation (if needed) and fuzzing evaluation on all cases."""
         # Initialize case states for ALL test cases first (before building)
         # This allows TUI to show building progress
-        self._test_cases_to_use = self.test_cases[:num_test_cases] if num_test_cases > 0 else self.test_cases
-        
+        self._test_cases_to_use = (
+            self.test_cases[:num_test_cases] if num_test_cases > 0 else self.test_cases
+        )
+
         for llm in self.llms_under_test:
             for case_id in self._test_cases_to_use:
                 key = f"{case_id}_{llm.model}"
@@ -1890,7 +2595,9 @@ class FuzzingOnlyBenchmark(Benchmark):
                 state.current_activity = "Waiting for container build..."
                 self.case_states[key] = state
 
-        LOG.info(f"Initialized {len(self.case_states)} case states for {len(self._test_cases_to_use)} test cases")
+        LOG.info(
+            f"Initialized {len(self.case_states)} case states for {len(self._test_cases_to_use)} test cases"
+        )
 
         # Check if TUI is enabled
         if self.fuzzing_config.enable_tui:
@@ -1915,22 +2622,54 @@ class FuzzingOnlyBenchmark(Benchmark):
         else:
             await self._build_and_run_without_tui(run_llm_in_parallel)
 
+        # Log debug containers summary at the end of the benchmark
+        if self.debug_containers:
+            LOG.warning(
+                f"\n{'='*60}\n"
+                f"DEBUG CONTAINERS PRESERVED: {len(self.debug_containers)}\n"
+                f"{'='*60}\n"
+                f"The following containers have been preserved for debugging.\n"
+                f"They will NOT be automatically cleaned up.\n"
+            )
+            for container_id, info in self.debug_containers.items():
+                LOG.warning(
+                    f"\n  Case {info['case_id']} ({info['model']}):\n"
+                    f"    Container: {container_id}\n"
+                    f"    Command:   podman exec -it {container_id} bash\n"
+                    f"    Reason:    {info['reason'][:100]}..."
+                )
+            LOG.warning(
+                f"\n{'='*60}\n"
+                f"To manually clean up these containers later, run:\n"
+                f"  podman stop {' '.join(self.debug_containers.keys())}\n"
+                f"  podman rm {' '.join(self.debug_containers.keys())}\n"
+                f"{'='*60}\n"
+            )
+
         if should_cleanup_after_eval:
-            await ArvoContainer.cleanup_all_containers()
+            if self.debug_containers:
+                LOG.warning(
+                    "Skipping automatic container cleanup because debug containers exist.\n"
+                    "Clean them up manually after debugging."
+                )
+            else:
+                await ArvoContainer.cleanup_all_containers()
 
     def _build_containers_and_get_cases(self) -> List[tuple]:
         """Build containers and return list of cases to process.
-        
+
         Note: Caller should set CaseStatus.BUILDING_CONTAINER before calling this.
         """
         if not self._images_built:
-            LOG.info(f"Building container images for {len(self._test_cases_to_use)} test cases...")
+            LOG.info(
+                f"Building container images for {len(self._test_cases_to_use)} test cases..."
+            )
             self.images_available = self._build_container_images(
                 self._test_cases_to_use, self._max_concurrency
             )
             self._images_built = True
             LOG.info(f"Built {len(self.images_available)} container images")
-            
+
             # Update case states for build results
             available_set = set(self.images_available)
             for llm in self.llms_under_test:
@@ -1945,9 +2684,13 @@ class FuzzingOnlyBenchmark(Benchmark):
                             state.status = CaseStatus.PENDING
                             # Check if response already exists
                             if self._is_response_cached(case_id, llm.model):
-                                state.current_activity = "Response cached, ready to process"
+                                state.current_activity = (
+                                    "Response cached, ready to process"
+                                )
                             else:
-                                state.current_activity = "Build complete, waiting for patch generation"
+                                state.current_activity = (
+                                    "Build complete, waiting for patch generation"
+                                )
 
         # Build case list from successfully built images
         cases_to_process = []
@@ -1959,7 +2702,7 @@ class FuzzingOnlyBenchmark(Benchmark):
                 state = self.case_states.get(key)
                 if state and state.status != CaseStatus.FAILED:
                     cases_to_process.append((case_id, llm.model, llm, state))
-        
+
         LOG.info(f"Processing {len(cases_to_process)} cases...")
         return cases_to_process
 
@@ -2010,7 +2753,7 @@ class FuzzingOnlyBenchmark(Benchmark):
         max_concurrent: int,
     ) -> None:
         """Run fuzzing with TUI visualization.
-        
+
         TUI launches immediately, then container building and processing
         happens in the background so user can see progress.
         """
@@ -2027,16 +2770,18 @@ class FuzzingOnlyBenchmark(Benchmark):
         async def run_build_and_processing():
             # Small delay to let TUI initialize and render first tick
             await asyncio.sleep(0.5)
-            
+
             # Update states to show building is starting
             for key, state in self.case_states.items():
                 state.status = CaseStatus.BUILDING_CONTAINER
                 case_id = state.case_id
-                state.current_activity = f"Building container... (logs: build_logs/{case_id}-*.log)"
-            
+                state.current_activity = (
+                    f"Building container... (logs: build_logs/{case_id}-*.log)"
+                )
+
             # Another small delay to let TUI show "building" status
             await asyncio.sleep(0.5)
-            
+
             # Build containers in executor (blocking call)
             cases_to_process = await asyncio.get_event_loop().run_in_executor(
                 None, self._build_containers_and_get_cases
@@ -2058,7 +2803,7 @@ class FuzzingOnlyBenchmark(Benchmark):
         max_concurrent: int,
     ) -> None:
         """Run fuzzing with v2 PTY-based TUI visualization.
-        
+
         TUI launches immediately, then container building and processing
         happens in the background so user can see progress.
         """
@@ -2081,16 +2826,18 @@ class FuzzingOnlyBenchmark(Benchmark):
             try:
                 # Small delay to let TUI initialize and render first tick
                 await asyncio.sleep(0.5)
-                
+
                 # Update states to show building is starting
                 for key, state in self.case_states.items():
                     state.status = CaseStatus.BUILDING_CONTAINER
                     case_id = state.case_id
-                    state.current_activity = f"Building container... (logs: build_logs/{case_id}-*.log)"
-                
+                    state.current_activity = (
+                        f"Building container... (logs: build_logs/{case_id}-*.log)"
+                    )
+
                 # Another small delay to let TUI show "building" status
                 await asyncio.sleep(0.5)
-                
+
                 # Build containers in executor (blocking call)
                 cases_to_process = await asyncio.get_event_loop().run_in_executor(
                     None, self._build_containers_and_get_cases
@@ -2113,242 +2860,24 @@ class FuzzingOnlyBenchmark(Benchmark):
     def _handle_deduplicate(self, case_key: str) -> None:
         """Handle CASR deduplication request from TUI.
 
-        Runs CASR clustering on crash files to deduplicate crashes by stack trace.
-        Updates crash_details with cluster IDs and refreshes unique crash counts.
+        CASR deduplication runs automatically inside the container during fuzzing.
+        This method just reports the existing cluster information.
         """
-        LOG.info(f"CASR deduplication requested for {case_key}")
+        LOG.info(f"CASR deduplication info requested for {case_key}")
 
         state = self.case_states.get(case_key)
         if not state:
             LOG.warning(f"No state found for case {case_key}")
             return
 
-        # Run deduplication in a background thread to not block TUI
-        import threading
+        # Report CASR results from fuzzing
+        gt_unique = state.gt_timeline.unique_crashes() if state.gt_timeline else 0
+        llm_unique = state.llm_timeline.unique_crashes() if state.llm_timeline else 0
+        gt_total = len(state.gt_timeline.crashes) if state.gt_timeline else 0
+        llm_total = len(state.llm_timeline.crashes) if state.llm_timeline else 0
 
-        def run_dedup():
-            try:
-                self._run_casr_deduplication(state)
-            except Exception as e:
-                LOG.error(f"CASR deduplication failed for {case_key}: {e}")
-                state.current_activity = f"Dedup failed: {e}"
-
-        thread = threading.Thread(target=run_dedup, daemon=True)
-        thread.start()
-
-    def _run_casr_deduplication(self, state: CaseState) -> None:
-        """Run CASR deduplication on crash files for a case.
-
-        This uses casr-cluster to group crashes by stack trace similarity.
-        """
-        case_dir = self._get_case_dir(state.case_id, state.model)
-        state.current_activity = "Running CASR deduplication..."
-
-        # Process GT crashes
-        if state.gt_timeline and state.gt_timeline.crashes:
-            gt_crashes_dir = case_dir / "gt_crashes"
-            if gt_crashes_dir.exists():
-                self._deduplicate_crashes_in_dir(
-                    gt_crashes_dir, state.gt_timeline, state, "GT"
-                )
-
-        # Process LLM crashes
-        if state.llm_timeline and state.llm_timeline.crashes:
-            llm_crashes_dir = case_dir / "llm_crashes"
-            if llm_crashes_dir.exists():
-                self._deduplicate_crashes_in_dir(
-                    llm_crashes_dir, state.llm_timeline, state, "LLM"
-                )
-
-        state.current_activity = "Deduplication complete"
+        state.current_activity = f"CASR: GT={gt_unique}/{gt_total} unique, LLM={llm_unique}/{llm_total} unique"
         LOG.info(
-            f"Case {state.case_id}: Deduplication complete. "
-            f"GT: {state.gt_timeline.unique_crashes() if state.gt_timeline else 0} unique, "
-            f"LLM: {state.llm_timeline.unique_crashes() if state.llm_timeline else 0} unique"
-        )
-
-    def _deduplicate_crashes_in_dir(
-        self,
-        crashes_dir: Path,
-        timeline: "CrashTimeline",
-        state: CaseState,
-        target_name: str,
-    ) -> None:
-        """Run CASR clustering on a directory of crash files."""
-        import subprocess
-
-        # Check if casr-cluster is available
-        try:
-            result = subprocess.run(
-                ["which", "casr-cluster"],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                LOG.warning(
-                    "casr-cluster not found in PATH, using hash-based deduplication"
-                )
-                self._hash_based_deduplication(timeline, state)
-                return
-        except Exception:
-            LOG.warning(
-                "Could not check for casr-cluster, using hash-based deduplication"
-            )
-            self._hash_based_deduplication(timeline, state)
-            return
-
-        # Find all CASR report files
-        casr_reports = list(crashes_dir.glob("*.casr.json"))
-        if not casr_reports:
-            LOG.info(
-                f"No CASR reports found in {crashes_dir}, running casr-libfuzzer first"
-            )
-            # Try to generate CASR reports for crash files
-            self._generate_casr_reports(crashes_dir, state)
-            casr_reports = list(crashes_dir.glob("*.casr.json"))
-
-        if not casr_reports:
-            LOG.warning(f"No crashes to deduplicate for {target_name}")
-            return
-
-        # Create a temporary directory for clustering output
-        clusters_dir = crashes_dir.parent / f"{target_name.lower()}_clusters"
-        clusters_dir.mkdir(parents=True, exist_ok=True)
-
-        # Run casr-cluster
-        try:
-            cmd = [
-                "casr-cluster",
-                "-d",
-                str(crashes_dir),
-                "-o",
-                str(clusters_dir),
-            ]
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=300,  # 5 minute timeout
-            )
-
-            if result.returncode != 0:
-                LOG.warning(f"casr-cluster failed: {result.stderr}")
-                self._hash_based_deduplication(timeline, state)
-                return
-
-            # Parse clustering results and update crash info
-            self._update_crash_clusters(clusters_dir, timeline, state)
-
-        except subprocess.TimeoutExpired:
-            LOG.warning("casr-cluster timed out, using hash-based deduplication")
-            self._hash_based_deduplication(timeline, state)
-        except Exception as e:
-            LOG.warning(f"casr-cluster error: {e}, using hash-based deduplication")
-            self._hash_based_deduplication(timeline, state)
-
-    def _generate_casr_reports(self, crashes_dir: Path, state: CaseState) -> None:
-        """Generate CASR reports for crash files that don't have them."""
-        import subprocess
-
-        # Find crash files without CASR reports
-        crash_files = [
-            f
-            for f in crashes_dir.iterdir()
-            if f.is_file()
-            and not f.name.endswith(".casr.json")
-            and f.name.startswith("crash-")
-        ]
-
-        for crash_file in crash_files:
-            casr_report = crash_file.with_suffix(crash_file.suffix + ".casr.json")
-            if casr_report.exists():
-                continue
-
-            # We need the binary path to run casr-libfuzzer
-            binary_path = state.binary_path
-            if not binary_path:
-                LOG.warning(
-                    f"No binary path available for CASR analysis of {crash_file}"
-                )
-                continue
-
-            try:
-                cmd = [
-                    "casr-libfuzzer",
-                    "-o",
-                    str(casr_report),
-                    str(crash_file),
-                    binary_path,
-                ]
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-                if result.returncode != 0:
-                    LOG.debug(
-                        f"casr-libfuzzer failed for {crash_file}: {result.stderr}"
-                    )
-            except Exception as e:
-                LOG.debug(f"Error generating CASR report for {crash_file}: {e}")
-
-    def _update_crash_clusters(
-        self,
-        clusters_dir: Path,
-        timeline: "CrashTimeline",
-        state: CaseState,
-    ) -> None:
-        """Update crash info with cluster IDs from CASR clustering output."""
-        # CASR creates subdirectories for each cluster
-        cluster_dirs = [d for d in clusters_dir.iterdir() if d.is_dir()]
-
-        # Build mapping from crash file to cluster ID
-        crash_to_cluster: Dict[str, str] = {}
-        for cluster_dir in cluster_dirs:
-            cluster_id = cluster_dir.name
-            for report_file in cluster_dir.glob("*.casr.json"):
-                # Extract crash filename from report name
-                crash_name = report_file.stem.replace(".casr", "")
-                crash_to_cluster[crash_name] = cluster_id
-
-        # Update crash info
-        for crash in timeline.crashes:
-            crash_name = Path(crash.corpus_file).name
-            if crash_name in crash_to_cluster:
-                crash.cluster_id = crash_to_cluster[crash_name]
-                # Also update in state.crash_details
-                if crash.crash_id in state.crash_details:
-                    state.crash_details[crash.crash_id].cluster_id = crash.cluster_id
-
-        LOG.info(
-            f"Updated {len(crash_to_cluster)} crashes with cluster IDs "
-            f"({len(cluster_dirs)} unique clusters)"
-        )
-
-    def _hash_based_deduplication(
-        self,
-        timeline: "CrashTimeline",
-        state: CaseState,
-    ) -> None:
-        """Fallback deduplication using crash type as cluster ID.
-
-        When CASR is not available, we group crashes by their crash_type.
-        """
-        # Group by crash type
-        type_to_cluster: Dict[str, str] = {}
-        cluster_counter = 0
-
-        for crash in timeline.crashes:
-            if crash.crash_type not in type_to_cluster:
-                type_to_cluster[crash.crash_type] = f"type_cluster_{cluster_counter}"
-                cluster_counter += 1
-
-            crash.cluster_id = type_to_cluster[crash.crash_type]
-            if crash.crash_id in state.crash_details:
-                state.crash_details[crash.crash_id].cluster_id = crash.cluster_id
-
-        LOG.info(
-            f"Hash-based deduplication: {len(timeline.crashes)} crashes -> "
-            f"{len(type_to_cluster)} unique types"
+            f"Case {state.case_id}: CASR dedup results - "
+            f"GT: {gt_unique}/{gt_total} unique, LLM: {llm_unique}/{llm_total} unique"
         )

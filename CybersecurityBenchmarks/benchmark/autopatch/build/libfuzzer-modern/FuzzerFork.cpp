@@ -61,6 +61,49 @@ static Stats ParseFinalStatsFromLog(const std::string &LogPath) {
   return Res;
 }
 
+// Save crash log content from worker's log to artifact directory for CASR.
+// This copies the ASAN/crash output from Job->LogPath to {ArtifactPrefix}/logs/
+// so that CASR can use log-based clustering instead of re-running binaries.
+static void SaveCrashLogsForCASR(const std::string &JobLogPath,
+                                  const std::string &ArtifactPrefix) {
+  // Read the entire job log
+  std::string LogContent = FileToString(JobLogPath);
+  if (LogContent.empty())
+    return;
+
+  // Create logs directory
+  std::string LogsDir = ArtifactPrefix + "logs";
+  MkDir(LogsDir);
+
+  // Find crash files in ArtifactPrefix and save corresponding logs
+  // Crash files are named: crash-{hash}, oom-{hash}, timeout-{hash}, leak-{hash}
+  Vector<std::string> CrashFiles;
+  ListFilesInDirRecursive(ArtifactPrefix, nullptr, &CrashFiles, false);
+
+  for (const auto &CrashPath : CrashFiles) {
+    // Extract filename from path
+    size_t LastSlash = CrashPath.rfind('/');
+    std::string CrashName = (LastSlash != std::string::npos)
+                                ? CrashPath.substr(LastSlash + 1)
+                                : CrashPath;
+
+    // Only process crash/oom/timeout/leak files, not other artifacts
+    // Also skip .log files (they're in the logs/ subdirectory, not crash artifacts)
+    if (CrashName.find("crash-") != 0 && CrashName.find("oom-") != 0 &&
+        CrashName.find("timeout-") != 0 && CrashName.find("leak-") != 0)
+      continue;
+    if (CrashName.size() > 4 && 
+        CrashName.substr(CrashName.size() - 4) == ".log")
+      continue;
+
+    // Always overwrite - Job->LogPath has full ASAN output, while any existing
+    // log file from RedirectStderrToCrashLog only has partial output (ASAN
+    // prints BEFORE our crash callback runs in fork mode)
+    std::string LogPath = DirPlusFile(LogsDir, CrashName + ".log");
+    WriteToFile(LogContent, LogPath);
+  }
+}
+
 struct FuzzJob {
   // Inputs.
   Command Cmd;
@@ -347,9 +390,8 @@ void FuzzWithFork(Random &Rand, const FuzzingOptions &Options,
     }
     Fuzzer::MaybeExitGracefully();
 
-    Env.RunOneMergeJob(Job.get());
-
-    // Continue if our crash is one of the ignorred ones.
+    // Update crash/timeout/oom counters BEFORE printing stats
+    bool ShouldStop = false;
     if (Options.IgnoreTimeouts && ExitCode == Options.TimeoutExitCode)
       Env.NumTimeouts++;
     else if (Options.IgnoreOOMs && ExitCode == Options.OOMExitCode)
@@ -365,11 +407,24 @@ void FuzzWithFork(Random &Rand, const FuzzingOptions &Options,
             Printf("%s\n", Line.c_str());
       } else {
         // And exit if we don't ignore this crash.
-        Printf("INFO: log from the inner process:\n%s",
-               FileToString(Job->LogPath).c_str());
-        StopJobs();
-        break;
+        ShouldStop = true;
       }
+    }
+
+    // Save crash log content to artifact directory for CASR log-based clustering.
+    // This copies ASAN/crash output from the worker's log so CASR doesn't need
+    // to re-run binaries.
+    if (ExitCode != 0 && !Options.ArtifactPrefix.empty()) {
+      SaveCrashLogsForCASR(Job->LogPath, Options.ArtifactPrefix);
+    }
+
+    Env.RunOneMergeJob(Job.get());
+
+    if (ShouldStop) {
+      Printf("INFO: log from the inner process:\n%s",
+             FileToString(Job->LogPath).c_str());
+      StopJobs();
+      break;
     }
 
     // Stop if we are over the time budget.

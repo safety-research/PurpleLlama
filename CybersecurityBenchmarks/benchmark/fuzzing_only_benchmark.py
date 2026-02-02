@@ -75,9 +75,15 @@ class FuzzingOnlyBenchmark(Benchmark):
     - Crash timeline tracking for plotting
     - LLM response caching support
     - Optional TUI for real-time visualization
+
+    GT (ground truth) is treated as a special "model" with model name GT_MODEL_NAME.
+    It uses the pre-built -fix container instead of requiring LLM patch generation.
     """
 
     BENCHMARK_NAME: str = "fuzzing-only"
+
+    # Ground truth model name - treated as a special model that uses the fix container
+    GT_MODEL_NAME: str = "ground_truth"
 
     # Timeout for patch generation (seconds)
     PER_SAMPLE_PATCH_GENERATION_TIMEOUT: int = 60 * 20  # 20 minutes
@@ -257,6 +263,37 @@ class FuzzingOnlyBenchmark(Benchmark):
             target_dir = self.files_dir / f"case_{case_id}" / model
         target_dir.mkdir(parents=True, exist_ok=True)
         return target_dir
+
+    def _is_gt_results_cached(self, case_id: int) -> bool:
+        """Check if ground truth fuzzing results already exist for this case.
+
+        GT results are stored in /files/case_XXX/ground_truth/crashes.json
+        and are shared across all models for the same case.
+        """
+        gt_dir = self._get_target_dir(case_id, FuzzingTarget.GROUND_TRUTH)
+        crashes_file = gt_dir / "crashes.json"
+        return crashes_file.exists()
+
+    def _load_cached_gt_timeline(self, case_id: int) -> Optional[CrashTimeline]:
+        """Load cached ground truth timeline from the ground_truth directory.
+
+        Returns:
+            CrashTimeline if cached results exist, None otherwise
+        """
+        gt_dir = self._get_target_dir(case_id, FuzzingTarget.GROUND_TRUTH)
+        crashes_file = gt_dir / "crashes.json"
+
+        if not crashes_file.exists():
+            return None
+
+        try:
+            crashes_data = json.loads(crashes_file.read_text())
+            timeline = CrashTimeline.from_minimal_dict(crashes_data)
+            LOG.info(f"Case {case_id}: Loaded cached GT results with {len(timeline.crashes)} crashes")
+            return timeline
+        except Exception as e:
+            LOG.warning(f"Case {case_id}: Failed to load cached GT results: {e}")
+            return None
 
     def _read_responses(self) -> List[Dict[str, Any]]:
         """Read existing responses from file."""
@@ -1212,9 +1249,9 @@ class FuzzingOnlyBenchmark(Benchmark):
             stdout = result.stdout.decode(errors="replace") if result.stdout else ""
             stderr = result.stderr.decode(errors="replace") if result.stderr else ""
 
-            # Save CASR output to log file
-            case_dir = self._get_case_dir(case_id, container.model_under_test)
-            casr_log_file = case_dir / f"casr_output_{target.value}.log"
+            # Save CASR output to log file in target directory (GT or LLM)
+            target_dir = self._get_target_dir(case_id, target, container.model_under_test)
+            casr_log_file = target_dir / f"casr_output_{target.value}.log"
             with open(casr_log_file, "w") as f:
                 f.write(f"=== CASR Clustering (casr-cluster-map) ===\n")
                 f.write(f"Command: {' '.join(cmd_args)}\n")
@@ -1673,8 +1710,9 @@ class FuzzingOnlyBenchmark(Benchmark):
         LOG.info(f"Case {case_id}: Running fuzzer: {fuzz_cmd_str}")
 
         # Create log file path for this fuzzing run
-        case_dir = self._get_case_dir(case_id, model)
-        log_file = case_dir / f"fuzzer_output_{target.value}.log"
+        # Use target directory so GT logs go to ground_truth/, not model directory
+        target_dir = self._get_target_dir(case_id, target, model)
+        log_file = target_dir / f"fuzzer_output_{target.value}.log"
 
         # Show tail command for monitoring instead of streaming output
         tail_cmd = f"tail -f {log_file}"
@@ -1961,7 +1999,115 @@ class FuzzingOnlyBenchmark(Benchmark):
     # Main Workflow
     # =========================================================================
 
-    async def _process_single_case_full(
+    async def _process_gt_case(
+        self,
+        case_id: int,
+        state: CaseState,
+    ) -> Optional[FuzzingResults]:
+        """
+        Process a GT (ground truth) case.
+
+        GT is treated as a special "model" that:
+        - Uses the pre-built -fix container (no LLM generation needed)
+        - Fuzzes the fix container's binary directly
+        - Stores results in /files/case_XXX/ground_truth/
+
+        Args:
+            case_id: ARVO case ID
+            state: CaseState for this GT case
+
+        Returns:
+            FuzzingResults if successful, None otherwise
+        """
+        LOG.info(f"Case {case_id}: Processing GT (ground truth)")
+
+        try:
+            # Check for cached GT results
+            cached_gt = self._load_cached_gt_timeline(case_id)
+            if cached_gt:
+                LOG.info(
+                    f"Case {case_id}: Using cached GT results ({cached_gt.unique_crashes()} unique crashes)"
+                )
+                state.gt_timeline = cached_gt
+                state.status = CaseStatus.COMPLETED
+                state.current_activity = f"GT cached: {cached_gt.unique_crashes()} unique crashes"
+
+                results = FuzzingResults.from_case_state(state, self.fuzzing_config)
+                return results
+
+            # Start fix container for GT fuzzing
+            state.status = CaseStatus.BUILDING_CONTAINER
+            state.current_activity = "Starting fix container..."
+
+            gt_dir = self._get_target_dir(case_id, FuzzingTarget.GROUND_TRUTH)
+            container = ArvoContainer(
+                case_id,
+                container_type=ArvoContainer.CONTAINER_TYPE_FIX,
+                model_under_test=self.GT_MODEL_NAME,
+                log_level=logging.INFO,
+                log_filepath=gt_dir / "fuzzing_log.txt",
+                artifacts_dir=gt_dir,
+            )
+            await container.start_container()
+
+            # Analyze original crash (for reference/comparison)
+            state.status = CaseStatus.ANALYZING_ORIGINAL
+            state.current_activity = "Analyzing original PoC crash..."
+            original_crash = await self._analyze_original_crash(container, case_id)
+            state.original_crash = original_crash
+
+            # Fuzz ground truth
+            state.status = CaseStatus.FUZZING_GT
+            state.current_activity = "Fuzzing ground truth patch..."
+
+            state.gt_timeline = await self._fuzz_with_timeline(
+                container,
+                FuzzingTarget.GROUND_TRUTH,
+                case_id,
+                self.GT_MODEL_NAME,
+                original_crash=original_crash,
+                state=state,
+            )
+
+            # Save GT results
+            if state.gt_timeline:
+                crashes_file = gt_dir / "crashes.json"
+                crashes_data = state.gt_timeline.to_minimal_dict()
+                crashes_file.write_text(json.dumps(crashes_data, indent=2))
+                LOG.info(f"Case {case_id}: Saved GT results to {crashes_file}")
+
+            # Clean up container
+            await ArvoContainer.stop_container(container.container_id)
+
+            # Mark complete
+            state.status = CaseStatus.COMPLETED
+            state.current_activity = "Done"
+
+            results = FuzzingResults.from_case_state(state, self.fuzzing_config)
+            return results
+
+        except DebugContainerException as e:
+            self.debug_containers[e.container_id] = {
+                "case_id": e.case_id,
+                "reason": str(e),
+                "model": self.GT_MODEL_NAME,
+            }
+            LOG.error(
+                f"Case {case_id}: GT debug container preserved!\n"
+                f"Container ID: {e.container_id}\n"
+                f"To debug, run: podman exec -it {e.container_id} bash"
+            )
+            state.status = CaseStatus.FAILED
+            state.error = f"Debug container preserved: {e.container_id}"
+            return None
+
+        except Exception as e:
+            LOG.error(f"Case {case_id}: Error during GT processing: {e}")
+            state.status = CaseStatus.FAILED
+            state.error = str(e)
+            return None
+
+    async def _process_llm_case(
         self,
         case_id: int,
         model_name: str,
@@ -1969,8 +2115,22 @@ class FuzzingOnlyBenchmark(Benchmark):
         state: CaseState,
     ) -> Optional[FuzzingResults]:
         """
-        Full processing pipeline: generate LLM response if needed, then fuzz.
-        This method handles both LLM generation and fuzzing in a single flow.
+        Process an LLM model case.
+
+        LLM cases:
+        - Generate patch using LLM if not cached
+        - Rebuild binary with the patch
+        - Fuzz the patched binary
+        - Store results in /files/case_XXX/model_name/
+
+        Args:
+            case_id: ARVO case ID
+            model_name: LLM model name
+            llm: LLM instance for patch generation
+            state: CaseState for this LLM case
+
+        Returns:
+            FuzzingResults if successful, None otherwise
         """
         try:
             # Check if response is already cached
@@ -1990,7 +2150,7 @@ class FuzzingOnlyBenchmark(Benchmark):
             return await self._process_single_case(case_id, model_name, state)
 
         except Exception as e:
-            LOG.error(f"Case {case_id}: Error during full processing: {e}")
+            LOG.error(f"Case {case_id}: Error during LLM processing: {e}")
             state.status = CaseStatus.FAILED
             state.error = str(e)
             return None
@@ -2322,8 +2482,12 @@ class FuzzingOnlyBenchmark(Benchmark):
         model: str,
         state: CaseState,
     ) -> Optional[FuzzingResults]:
-        """Process a single case: load response, fuzz GT and LLM patch."""
-        LOG.info(f"Processing case {case_id} with model {model}")
+        """Process a single LLM case: load response and fuzz LLM patch.
+
+        Note: GT is now handled separately by _process_gt_case as its own "model".
+        This method only handles LLM patch fuzzing.
+        """
+        LOG.info(f"Processing LLM case {case_id} with model {model}")
 
         try:
             # Load cached response
@@ -2393,82 +2557,67 @@ class FuzzingOnlyBenchmark(Benchmark):
             )
             await container.start_container()
 
-            # Analyze original crash
+            # Analyze original crash (for reference/comparison)
             state.status = CaseStatus.ANALYZING_ORIGINAL
             state.current_activity = "Analyzing original PoC crash..."
             original_crash = await self._analyze_original_crash(container, case_id)
             state.original_crash = original_crash
 
-            # Fuzz ground truth (if enabled)
-            if self.fuzzing_config.fuzz_ground_truth:
-                state.status = CaseStatus.FUZZING_GT
-                state.current_activity = "Fuzzing ground truth patch..."
+            # Fuzz LLM patch
+            # Reset corpus to start fresh - ensures fair comparison with GT
+            LOG.info(f"Case {case_id}: Resetting corpus for LLM fuzzing...")
+            state.current_activity = "Resetting corpus..."
 
-                state.gt_timeline = await self._fuzz_with_timeline(
-                    container,
-                    FuzzingTarget.GROUND_TRUTH,
-                    case_id,
-                    model,
-                    original_crash=original_crash,
-                    state=state,
-                )
+            # Log corpus state before reset
+            result = await container.exec_command(
+                cmd_args=["sh", "-c", "'ls /tmp/corpus/ | wc -l'"]
+            )
+            LOG.info(
+                f"Case {case_id}: Corpus files BEFORE reset: {result.stdout.decode().strip()}"
+            )
 
-            # Fuzz LLM patch (if enabled)
-            if self.fuzzing_config.fuzz_llm_patch:
-                # Reset corpus to start fresh - ensures fair comparison with GT
-                LOG.info(f"Case {case_id}: Resetting corpus for LLM fuzzing...")
-                state.current_activity = "Resetting corpus..."
+            # Clean corpus directory - use find to delete all files
+            result = await container.exec_command(
+                cmd_args=["sh", "-c", "'find /tmp/corpus/ -type f -delete'"]
+            )
+            LOG.info(f"Case {case_id}: find/delete exit code: {result.returncode}")
 
-                # Log corpus state before reset
-                result = await container.exec_command(
-                    cmd_args=["sh", "-c", "'ls /tmp/corpus/ | wc -l'"]
-                )
-                LOG.info(
-                    f"Case {case_id}: Corpus files BEFORE reset: {result.stdout.decode().strip()}"
-                )
+            # Clean up libFuzzer temp directories from fork mode
+            result = await container.exec_command(
+                cmd_args=["sh", "-c", "'rm -rf /tmp/libFuzzer*'"]
+            )
+            LOG.info(
+                f"Case {case_id}: libFuzzer cleanup exit code: {result.returncode}"
+            )
 
-                # Clean corpus directory - use find to delete all files
-                result = await container.exec_command(
-                    cmd_args=["sh", "-c", "'find /tmp/corpus/ -type f -delete'"]
-                )
-                LOG.info(f"Case {case_id}: find/delete exit code: {result.returncode}")
+            # Copy only the PoC as starting seed
+            result = await container.exec_command(
+                cmd_args=["cp", "/tmp/poc", "/tmp/corpus/poc"]
+            )
+            LOG.info(f"Case {case_id}: cp exit code: {result.returncode}")
 
-                # Clean up libFuzzer temp directories from fork mode
-                result = await container.exec_command(
-                    cmd_args=["sh", "-c", "'rm -rf /tmp/libFuzzer*'"]
-                )
-                LOG.info(
-                    f"Case {case_id}: libFuzzer cleanup exit code: {result.returncode}"
-                )
+            # Verify corpus state after reset
+            result = await container.exec_command(
+                cmd_args=["sh", "-c", "'ls /tmp/corpus/ | wc -l'"]
+            )
+            LOG.info(
+                f"Case {case_id}: Corpus files AFTER reset: {result.stdout.decode().strip()}"
+            )
 
-                # Copy only the PoC as starting seed
-                result = await container.exec_command(
-                    cmd_args=["cp", "/tmp/poc", "/tmp/corpus/poc"]
-                )
-                LOG.info(f"Case {case_id}: cp exit code: {result.returncode}")
+            LOG.info(f"Case {case_id}: Corpus reset complete, starting LLM fuzzing")
 
-                # Verify corpus state after reset
-                result = await container.exec_command(
-                    cmd_args=["sh", "-c", "'ls /tmp/corpus/ | wc -l'"]
-                )
-                LOG.info(
-                    f"Case {case_id}: Corpus files AFTER reset: {result.stdout.decode().strip()}"
-                )
+            state.status = CaseStatus.FUZZING_LLM
+            state.current_activity = "Fuzzing LLM patch..."
 
-                LOG.info(f"Case {case_id}: Corpus reset complete, starting LLM fuzzing")
-
-                state.status = CaseStatus.FUZZING_LLM
-                state.current_activity = "Fuzzing LLM patch..."
-
-                state.llm_timeline = await self._fuzz_with_timeline(
-                    container,
-                    FuzzingTarget.LLM_PATCH,
-                    case_id,
-                    model,
-                    binary_path=binary_path,
-                    original_crash=original_crash,
-                    state=state,
-                )
+            state.llm_timeline = await self._fuzz_with_timeline(
+                container,
+                FuzzingTarget.LLM_PATCH,
+                case_id,
+                model,
+                binary_path=binary_path,
+                original_crash=original_crash,
+                state=state,
+            )
 
             # Clean up container
             await ArvoContainer.stop_container(container.container_id)
@@ -2515,19 +2664,14 @@ class FuzzingOnlyBenchmark(Benchmark):
         """Save results for a single case.
 
         Saves crashes.json in minimal format to appropriate directories:
-        - /files/case_XXX/ground_truth/crashes.json for GT
+        - /files/case_XXX/ground_truth/crashes.json for GT (saved during processing, not here)
         - /files/case_XXX/model_name/crashes.json for LLM patches
 
         Detailed crash analysis is in casr_reports/ subdirectory.
-        """
-        # Save GT timeline if available
-        if state.gt_timeline:
-            gt_dir = self._get_target_dir(case_id, FuzzingTarget.GROUND_TRUTH, model)
-            crashes_file = gt_dir / "crashes.json"
-            crashes_data = state.gt_timeline.to_minimal_dict()
-            crashes_file.write_text(json.dumps(crashes_data, indent=2))
-            LOG.info(f"Case {case_id}: Saved GT crashes to {crashes_file}")
 
+        Note: GT results are saved immediately after GT fuzzing in _process_single_case
+        to allow other models to reuse them. We don't save them again here.
+        """
         # Save LLM timeline if available
         if state.llm_timeline:
             llm_dir = self._get_target_dir(case_id, FuzzingTarget.LLM_PATCH, model)
@@ -2587,13 +2731,25 @@ class FuzzingOnlyBenchmark(Benchmark):
             self.test_cases[:num_test_cases] if num_test_cases > 0 else self.test_cases
         )
 
-        for llm in self.llms_under_test:
+        # Create GT case states (one per case_id) if GT fuzzing is enabled
+        # GT is treated as a special "model" that uses the pre-built fix container
+        if self.fuzzing_config.fuzz_ground_truth:
             for case_id in self._test_cases_to_use:
-                key = f"{case_id}_{llm.model}"
-                state = CaseState(case_id=case_id, model=llm.model)
+                key = f"{case_id}_{self.GT_MODEL_NAME}"
+                state = CaseState(case_id=case_id, model=self.GT_MODEL_NAME)
                 state.status = CaseStatus.PENDING
                 state.current_activity = "Waiting for container build..."
                 self.case_states[key] = state
+
+        # Create LLM model case states if LLM fuzzing is enabled
+        if self.fuzzing_config.fuzz_llm_patch:
+            for llm in self.llms_under_test:
+                for case_id in self._test_cases_to_use:
+                    key = f"{case_id}_{llm.model}"
+                    state = CaseState(case_id=case_id, model=llm.model)
+                    state.status = CaseStatus.PENDING
+                    state.current_activity = "Waiting for container build..."
+                    self.case_states[key] = state
 
         LOG.info(
             f"Initialized {len(self.case_states)} case states for {len(self._test_cases_to_use)} test cases"
@@ -2601,24 +2757,13 @@ class FuzzingOnlyBenchmark(Benchmark):
 
         # Check if TUI is enabled
         if self.fuzzing_config.enable_tui:
-            if self.fuzzing_config.use_tui_v2:
-                from .fuzzing_tui_v2 import is_textual_available
+            from .fuzzing_tui import is_textual_available
 
-                if is_textual_available():
-                    # Run with v2 TUI - builds containers and processes in background
-                    await self._run_with_tui_v2(run_llm_in_parallel)
-                else:
-                    LOG.warning("Textual not available for v2 TUI, running without TUI")
-                    await self._build_and_run_without_tui(run_llm_in_parallel)
+            if is_textual_available():
+                await self._run_with_tui(run_llm_in_parallel)
             else:
-                from .fuzzing_tui import is_textual_available
-
-                if is_textual_available():
-                    # Run with v1 TUI - builds containers and processes in background
-                    await self._run_with_tui(run_llm_in_parallel)
-                else:
-                    LOG.warning("Textual not available, running without TUI")
-                    await self._build_and_run_without_tui(run_llm_in_parallel)
+                LOG.warning("Textual not available, running without TUI")
+                await self._build_and_run_without_tui(run_llm_in_parallel)
         else:
             await self._build_and_run_without_tui(run_llm_in_parallel)
 
@@ -2658,6 +2803,10 @@ class FuzzingOnlyBenchmark(Benchmark):
     def _build_containers_and_get_cases(self) -> List[tuple]:
         """Build containers and return list of cases to process.
 
+        Returns list of tuples: (case_id, model_name, llm_or_none, state)
+        - For GT cases: llm_or_none is None
+        - For LLM cases: llm_or_none is the LLM instance
+
         Note: Caller should set CaseStatus.BUILDING_CONTAINER before calling this.
         """
         if not self._images_built:
@@ -2672,9 +2821,11 @@ class FuzzingOnlyBenchmark(Benchmark):
 
             # Update case states for build results
             available_set = set(self.images_available)
-            for llm in self.llms_under_test:
+
+            # Update GT case states
+            if self.fuzzing_config.fuzz_ground_truth:
                 for case_id in self._test_cases_to_use:
-                    key = f"{case_id}_{llm.model}"
+                    key = f"{case_id}_{self.GT_MODEL_NAME}"
                     state = self.case_states.get(key)
                     if state:
                         if case_id not in available_set:
@@ -2682,26 +2833,58 @@ class FuzzingOnlyBenchmark(Benchmark):
                             state.current_activity = f"Container build failed (see build_logs/{case_id}-*.log)"
                         else:
                             state.status = CaseStatus.PENDING
-                            # Check if response already exists
-                            if self._is_response_cached(case_id, llm.model):
-                                state.current_activity = (
-                                    "Response cached, ready to process"
-                                )
+                            # Check if GT results already exist
+                            if self._is_gt_results_cached(case_id):
+                                state.current_activity = "GT cached, ready to process"
                             else:
-                                state.current_activity = (
-                                    "Build complete, waiting for patch generation"
-                                )
+                                state.current_activity = "Build complete, ready to fuzz"
+
+            # Update LLM case states
+            if self.fuzzing_config.fuzz_llm_patch:
+                for llm in self.llms_under_test:
+                    for case_id in self._test_cases_to_use:
+                        key = f"{case_id}_{llm.model}"
+                        state = self.case_states.get(key)
+                        if state:
+                            if case_id not in available_set:
+                                state.status = CaseStatus.FAILED
+                                state.current_activity = f"Container build failed (see build_logs/{case_id}-*.log)"
+                            else:
+                                state.status = CaseStatus.PENDING
+                                # Check if response already exists
+                                if self._is_response_cached(case_id, llm.model):
+                                    state.current_activity = (
+                                        "Response cached, ready to process"
+                                    )
+                                else:
+                                    state.current_activity = (
+                                        "Build complete, waiting for patch generation"
+                                    )
 
         # Build case list from successfully built images
         cases_to_process = []
-        for llm in self.llms_under_test:
+
+        # Add GT cases first (they don't need LLM generation)
+        if self.fuzzing_config.fuzz_ground_truth:
             for case_id in self.images_available:
                 if case_id not in self._test_cases_to_use:
                     continue
-                key = f"{case_id}_{llm.model}"
+                key = f"{case_id}_{self.GT_MODEL_NAME}"
                 state = self.case_states.get(key)
                 if state and state.status != CaseStatus.FAILED:
-                    cases_to_process.append((case_id, llm.model, llm, state))
+                    # GT cases have None for LLM
+                    cases_to_process.append((case_id, self.GT_MODEL_NAME, None, state))
+
+        # Add LLM cases
+        if self.fuzzing_config.fuzz_llm_patch:
+            for llm in self.llms_under_test:
+                for case_id in self.images_available:
+                    if case_id not in self._test_cases_to_use:
+                        continue
+                    key = f"{case_id}_{llm.model}"
+                    state = self.case_states.get(key)
+                    if state and state.status != CaseStatus.FAILED:
+                        cases_to_process.append((case_id, llm.model, llm, state))
 
         LOG.info(f"Processing {len(cases_to_process)} cases...")
         return cases_to_process
@@ -2716,18 +2899,30 @@ class FuzzingOnlyBenchmark(Benchmark):
         cases_to_process: List[tuple],
         max_concurrent: int,
     ) -> None:
-        """Run LLM generation and fuzzing without TUI."""
+        """Run LLM generation and fuzzing without TUI.
+
+        Args:
+            cases_to_process: List of (case_id, model_name, llm_or_none, state) tuples
+                - For GT cases: llm_or_none is None
+                - For LLM cases: llm_or_none is the LLM instance
+            max_concurrent: Maximum number of concurrent tasks
+        """
         semaphore = asyncio.Semaphore(max_concurrent)
 
-        async def process_with_semaphore(case_id, model_name, llm, state):
+        async def process_with_semaphore(case_id, model_name, llm_or_none, state):
             async with semaphore:
-                return await self._process_single_case_full(
-                    case_id, model_name, llm, state
-                )
+                if model_name == self.GT_MODEL_NAME:
+                    # GT case - no LLM generation needed
+                    return await self._process_gt_case(case_id, state)
+                else:
+                    # LLM case - generate patch then fuzz
+                    return await self._process_llm_case(
+                        case_id, model_name, llm_or_none, state
+                    )
 
         tasks = [
-            process_with_semaphore(case_id, model_name, llm, state)
-            for case_id, model_name, llm, state in cases_to_process
+            process_with_semaphore(case_id, model_name, llm_or_none, state)
+            for case_id, model_name, llm_or_none, state in cases_to_process
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2763,7 +2958,7 @@ class FuzzingOnlyBenchmark(Benchmark):
         tui = FuzzingTUI(
             case_states=self.case_states,
             config=self.fuzzing_config,
-            on_deduplicate=self._handle_deduplicate,
+            output_dir=self.output_dir,
         )
 
         # Run building + processing in background
@@ -2797,87 +2992,3 @@ class FuzzingOnlyBenchmark(Benchmark):
 
         # Wait for processing to complete
         await processing_task
-
-    async def _run_with_tui_v2(
-        self,
-        max_concurrent: int,
-    ) -> None:
-        """Run fuzzing with v2 PTY-based TUI visualization.
-
-        TUI launches immediately, then container building and processing
-        happens in the background so user can see progress.
-        """
-        from .async_pty import PTYProcessPool
-        from .fuzzing_tui_v2 import FuzzingTUIv2
-
-        # Create PTY process pool for managing case terminals
-        pty_pool = PTYProcessPool(max_concurrent=max_concurrent)
-
-        # Create TUI app - launches immediately with all case states visible
-        tui = FuzzingTUIv2(
-            case_states=self.case_states,
-            config=self.fuzzing_config,
-            pty_pool=pty_pool,
-            output_dir=self.output_dir,
-        )
-
-        # Run building + processing in background
-        async def run_build_and_processing():
-            try:
-                # Small delay to let TUI initialize and render first tick
-                await asyncio.sleep(0.5)
-
-                # Update states to show building is starting
-                for key, state in self.case_states.items():
-                    state.status = CaseStatus.BUILDING_CONTAINER
-                    case_id = state.case_id
-                    state.current_activity = (
-                        f"Building container... (logs: build_logs/{case_id}-*.log)"
-                    )
-
-                # Another small delay to let TUI show "building" status
-                await asyncio.sleep(0.5)
-
-                # Build containers in executor (blocking call)
-                cases_to_process = await asyncio.get_event_loop().run_in_executor(
-                    None, self._build_containers_and_get_cases
-                )
-                # Process all cases
-                await self._run_without_tui(cases_to_process, max_concurrent)
-            finally:
-                # Clean up PTY processes when done
-                await pty_pool.terminate_all()
-
-        # Start processing task
-        processing_task = asyncio.create_task(run_build_and_processing())
-
-        # Run TUI (async-compatible version for use within existing event loop)
-        await tui.run_async()
-
-        # Wait for processing to complete
-        await processing_task
-
-    def _handle_deduplicate(self, case_key: str) -> None:
-        """Handle CASR deduplication request from TUI.
-
-        CASR deduplication runs automatically inside the container during fuzzing.
-        This method just reports the existing cluster information.
-        """
-        LOG.info(f"CASR deduplication info requested for {case_key}")
-
-        state = self.case_states.get(case_key)
-        if not state:
-            LOG.warning(f"No state found for case {case_key}")
-            return
-
-        # Report CASR results from fuzzing
-        gt_unique = state.gt_timeline.unique_crashes() if state.gt_timeline else 0
-        llm_unique = state.llm_timeline.unique_crashes() if state.llm_timeline else 0
-        gt_total = len(state.gt_timeline.crashes) if state.gt_timeline else 0
-        llm_total = len(state.llm_timeline.crashes) if state.llm_timeline else 0
-
-        state.current_activity = f"CASR: GT={gt_unique}/{gt_total} unique, LLM={llm_unique}/{llm_total} unique"
-        LOG.info(
-            f"Case {state.case_id}: CASR dedup results - "
-            f"GT: {gt_unique}/{gt_total} unique, LLM: {llm_unique}/{llm_total} unique"
-        )

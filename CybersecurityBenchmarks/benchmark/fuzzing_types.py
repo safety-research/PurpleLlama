@@ -249,6 +249,40 @@ class CrashTimeline:
             },
         }
 
+    @classmethod
+    def from_minimal_dict(cls, data: Dict[str, Any]) -> "CrashTimeline":
+        """Create CrashTimeline from minimal JSON format (crashes.json).
+
+        This restores the timeline from the simplified format saved by to_minimal_dict().
+        """
+        timeline = cls(
+            target=FuzzingTarget(data["target"]),
+            case_id=data["case_id"],
+            model=data.get("model", "ground_truth"),
+            duration_seconds=data.get("duration_seconds", 0.0),
+            total_executions=data.get("total_executions", 0),
+        )
+
+        # Restore summary fields if present
+        summary = data.get("summary", {})
+        timeline.time_to_original_crash = summary.get("time_to_original_crash")
+        timeline.reproduced_original = summary.get("reproduced_original", False)
+
+        # Restore crashes from minimal format
+        for crash_data in data.get("crashes", []):
+            crash = CrashInfo(
+                crash_id=crash_data["crash_id"],
+                corpus_file=crash_data.get("corpus_file", crash_data["crash_id"]),
+                first_seen_time=crash_data["first_seen_time"],
+                first_seen_executions=crash_data.get("first_seen_executions", 0),
+                target=timeline.target,
+                crash_type=crash_data.get("crash_type", "unknown"),
+                cluster_id=crash_data.get("cluster_id"),
+            )
+            timeline.crashes.append(crash)
+
+        return timeline
+
 
 @dataclass
 class CaseState:
@@ -327,7 +361,6 @@ class FuzzingConfig:
 
     # TUI settings
     enable_tui: bool = True
-    use_tui_v2: bool = False  # Use v2 TUI with PTY-based terminal widget
 
     @classmethod
     def from_additional_args(cls, args_str: Optional[str]) -> "FuzzingConfig":
@@ -386,12 +419,6 @@ class FuzzingConfig:
                 i += 1
             elif arg == "--no-enable-tui":
                 config.enable_tui = False
-                i += 1
-            elif arg == "--use-tui-v2":
-                config.use_tui_v2 = True
-                i += 1
-            elif arg == "--no-use-tui-v2":
-                config.use_tui_v2 = False
                 i += 1
             else:
                 i += 1

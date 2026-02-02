@@ -27,7 +27,8 @@ else
     FUZZER_SUFFIX="x86_64"
 fi
 
-# Find the existing system libfuzzer
+# Find the existing system libfuzzer (informational only - not required)
+# Some older clang versions (e.g., 5.0.0) don't include libfuzzer runtime
 EXISTING_FUZZER=$(find /usr/local/lib/clang -name "libclang_rt.fuzzer-${FUZZER_SUFFIX}.a" 2>/dev/null | head -1)
 if [ -z "$EXISTING_FUZZER" ]; then
     # Fallback to x86_64
@@ -35,24 +36,32 @@ if [ -z "$EXISTING_FUZZER" ]; then
 fi
 
 if [ -z "$EXISTING_FUZZER" ]; then
-    echo "ERROR: No system libfuzzer found"
-    exit 1
+    echo "NOTE: No system libfuzzer runtime found"
+    echo "SOURCE method will be used: compile_libfuzzer will compile from /src/libfuzzer/"
+else
+    echo "Found system libfuzzer at: $EXISTING_FUZZER"
+    echo "LIBRARY method available: can replace clang runtime libraries"
 fi
-
-echo "Found system libfuzzer at: $EXISTING_FUZZER"
 
 # Detect compiler
 CXX="${CXX:-clang++}"
 
 # Find static libc++ and libc++abi libraries
-# For 32-bit, we look for the i386 versions if available
+# For 32-bit, OSS-Fuzz provides 32-bit libc++ at /usr/i386/lib/
 if [ "$ARCH" = "i386" ] || [ "$ARCH" = "i686" ]; then
-    # Try to find 32-bit libraries first
-    LIBCXX_A=$(find /usr/local/lib /usr/lib -name 'libc++.a' -path '*i386*' 2>/dev/null | grep -v msan | head -1)
-    LIBCXXABI_A=$(find /usr/local/lib /usr/lib -name 'libc++abi.a' -path '*i386*' 2>/dev/null | grep -v msan | head -1)
-    # Fallback to regular ones (they might work with -m32 if multilib is installed)
-    [ -z "$LIBCXX_A" ] && LIBCXX_A=$(find /usr/local/lib /usr/lib -name 'libc++.a' 2>/dev/null | grep -v msan | grep -v i386 | head -1)
-    [ -z "$LIBCXXABI_A" ] && LIBCXXABI_A=$(find /usr/local/lib /usr/lib -name 'libc++abi.a' 2>/dev/null | grep -v msan | grep -v i386 | head -1)
+    # OSS-Fuzz containers have 32-bit libc++ at /usr/i386/lib/
+    if [ -f /usr/i386/lib/libc++.a ]; then
+        LIBCXX_A="/usr/i386/lib/libc++.a"
+        echo "Found 32-bit libc++ at /usr/i386/lib/libc++.a"
+    else
+        # Fallback: search for i386 libraries
+        LIBCXX_A=$(find /usr/local/lib /usr/lib /usr/i386 -name 'libc++.a' -path '*i386*' 2>/dev/null | grep -v msan | head -1)
+    fi
+    if [ -f /usr/i386/lib/libc++abi.a ]; then
+        LIBCXXABI_A="/usr/i386/lib/libc++abi.a"
+    else
+        LIBCXXABI_A=$(find /usr/local/lib /usr/lib /usr/i386 -name 'libc++abi.a' -path '*i386*' 2>/dev/null | grep -v msan | head -1)
+    fi
 else
     LIBCXX_A=$(find /usr/local/lib /usr/lib -name 'libc++.a' 2>/dev/null | grep -v msan | grep -v i386 | head -1)
     LIBCXXABI_A=$(find /usr/local/lib /usr/lib -name 'libc++abi.a' 2>/dev/null | grep -v msan | grep -v i386 | head -1)
@@ -111,22 +120,29 @@ done
 
 # If static libc++ is available, extract and include needed .o files
 # This makes our libfuzzer self-contained
-# For 32-bit builds, we need 32-bit libc++ - skip bundling if not available
+# For 32-bit builds, we use the 32-bit libc++ from /usr/i386/lib/ (OSS-Fuzz provides it)
 CAN_BUNDLE_LIBCXX=true
 if [ "$ARCH" = "i386" ] || [ "$ARCH" = "i686" ]; then
-    # Check if the libc++.a contains 32-bit objects
-    # Extract one object and check its class
-    if [ -n "$LIBCXX_A" ]; then
-        TEMP_CHECK_DIR=$(mktemp -d)
-        cd "$TEMP_CHECK_DIR"
-        ar x "$LIBCXX_A" 2>/dev/null
+    # Verify we found 32-bit libc++ (not 64-bit by mistake)
+    if [ -n "$LIBCXX_A" ] && [ -f "$LIBCXX_A" ]; then
+        # Extract one object and verify it's 32-bit
+        TEMP_CHECK=$(mktemp -d)
+        cd "$TEMP_CHECK"
+        ar x "$LIBCXX_A" 2>/dev/null || true
         SAMPLE_OBJ=$(ls *.o 2>/dev/null | head -1)
-        if [ -n "$SAMPLE_OBJ" ] && file "$SAMPLE_OBJ" | grep -q "64-bit\|ELF64"; then
-            echo "WARNING: libc++.a contains 64-bit objects but building for 32-bit, skipping libc++ bundling"
-            CAN_BUNDLE_LIBCXX=false
+        if [ -n "$SAMPLE_OBJ" ]; then
+            if objdump -f "$SAMPLE_OBJ" 2>/dev/null | grep -q "elf32-i386\|i386"; then
+                echo "=== Verified: libc++ is 32-bit (elf32-i386) ==="
+            else
+                echo "WARNING: libc++ appears to be 64-bit, skipping bundling for i386"
+                CAN_BUNDLE_LIBCXX=false
+            fi
         fi
-        rm -rf "$TEMP_CHECK_DIR"
+        rm -rf "$TEMP_CHECK"
         cd "$WORK_DIR"
+    else
+        echo "WARNING: No 32-bit libc++ found, skipping bundling"
+        CAN_BUNDLE_LIBCXX=false
     fi
 fi
 

@@ -131,7 +131,7 @@ class BaseAgent(ABC):
         output_dir: Path,
         model: Optional[str] = None,
         dry_run: bool = False,
-        max_retries: int = 5,
+        max_retries: int = 10,
     ):
         """
         Initialize the agent.
@@ -227,7 +227,17 @@ class BaseAgent(ABC):
             crash_file = self.output_dir / "crash_output.txt"
             crash_file.write_text(self.result.original_crash_output)
 
-        # Save chat history
+        # Save chat history as markdown
         if self.result.chat_history:
-            chat_file = self.output_dir / "chat_history.json"
-            chat_file.write_text(json.dumps(self.result.chat_history, indent=2))
+            chat_file = self.output_dir / "chat.md"
+            with open(chat_file, "w") as f:
+                f.write("# Chat History\n\n")
+                f.write(f"## Case ID {self.result.case_id}, Status: {self.result.status.value}\n\n")
+                for i, msg in enumerate(self.result.chat_history):
+                    f.write(f"### Message {i + 1}\n\n")
+                    # Escape markdown headers to avoid conflicts
+                    msg = msg.replace("###", "@@@")
+                    msg = msg.replace("##", "@@")
+                    msg = msg.replace("# ", "#### ")
+                    msg = msg.replace("@@", "##### ")
+                    f.write(msg + "\n\n")

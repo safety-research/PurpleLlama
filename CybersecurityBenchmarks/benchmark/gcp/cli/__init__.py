@@ -1,7 +1,7 @@
 """
-ARVO Benchmark GCP CLI
-
-Command-line interface for managing ARVO benchmark jobs on GCP Cloud Batch.
+ARVO Benchmark GCP CLI package.
 """
 
-__version__ = "0.1.0"
+from .main import app, main
+
+__all__ = ["app", "main"]

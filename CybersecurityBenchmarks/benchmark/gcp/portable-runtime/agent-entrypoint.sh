@@ -120,7 +120,6 @@ if [ $# -eq 0 ]; then
     echo "  agent      - Patching agents (autopatchbench)"
     echo "  evaluation - Fuzzing and crash analysis"
     exit 1
-fi
 else
     # Determine what to run based on first argument
     CMD="$1"

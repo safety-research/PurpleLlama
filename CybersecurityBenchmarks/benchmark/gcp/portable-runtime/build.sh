@@ -73,23 +73,50 @@ else
     echo "WARNING: agent-entrypoint.sh not found, skipping"
 fi
 
-# Step 4: Copy agent code
+# Step 4: Copy agent and evaluation code
 echo ""
-echo "=== Step 4: Copying agent code ==="
+echo "=== Step 4: Copying agent and evaluation code ==="
+
+# Create directories
+mkdir -p "${OUTPUT_DIR}/agent-runtime/agent"
+mkdir -p "${OUTPUT_DIR}/agent-runtime/evaluation"
+
+# Copy agent module (for patching)
 if [ -d "${SCRIPT_DIR}/agent" ]; then
-    cp -r "${SCRIPT_DIR}/agent/"* "${OUTPUT_DIR}/agent-runtime/agent/" 2>/dev/null || true
+    cp -r "${SCRIPT_DIR}/agent/"* "${OUTPUT_DIR}/agent-runtime/agent/"
     echo "Copied agent code"
 else
-    echo "WARNING: agent/ directory not found, creating placeholder"
-    mkdir -p "${OUTPUT_DIR}/agent-runtime/agent"
-    echo "# Agent code goes here" > "${OUTPUT_DIR}/agent-runtime/agent/README.md"
+    echo "WARNING: agent/ directory not found"
+fi
+
+# Copy evaluation module (for fuzzing)
+if [ -d "${SCRIPT_DIR}/evaluation" ]; then
+    cp -r "${SCRIPT_DIR}/evaluation/"* "${OUTPUT_DIR}/agent-runtime/evaluation/"
+    echo "Copied evaluation code"
+else
+    echo "WARNING: evaluation/ directory not found"
 fi
 
 # Step 5: Create tarball
 echo ""
 echo "=== Step 5: Creating tarball ==="
 cd "${OUTPUT_DIR}"
-tar -czf agent-runtime.tar.gz -C agent-runtime .
+# COPYFILE_DISABLE=1 prevents macOS from including AppleDouble (._*) files
+# --no-mac-metadata prevents bsdtar/libarchive from including extended attributes
+# (like com.apple.provenance) in PAX headers, which causes "Ignoring unknown
+# extended header keyword" warnings when extracted on Linux
+COPYFILE_DISABLE=1 tar --no-mac-metadata -czf agent-runtime.tar.gz -C agent-runtime .
+
+# Step 5b: Compute and save source hash for change detection
+echo ""
+echo "=== Step 5b: Computing source hash ==="
+# Source the shared hash computation script (single source of truth)
+HASH_SCRIPT="${SCRIPT_DIR}/../scripts/compute_hashes.sh"
+# shellcheck source=/dev/null
+source "${HASH_SCRIPT}"
+SOURCE_HASH=$(compute_runtime_hash "${SCRIPT_DIR}")
+echo "${SOURCE_HASH}" > "${OUTPUT_DIR}/source-hash.txt"
+echo "Source hash: ${SOURCE_HASH}"
 
 # Calculate sizes
 UNCOMPRESSED_SIZE=$(du -sh agent-runtime | cut -f1)

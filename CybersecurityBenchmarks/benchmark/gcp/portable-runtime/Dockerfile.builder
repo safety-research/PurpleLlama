@@ -60,13 +60,16 @@ WORKDIR /runtime
 # Upgrade pip and install packages
 RUN /runtime/python/bin/python3.11 -m pip install --upgrade pip && \
     /runtime/python/bin/python3.11 -m pip install \
-        anthropic \
-        httpx \
-        pydantic \
-        && echo "Python packages installed"
+    anthropic \
+    httpx \
+    pydantic \
+    tree-sitter \
+    tree-sitter-cpp \
+    && echo "Python packages installed"
 
 # Verify imports work
-RUN /runtime/python/bin/python3.11 -c "import anthropic; print('anthropic OK')"
+RUN /runtime/python/bin/python3.11 -c "import anthropic; print('anthropic OK')" && \
+    /runtime/python/bin/python3.11 -c "import tree_sitter; import tree_sitter_cpp; print('tree-sitter OK')"
 
 # =============================================================================
 # Stage 3: Create bin directory with entry points

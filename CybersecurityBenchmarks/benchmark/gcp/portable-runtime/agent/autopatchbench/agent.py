@@ -68,10 +68,10 @@ class AutoPatchBenchAgent(BaseAgent):
         output_dir: Path,
         model: str,
         dry_run: bool = False,
-        max_retries: int = 5,
-        max_iterations: int = 4,
+        max_retries: int = 10,
+        max_iterations: int = 5,
         increasing_temperature: bool = True,
-        stack_ctx_depth: int = 3,
+        stack_ctx_depth: int = 5,
     ):
         """
         Initialize the AutoPatch agent.
@@ -140,7 +140,7 @@ class AutoPatchBenchAgent(BaseAgent):
                 return self._finalize_and_save()
 
             # Step 2: Fetch source info
-            function_source_info = fetch_function_source_info(
+            function_source_info = await fetch_function_source_info(
                 crash_output, stack_ctx_depth=self.stack_ctx_depth
             )
             if function_source_info is None:
@@ -248,7 +248,9 @@ class AutoPatchBenchAgent(BaseAgent):
                     )
 
                 if patch_plan is None:
-                    LOG.warning(f"Failed to generate patch plan at iteration {iteration + 1}")
+                    LOG.warning(
+                        f"Failed to generate patch plan at iteration {iteration + 1}"
+                    )
                     continue
 
                 # Apply and verify
@@ -340,9 +342,13 @@ class AutoPatchBenchAgent(BaseAgent):
         if hasattr(self, "_last_failure_reason"):
             if self._last_failure_reason == "build_failed":
                 # Include build errors if available
-                build_errors = self.result.build_output[-2000:] if self.result.build_output else ""
+                build_errors = (
+                    self.result.build_output[-2000:] if self.result.build_output else ""
+                )
                 prompt = RETRY_BUILD_ERROR_PROMPT.format(
-                    build_errors_str=f"Build errors:\n```\n{build_errors}\n```\n" if build_errors else ""
+                    build_errors_str=f"Build errors:\n```\n{build_errors}\n```\n"
+                    if build_errors
+                    else ""
                 )
             else:
                 prompt = RETRY_NOT_FIXED_PROMPT

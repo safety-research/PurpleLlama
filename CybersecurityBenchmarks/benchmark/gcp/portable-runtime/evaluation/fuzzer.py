@@ -33,6 +33,84 @@ from .types import (
 LOG = logging.getLogger(__name__)
 
 
+def find_fuzzer_binary(
+    arvo_script: str = "/bin/arvo", out_dir: str = "/out"
+) -> Optional[str]:
+    """
+    Find the fuzzer binary path from the ARVO container.
+
+    The /bin/arvo script specifies which fuzzer to use for each case.
+    This function parses that script to extract the correct binary path.
+
+    Args:
+        arvo_script: Path to the /bin/arvo script
+        out_dir: Fallback directory to search for executables
+
+    Returns:
+        Path to the fuzzer binary, or None if not found
+    """
+    import os
+    import re
+    from pathlib import Path
+
+    # Priority 1: Parse /bin/arvo to get the exact binary path
+    # The script has lines like: /out/png_transforms_fuzzer /tmp/poc
+    arvo_path = Path(arvo_script)
+    if arvo_path.exists():
+        try:
+            content = arvo_path.read_text()
+
+            # Look for pattern: <binary_path> /tmp/poc (or /tmp/corpus)
+            # This is how ARVO specifies which fuzzer to use
+            match = re.search(r"(/out/[\w\-\.]+)\s+/tmp/(poc|corpus)", content)
+            if match:
+                binary_path = match.group(1)
+                if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
+                    LOG.info(f"Found fuzzer binary from /bin/arvo: {binary_path}")
+                    return binary_path
+                else:
+                    LOG.warning(
+                        f"Binary from /bin/arvo not found or not executable: {binary_path}"
+                    )
+
+            # Alternative pattern: look after 'run' command
+            match = re.search(r'"run"[^/]*/([^\s]+)\s', content)
+            if match:
+                binary_path = (
+                    "/" + match.group(1)
+                    if not match.group(1).startswith("/")
+                    else match.group(1)
+                )
+                if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
+                    LOG.info(
+                        f"Found fuzzer binary from /bin/arvo (run command): {binary_path}"
+                    )
+                    return binary_path
+
+        except Exception as e:
+            LOG.warning(f"Failed to parse {arvo_script}: {e}")
+
+    # Priority 2: Fallback to finding executable in /out/
+    out_path = Path(out_dir)
+    if out_path.exists():
+        executables = [
+            f
+            for f in out_path.iterdir()
+            if f.is_file()
+            and os.access(f, os.X_OK)
+            and not f.name.endswith((".dict", ".options", ".zip", ".txt"))
+        ]
+        if executables:
+            # Prefer files with "fuzzer" in name
+            fuzzer_bins = [f for f in executables if "fuzzer" in f.name.lower()]
+            selected = fuzzer_bins[0] if fuzzer_bins else executables[0]
+            LOG.warning(f"Using fallback fuzzer binary: {selected}")
+            return str(selected)
+
+    LOG.error(f"Could not find fuzzer binary")
+    return None
+
+
 def detect_fuzzer_type(binary_path: str = "/out/fuzzer") -> FuzzerType:
     """
     Detect whether the binary is built for libFuzzer or AFL++.
@@ -134,9 +212,12 @@ def configure_afl_continuous_mode(
         Tuple of (command args, environment variables)
     """
     args = [
-        "-i", input_dir,
-        "-o", output_dir,
-        "-V", str(config.duration_seconds),
+        "-i",
+        input_dir,
+        "-o",
+        output_dir,
+        "-V",
+        str(config.duration_seconds),
     ]
 
     env = config.get_afl_environment()
@@ -291,6 +372,25 @@ async def run_fuzzer(
     return timeline
 
 
+def parse_crash_type_from_filename(filename: str) -> str:
+    """
+    Parse crash type from libFuzzer crash filename prefix.
+
+    libFuzzer names crashes as: crash-<hash>, oom-<hash>, timeout-<hash>, leak-<hash>
+    The prefix indicates the type of crash.
+
+    Args:
+        filename: The crash filename
+
+    Returns:
+        Crash type string (e.g., "crash", "oom", "timeout", "leak")
+    """
+    for prefix in ["crash", "oom", "timeout", "leak"]:
+        if filename.startswith(f"{prefix}-"):
+            return prefix
+    return "unknown"
+
+
 async def collect_libfuzzer_crashes(
     crash_dir: str,
     start_time: float,
@@ -298,6 +398,11 @@ async def collect_libfuzzer_crashes(
 ) -> List[CrashInfo]:
     """
     Collect crash files from libFuzzer output.
+
+    Collects all crash types: crash-*, oom-*, timeout-*, leak-*
+
+    Note: OOM and timeout crashes are handled separately since they don't produce
+    stack traces that CASR can analyze. They are assigned to special pseudo-clusters.
 
     Args:
         crash_dir: Directory containing crash files
@@ -313,10 +418,24 @@ async def collect_libfuzzer_crashes(
     if not crash_path.exists():
         return crashes
 
-    for crash_file in crash_path.glob("crash-*"):
+    # Collect all crash types: crash-*, oom-*, timeout-*, leak-*
+    crash_prefixes = ["crash-", "oom-", "timeout-", "leak-"]
+
+    for crash_file in crash_path.iterdir():
+        # Skip non-crash files (e.g., logs directory, other artifacts)
+        if not any(crash_file.name.startswith(prefix) for prefix in crash_prefixes):
+            continue
+
+        # Skip log files that may be in the crash directory
+        if crash_file.name.endswith(".log"):
+            continue
+
         try:
             mtime = crash_file.stat().st_mtime
             first_seen = mtime - start_time
+
+            # Parse crash type from filename prefix
+            crash_type = parse_crash_type_from_filename(crash_file.name)
 
             crash = CrashInfo(
                 crash_id=crash_file.name,
@@ -324,12 +443,23 @@ async def collect_libfuzzer_crashes(
                 first_seen_time=max(0, first_seen),
                 first_seen_executions=0,  # libFuzzer doesn't provide this per-crash
                 target=target,
-                crash_type="unknown",  # Will be filled by CASR
+                crash_type=crash_type,  # Initial type from filename, CASR may refine
             )
             crashes.append(crash)
 
         except Exception as e:
             LOG.warning(f"Failed to process crash file {crash_file}: {e}")
+
+    # Log crash type counts for visibility
+    if crashes:
+        oom_count = sum(1 for c in crashes if c.crash_type == "oom")
+        timeout_count = sum(1 for c in crashes if c.crash_type == "timeout")
+        leak_count = sum(1 for c in crashes if c.crash_type == "leak")
+        regular_count = len(crashes) - oom_count - timeout_count - leak_count
+        LOG.info(
+            f"Collected {len(crashes)} crashes "
+            f"({regular_count} regular, {oom_count} OOM, {timeout_count} timeout, {leak_count} leak)"
+        )
 
     return crashes
 

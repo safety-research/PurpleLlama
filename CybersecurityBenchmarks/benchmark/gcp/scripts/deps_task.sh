@@ -107,23 +107,22 @@ gsutil cp "gs://${BUCKET_NAME}/deps-sources/Dockerfile.casr-builder" "${WORKDIR}
 }
 
 # =============================================================================
-# Compute source hashes
+# Compute source hashes (using shared hash computation script)
 # =============================================================================
 
-compute_casr_hash() {
-    # Hash Cargo.toml files and Rust source files
-    # Truncate to 16 chars to match CLI's compute_deps_source_hash()
-    find "${WORKDIR}/casr" -name "*.rs" -o -name "Cargo.toml" | \
-        sort | xargs sha256sum 2>/dev/null | sha256sum | cut -c1-16
+# Download the shared hash computation script
+gsutil cp "gs://${BUCKET_NAME}/deps-sources/compute_hashes.sh" "${WORKDIR}/" || {
+    echo "ERROR: compute_hashes.sh not found in GCS"
+    exit 1
 }
+chmod +x "${WORKDIR}/compute_hashes.sh"
 
-compute_dd_hash() {
-    # Truncate to 16 chars to match CLI
-    sha256sum "${WORKDIR}/build_deb_packages.sh" | cut -c1-16
-}
+# Source the shared hash functions
+# shellcheck source=/dev/null
+source "${WORKDIR}/compute_hashes.sh"
 
-LOCAL_CASR_HASH=$(compute_casr_hash)
-LOCAL_DD_HASH=$(compute_dd_hash)
+LOCAL_CASR_HASH=$(compute_casr_hash "${WORKDIR}/casr")
+LOCAL_DD_HASH=$(compute_dd_hash "${WORKDIR}/build_deb_packages.sh")
 
 echo "[*] Local source hashes:"
 echo "    CASR: ${LOCAL_CASR_HASH}"

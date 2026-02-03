@@ -75,6 +75,20 @@ async def run_fuzzing(
     """
     start_time = datetime.utcnow().isoformat() + "Z"
 
+    # Auto-detect binary if not specified or doesn't exist
+    if not os.path.exists(binary_path):
+        LOG.info(
+            f"Binary not found at {binary_path}, attempting auto-detection from /bin/arvo..."
+        )
+        from .fuzzer import find_fuzzer_binary
+
+        detected_binary = find_fuzzer_binary("/bin/arvo", "/out")
+        if detected_binary:
+            LOG.info(f"Auto-detected fuzzer binary: {detected_binary}")
+            binary_path = detected_binary
+        else:
+            LOG.error(f"Could not find fuzzer binary")
+
     # Create config
     config = FuzzingConfig(
         duration_seconds=duration_seconds,
@@ -137,11 +151,12 @@ async def run_fuzzing(
     result.save(result_file)
     LOG.info(f"Results saved to {result_file}")
 
-    # Save timeline separately for easier parsing
+    # Save crashes.json in minimal format (compatible with fuzzing_only_benchmark.py)
     if result.timeline:
-        timeline_file = output_dir / f"timeline_{target.value}.json"
-        with open(timeline_file, "w") as f:
-            json.dump(result.timeline.to_dict(), f, indent=2)
+        crashes_file = output_dir / "crashes.json"
+        with open(crashes_file, "w") as f:
+            json.dump(result.timeline.to_minimal_dict(), f, indent=2)
+        LOG.info(f"Crashes saved to {crashes_file}")
 
     return result
 

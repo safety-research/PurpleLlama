@@ -1,8 +1,11 @@
 #!/bin/bash
-# Eval Task Script for Cloud Batch
+# Patch Task Script for Cloud Batch
 #
-# This script runs as a single task in the EVAL Cloud Batch job.
-# It runs the Agent SDK inside an ARVO container to generate and verify patches.
+# This script runs as a single task in the PATCH Cloud Batch job.
+# It runs the LLM Agent to generate and verify patches, then uploads
+# the rebuilt binary to GCS for later fuzzing.
+#
+# NOTE: This script only does patching - fuzzing is handled by fuzz_task.sh
 #
 # Environment variables (set by Cloud Batch):
 #   BATCH_TASK_INDEX  - Task index (0-based)
@@ -11,10 +14,8 @@
 #   ARVO_CASES        - Comma-separated list of ARVO case IDs
 #   MODEL             - Anthropic model to use
 #   RUN_ID            - Unique run identifier
-#   FUZZING_DURATION  - Fuzzing duration in seconds
 #   ANTHROPIC_API_KEY - API key (from Secret Manager)
 #   FORCE_REPATCH     - If "true", ignore cached patches and re-run agent
-#   FUZZ_ONLY         - If "true", require cached patches (fail if not found)
 #   BUILD_VERSION     - Version hash for container images (default: "latest")
 
 set -e
@@ -23,7 +24,7 @@ set -e
 # Configuration
 # =============================================================================
 
-WORKDIR="/tmp/arvo-eval"
+WORKDIR="/tmp/arvo-patch"
 RUNTIME_DIR="/opt/agent-runtime"
 OUTPUT_DIR="/tmp/output"
 mkdir -p "${WORKDIR}" "${RUNTIME_DIR}" "${OUTPUT_DIR}"
@@ -48,20 +49,17 @@ CASE_ID="${CASES[${BATCH_TASK_INDEX}]}"
 
 # Cache settings
 FORCE_REPATCH="${FORCE_REPATCH:-false}"
-FUZZ_ONLY="${FUZZ_ONLY:-false}"
 BUILD_VERSION="${BUILD_VERSION:-latest}"
 PATCH_CACHE="gs://${BUCKET_NAME}/patches/case_${CASE_ID}/${MODEL}"
 
 echo "==========================================="
-echo "Eval Task"
+echo "Patch Task (LLM Patching Only)"
 echo "==========================================="
 echo "Task Index:        ${BATCH_TASK_INDEX}"
 echo "Case ID:           ${CASE_ID}"
 echo "Model:             ${MODEL}"
 echo "Run ID:            ${RUN_ID}"
-echo "Fuzzing Duration:  ${FUZZING_DURATION}s"
 echo "Force Repatch:     ${FORCE_REPATCH}"
-echo "Fuzz Only:         ${FUZZ_ONLY}"
 echo "Build Version:     ${BUILD_VERSION}"
 echo "Patch Cache:       ${PATCH_CACHE}"
 echo "Bucket:            ${BUCKET_NAME}"
@@ -111,7 +109,7 @@ fi
 echo "[*] Agent runtime ready at ${RUNTIME_DIR}"
 
 # =============================================================================
-# Pull and run container
+# Pull and run container (uses -vul image for patching)
 # =============================================================================
 
 IMAGE="${ARTIFACT_REGISTRY}/arvo-${CASE_ID}-vul:${BUILD_VERSION}"
@@ -131,7 +129,6 @@ CONTAINER_ID=$(docker run -d \
     -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" \
     -e "CASE_ID=${CASE_ID}" \
     -e "MODEL=${MODEL}" \
-    -e "FUZZING_DURATION=${FUZZING_DURATION}" \
     "${IMAGE}" \
     sleep infinity)
 
@@ -162,37 +159,13 @@ if [ -n "${CACHED_RESULT}" ]; then
 
     if [ "${FORCE_REPATCH}" = "true" ]; then
         echo "[*] FORCE_REPATCH=true, ignoring cache and re-running agent"
-    elif [ "${CACHED_CRASH_FIXED}" = "true" ]; then
-        echo "[*] Using cached patch (crash_fixed=true)"
-        SKIP_AGENT="true"
-        CRASH_FIXED="true"
-
-        # Download cached artifacts into container
-        mkdir -p "${OUTPUT_DIR}/case_${CASE_ID}/autopatchbench/${MODEL}"
-        gsutil cp "${PATCH_CACHE}/result.json" "${OUTPUT_DIR}/case_${CASE_ID}/autopatchbench/${MODEL}/"
-        gsutil cp "${PATCH_CACHE}/patch.txt" "${OUTPUT_DIR}/case_${CASE_ID}/autopatchbench/${MODEL}/" 2>/dev/null || true
-
-        # Download rebuilt binary and copy into container
-        if gsutil cp "${PATCH_CACHE}/rebuilt_binary" "/tmp/rebuilt_binary" 2>/dev/null; then
-            docker cp "/tmp/rebuilt_binary" "${CONTAINER_ID}:/out/fuzzer"
-            echo "[*] Restored cached rebuilt binary to /out/fuzzer"
-        else
-            echo "[!] Warning: Could not download cached rebuilt binary"
-            SKIP_AGENT="false"
-            CRASH_FIXED="false"
-        fi
     else
-        echo "[*] Cached patch did not fix crash, re-running agent"
+        echo "[*] Using cached patch - skipping agent run"
+        SKIP_AGENT="true"
+        CRASH_FIXED="${CACHED_CRASH_FIXED}"
     fi
 else
     echo "[*] No cached patch found"
-
-    if [ "${FUZZ_ONLY}" = "true" ]; then
-        echo "ERROR: FUZZ_ONLY=true but no cached patch found for case ${CASE_ID}"
-        docker stop "${CONTAINER_ID}" > /dev/null 2>&1 || true
-        docker rm "${CONTAINER_ID}" > /dev/null 2>&1 || true
-        exit 1
-    fi
 fi
 
 # =============================================================================
@@ -231,7 +204,9 @@ if [ "${SKIP_AGENT}" = "false" ]; then
             if docker exec "${CONTAINER_ID}" test -f "/out/fuzzer"; then
                 docker cp "${CONTAINER_ID}:/out/fuzzer" "/tmp/rebuilt_binary"
                 gsutil cp "/tmp/rebuilt_binary" "${PATCH_CACHE}/"
-                echo "[*] Cached rebuilt binary for future runs"
+                echo "[*] Cached rebuilt binary for future fuzzing"
+            else
+                echo "[!] Warning: Rebuilt binary not found at /out/fuzzer"
             fi
         fi
     else
@@ -241,30 +216,6 @@ if [ "${SKIP_AGENT}" = "false" ]; then
 else
     echo ""
     echo "[*] Step 2: Skipped (using cached patch)"
-fi
-
-# =============================================================================
-# Step 3: Run Evaluation (Fuzzing) - only if patch fixes the crash
-# =============================================================================
-
-if [ "${CRASH_FIXED}" = "true" ]; then
-    echo ""
-    echo "[*] Step 3: Running evaluation (fuzzing) for ${FUZZING_DURATION}s..."
-
-    # Get original crash type for reproduction checking
-    ORIGINAL_CRASH_TYPE=$(docker exec "${CONTAINER_ID}" cat "${PATCH_RESULT}" | grep -o '"original_crash_type": *"[^"]*"' | sed 's/.*: *"\([^"]*\)"/\1/' || echo "")
-
-    run_in_container python3 -m evaluation.main \
-        --case-id "${CASE_ID}" \
-        --model "${MODEL}" \
-        --target llm_patch \
-        --duration "${FUZZING_DURATION}" \
-        --output-dir /output \
-        ${ORIGINAL_CRASH_TYPE:+--original-crash-type "${ORIGINAL_CRASH_TYPE}"} \
-        --verbose
-else
-    echo ""
-    echo "[*] Skipping fuzzing - patch did not fix the original crash"
 fi
 
 # =============================================================================
@@ -281,7 +232,7 @@ docker rm "${CONTAINER_ID}" > /dev/null
 # =============================================================================
 
 echo "[*] Uploading results to GCS..."
-RESULT_PATH="gs://${BUCKET_NAME}/results/case_${CASE_ID}/${MODEL}/${RUN_ID}/"
+RESULT_PATH="gs://${BUCKET_NAME}/results/case_${CASE_ID}/${MODEL}/${RUN_ID}/patch/"
 gsutil -m cp -r "${OUTPUT_DIR}/*" "${RESULT_PATH}" || {
     echo "WARNING: Failed to upload some results"
 }
@@ -291,6 +242,12 @@ docker rmi "${IMAGE}" || true
 
 echo ""
 echo "==========================================="
-echo "Eval Task Complete: Case ${CASE_ID}"
-echo "Results: ${RESULT_PATH}"
+echo "Patch Task Complete: Case ${CASE_ID}"
+echo "Crash Fixed:   ${CRASH_FIXED}"
+echo "Patch Cache:   ${PATCH_CACHE}"
+echo "Results:       ${RESULT_PATH}"
 echo "==========================================="
+
+# Exit with success even if patch didn't fix crash
+# The fuzz job will check the cache and skip if no valid binary
+exit 0

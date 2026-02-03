@@ -69,7 +69,7 @@ def create_agent(
     output_dir: Path,
     model: str,
     dry_run: bool = False,
-    max_retries: int = 5,
+    max_retries: int = 10,
     **kwargs,
 ) -> BaseAgent:
     """
@@ -114,7 +114,7 @@ async def run_agent(
     output_dir: Path,
     model: str,
     dry_run: bool = False,
-    max_retries: int = 5,
+    max_retries: int = 10,
     **kwargs,
 ) -> AgentResult:
     """
@@ -205,20 +205,20 @@ def main() -> int:
     parser.add_argument(
         "--max-retries",
         type=int,
-        default=5,
-        help="Maximum patch generation retries (default: 5)",
+        default=10,
+        help="Maximum patch generation retries (default: 10)",
     )
     parser.add_argument(
         "--max-iterations",
         type=int,
-        default=4,
-        help="Maximum iterations per retry round (default: 4)",
+        default=5,
+        help="Maximum iterations per retry round (default: 5)",
     )
     parser.add_argument(
         "--stack-depth",
         type=int,
-        default=3,
-        help="Number of stack frames to include (default: 3)",
+        default=5,
+        help="Number of stack frames to include (default: 5)",
     )
     parser.add_argument(
         "--verbose",

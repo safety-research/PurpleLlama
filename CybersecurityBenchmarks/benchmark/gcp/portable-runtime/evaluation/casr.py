@@ -76,9 +76,13 @@ def analyze_crash(
 
         cmd = [
             "casr-san",
-            "-i", crash_file,
-            "-o", report_path or "/dev/stdout",
-            "--", binary_path, crash_file,
+            "-i",
+            crash_file,
+            "-o",
+            report_path or "/dev/stdout",
+            "--",
+            binary_path,
+            crash_file,
         ]
 
         proc = subprocess.run(
@@ -122,12 +126,44 @@ def analyze_crash(
     return result
 
 
+def get_all_crash_files(crash_dir: str) -> List[Path]:
+    """
+    Get all crash files from a directory.
+
+    Includes crash-*, oom-*, timeout-*, leak-* files but excludes .log files.
+
+    Args:
+        crash_dir: Directory containing crash files
+
+    Returns:
+        List of Path objects for crash files
+    """
+    crash_path = Path(crash_dir)
+    if not crash_path.exists():
+        return []
+
+    crash_prefixes = ["crash-", "oom-", "timeout-", "leak-"]
+    crash_files = []
+
+    for f in crash_path.iterdir():
+        if f.is_file() and any(f.name.startswith(p) for p in crash_prefixes):
+            # Skip log files
+            if not f.name.endswith(".log"):
+                crash_files.append(f)
+
+    return crash_files
+
+
 def cluster_crashes(
     crash_dir: str,
     output_dir: str,
 ) -> Dict[str, List[str]]:
     """
     Cluster crashes using CASR for deduplication.
+
+    Note: CASR now handles ALL crash types including OOM and timeout.
+    OOM/timeout crashes don't produce stack traces, so CASR creates
+    pseudo-clusters for them (e.g., all OOMs in one cluster).
 
     Args:
         crash_dir: Directory containing crash files
@@ -138,10 +174,26 @@ def cluster_crashes(
     """
     clusters: Dict[str, List[str]] = {}
 
+    # Get all crash files (crash-*, oom-*, timeout-*, leak-*)
+    all_crashes = get_all_crash_files(crash_dir)
+
+    if not all_crashes:
+        return clusters
+
+    # Count crash types for logging
+    oom_count = sum(1 for f in all_crashes if f.name.startswith("oom-"))
+    timeout_count = sum(1 for f in all_crashes if f.name.startswith("timeout-"))
+    regular_count = len(all_crashes) - oom_count - timeout_count
+
+    LOG.info(
+        f"Clustering {len(all_crashes)} crashes "
+        f"({regular_count} regular, {oom_count} OOM, {timeout_count} timeout)"
+    )
+
     if not is_casr_available():
         LOG.warning("CASR not available, skipping clustering")
         # Return each crash as its own cluster
-        for crash_file in Path(crash_dir).glob("crash-*"):
+        for crash_file in all_crashes:
             clusters[crash_file.name] = [str(crash_file)]
         return clusters
 
@@ -149,10 +201,13 @@ def cluster_crashes(
         os.makedirs(output_dir, exist_ok=True)
 
         # Run casr-cluster on the crash directory
+        # CASR will handle all crash types, creating pseudo-clusters for OOM/timeout
         cmd = [
             "casr-cluster",
-            "-c", crash_dir,
-            "-o", output_dir,
+            "-c",
+            crash_dir,
+            "-o",
+            output_dir,
         ]
 
         proc = subprocess.run(
@@ -173,7 +228,7 @@ def cluster_crashes(
         else:
             LOG.warning(f"CASR clustering failed: {proc.stderr}")
             # Fallback: each crash is its own cluster
-            for crash_file in Path(crash_dir).glob("crash-*"):
+            for crash_file in all_crashes:
                 clusters[crash_file.name] = [str(crash_file)]
 
     except subprocess.TimeoutExpired:
@@ -192,6 +247,9 @@ def deduplicate_timeline(
     """
     Deduplicate crashes in a timeline using CASR.
 
+    Note: OOM and timeout crashes are handled separately since they don't produce
+    stack traces that CASR can analyze. They are assigned to special pseudo-clusters.
+
     Args:
         timeline: CrashTimeline with crashes to deduplicate
         binary_path: Path to the fuzzer binary
@@ -206,14 +264,35 @@ def deduplicate_timeline(
     casr_dir = output_dir / "casr_reports"
     casr_dir.mkdir(parents=True, exist_ok=True)
 
-    # Analyze each crash
+    # Log crash type distribution
+    oom_count = sum(1 for c in timeline.crashes if c.crash_type == "oom")
+    timeout_count = sum(1 for c in timeline.crashes if c.crash_type == "timeout")
+    leak_count = sum(1 for c in timeline.crashes if c.crash_type == "leak")
+    regular_count = len(timeline.crashes) - oom_count - timeout_count - leak_count
+
+    LOG.info(
+        f"Deduplicating {len(timeline.crashes)} crashes "
+        f"({regular_count} regular, {oom_count} OOM, {timeout_count} timeout, {leak_count} leak)"
+    )
+
+    # Analyze each crash with CASR (may refine crash_type for regular crashes)
+    # Note: OOM/timeout crashes don't have useful stack traces
     for crash in timeline.crashes:
+        # Skip CASR analysis for OOM/timeout - they don't have stack traces
+        if crash.crash_type in ("oom", "timeout"):
+            # Keep the filename-derived type, no stack trace to analyze
+            crash.stack_trace = []
+            crash.casr_report = {}
+            continue
+
         analysis = analyze_crash(
             crash.corpus_file,
             binary_path,
             str(casr_dir),
         )
-        crash.crash_type = analysis["crash_type"]
+        # CASR may provide more specific type (e.g., "heap-buffer-overflow")
+        if analysis["crash_type"] != "unknown":
+            crash.crash_type = analysis["crash_type"]
         crash.stack_trace = analysis["stack_trace"]
         crash.casr_report = analysis["casr_report"]
 

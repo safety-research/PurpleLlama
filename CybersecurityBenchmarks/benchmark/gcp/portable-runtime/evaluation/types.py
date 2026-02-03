@@ -109,6 +109,67 @@ class CrashTimeline:
             "unique_crashes": self.unique_crashes(),
         }
 
+    def to_minimal_dict(self) -> Dict[str, Any]:
+        """Convert to minimal JSON format for crashes.json.
+
+        Simplified format optimized for plotting unique crashes over time:
+        - crashes: array of minimal crash info (id, time, cluster)
+        - summary: total and unique crash counts
+        """
+        return {
+            "target": self.target.value,
+            "case_id": self.case_id,
+            "model": self.model,
+            "duration_seconds": self.duration_seconds,
+            "total_executions": self.total_executions,
+            "crashes": [
+                {
+                    "crash_id": c.crash_id,
+                    "first_seen_time": c.first_seen_time,
+                    "first_seen_executions": c.first_seen_executions,
+                    "cluster_id": c.cluster_id,
+                }
+                for c in self.crashes
+            ],
+            "summary": {
+                "total_crashes": len(self.crashes),
+                "unique_crashes": self.unique_crashes(),
+                "time_to_original_crash": self.time_to_original_crash,
+                "reproduced_original": self.reproduced_original,
+            },
+        }
+
+    @classmethod
+    def from_minimal_dict(cls, data: Dict[str, Any]) -> "CrashTimeline":
+        """Create CrashTimeline from minimal JSON format (crashes.json)."""
+        timeline = cls(
+            target=FuzzingTarget(data["target"]),
+            case_id=data["case_id"],
+            model=data.get("model", "ground_truth"),
+            duration_seconds=data.get("duration_seconds", 0.0),
+            total_executions=data.get("total_executions", 0),
+        )
+
+        # Restore summary fields if present
+        summary = data.get("summary", {})
+        timeline.time_to_original_crash = summary.get("time_to_original_crash")
+        timeline.reproduced_original = summary.get("reproduced_original", False)
+
+        # Restore crashes from minimal format
+        for crash_data in data.get("crashes", []):
+            crash = CrashInfo(
+                crash_id=crash_data["crash_id"],
+                corpus_file=crash_data.get("corpus_file", crash_data["crash_id"]),
+                first_seen_time=crash_data["first_seen_time"],
+                first_seen_executions=crash_data.get("first_seen_executions", 0),
+                target=timeline.target,
+                crash_type=crash_data.get("crash_type", "unknown"),
+                cluster_id=crash_data.get("cluster_id"),
+            )
+            timeline.crashes.append(crash)
+
+        return timeline
+
     def to_plot_data(self, resolution: float = 5.0) -> Dict[str, List]:
         """Generate data for plotting crashes vs time."""
         max_time = self.duration_seconds or (
@@ -131,7 +192,11 @@ class CrashTimeline:
                 )
             )
             t += resolution
-        return {"time": times, "crash_count": counts, "unique_crash_count": unique_counts}
+        return {
+            "time": times,
+            "crash_count": counts,
+            "unique_crash_count": unique_counts,
+        }
 
 
 @dataclass
@@ -166,9 +231,12 @@ class FuzzingConfig:
     def get_afl_args(self, input_dir: str, output_dir: str) -> List[str]:
         """Get AFL++ command line arguments."""
         return [
-            "-i", input_dir,
-            "-o", output_dir,
-            "-V", str(self.duration_seconds),  # Time limit
+            "-i",
+            input_dir,
+            "-o",
+            output_dir,
+            "-V",
+            str(self.duration_seconds),  # Time limit
         ]
 
     def get_afl_environment(self) -> Dict[str, str]:

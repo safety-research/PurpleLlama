@@ -8,7 +8,14 @@ from typing import Annotated, Optional
 
 import typer
 
-from ..gcp_utils import get_gcp_username, get_script_dir, load_config, run_gcloud, run_gsutil
+from ..config import get_cli_tmp_dir
+from ..gcp_utils import (
+    get_gcp_username,
+    get_script_dir,
+    load_config,
+    run_gcloud,
+    run_gsutil,
+)
 from ..hashing import AUTOPATCH_BUILD_DIR
 from ..output import echo_error, echo_info, echo_success, echo_warning
 from .upload import upload_deps_sources_impl
@@ -19,6 +26,7 @@ def submit_deps_job_impl(
     username: str,
     run_id: str,
     force_rebuild: bool = False,
+    build_lldb: bool = False,
     quiet: bool = False,
 ) -> Optional[str]:
     """Submit deps build job.
@@ -65,10 +73,24 @@ def submit_deps_job_impl(
             boot_disk["image"] = config["vm_image"]
             instances[0]["policy"]["bootDisk"] = boot_disk
 
+    # Scale up to 32 cores if building LLDB (it's a heavy compile)
+    if build_lldb:
+        # Update compute resource requirements
+        task_spec = spec_json["taskGroups"][0]["taskSpec"]
+        task_spec["computeResource"]["cpuMilli"] = 32000
+        task_spec["computeResource"]["memoryMib"] = 131072  # 128GB
+        # Update machine type
+        instances = spec_json["allocationPolicy"]["instances"]
+        instances[0]["policy"]["machineType"] = "e2-standard-32"
+
+    # Add BUILD_LLDB environment variable
+    env_vars = spec_json["taskGroups"][0]["taskSpec"]["environment"]["variables"]
+    env_vars["BUILD_LLDB"] = "true" if build_lldb else "false"
+
     spec = json.dumps(spec_json, indent=2)
 
-    # Write temp spec file
-    temp_spec = jobs_dir / f"{job_name}.json"
+    # Write temp spec file to CLI temp directory (not in repo)
+    temp_spec = get_cli_tmp_dir() / f"{job_name}.json"
     with open(temp_spec, "w") as f:
         f.write(spec)
 
@@ -107,6 +129,12 @@ def build_deps(
     force_rebuild: Annotated[
         bool, typer.Option("--force", "-f", help="Force rebuild even if hashes match")
     ] = False,
+    build_lldb: Annotated[
+        bool,
+        typer.Option(
+            "--build-lldb", help="Build LLDB (uses 32 vCPUs instead of 4)"
+        ),
+    ] = False,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Show what would be done")
     ] = False,
@@ -115,12 +143,15 @@ def build_deps(
 
     This builds the heavy dependencies on native x86_64 GCP VMs:
     - CASR (Crash Analysis and Severity Reporting) binaries
-    - differential-debugging-deps .deb packages (Python 3.7 + LLDB 13)
+    - differential-debugging-deps .deb packages (Python 3.7, optionally LLDB 13)
 
     The job uses hash-based change detection - it only rebuilds if the
     source files have changed since the last build.
 
     This command automatically uploads deps sources before submitting the job.
+
+    Use --build-lldb to include LLDB compilation (requires 32 vCPUs, ~2-4 hours).
+    Without --build-lldb, only CASR is built (4 vCPUs, much faster).
     """
     config = load_config()
     if not config:
@@ -140,6 +171,7 @@ def build_deps(
     typer.echo(f"Region:        {region}")
     typer.echo(f"Bucket:        gs://{bucket}")
     typer.echo(f"Force Rebuild: {force_rebuild}")
+    typer.echo(f"Build LLDB:    {build_lldb}" + (" (32 vCPUs)" if build_lldb else " (4 vCPUs)"))
     typer.echo()
 
     # Check if CASR submodule exists locally
@@ -198,10 +230,24 @@ def build_deps(
             boot_disk["image"] = config["vm_image"]
             instances[0]["policy"]["bootDisk"] = boot_disk
 
+    # Scale up to 32 cores if building LLDB (it's a heavy compile)
+    if build_lldb:
+        # Update compute resource requirements
+        task_spec = spec_json["taskGroups"][0]["taskSpec"]
+        task_spec["computeResource"]["cpuMilli"] = 32000
+        task_spec["computeResource"]["memoryMib"] = 131072  # 128GB
+        # Update machine type
+        instances = spec_json["allocationPolicy"]["instances"]
+        instances[0]["policy"]["machineType"] = "e2-standard-32"
+
+    # Add BUILD_LLDB environment variable
+    env_vars = spec_json["taskGroups"][0]["taskSpec"]["environment"]["variables"]
+    env_vars["BUILD_LLDB"] = "true" if build_lldb else "false"
+
     spec = json.dumps(spec_json, indent=2)
 
-    # Write temp spec file
-    temp_spec = jobs_dir / f"{job_name}.json"
+    # Write temp spec file to CLI temp directory (not in repo)
+    temp_spec = get_cli_tmp_dir() / f"{job_name}.json"
     with open(temp_spec, "w") as f:
         f.write(spec)
 
@@ -246,7 +292,10 @@ def build_deps(
     typer.echo("=" * 50)
     typer.echo(f"Job: {job_name}")
     typer.echo()
-    typer.echo("This job builds CASR and DD deps (~2-4 hours)")
+    if build_lldb:
+        typer.echo("This job builds CASR and LLDB (~2-4 hours)")
+    else:
+        typer.echo("This job builds CASR only (~15-30 minutes)")
     typer.echo()
     typer.echo("Monitor with:")
     typer.echo(f"  python -m cli monitor --job {job_name}")

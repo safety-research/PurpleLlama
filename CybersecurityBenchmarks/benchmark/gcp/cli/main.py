@@ -69,6 +69,7 @@ runs_app.command("status")(runs_mod.runs_status)
 runs_app.command("jobs")(runs_mod.runs_jobs)
 runs_app.command("logs")(runs_mod.runs_logs)
 runs_app.command("delete")(runs_mod.runs_delete)
+runs_app.command("get-result")(runs_mod.runs_get_result)
 
 
 # =============================================================================

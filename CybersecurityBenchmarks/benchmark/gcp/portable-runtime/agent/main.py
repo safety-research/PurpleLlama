@@ -56,6 +56,7 @@ def get_available_agents() -> Dict[str, Type[BaseAgent]]:
         # Import agents to trigger registration
         try:
             from .autopatchbench import AutoPatchBenchAgent
+
             AGENT_REGISTRY["autopatchbench"] = AutoPatchBenchAgent
         except ImportError as e:
             LOG.warning(f"Failed to import autopatchbench agent: {e}")
@@ -242,7 +243,9 @@ def main() -> int:
         agents = get_available_agents()
         print("Available agents:")
         for name, agent_class in agents.items():
-            print(f"  - {name}: {agent_class.__doc__.split('.')[0] if agent_class.__doc__ else 'No description'}")
+            print(
+                f"  - {name}: {agent_class.__doc__.split('.')[0] if agent_class.__doc__ else 'No description'}"
+            )
         return 0
 
     # Check for API key (unless dry run)
@@ -251,9 +254,8 @@ def main() -> int:
         return 1
 
     # Create output directory
-    output_dir = Path(args.output_dir) / f"case_{args.case_id}" / args.agent
-    if args.model:
-        output_dir = output_dir / args.model
+    # Use flat structure - caller is responsible for the full path
+    output_dir = Path(args.output_dir)
 
     # Run agent
     LOG.info(f"Running {args.agent} agent for case {args.case_id}")

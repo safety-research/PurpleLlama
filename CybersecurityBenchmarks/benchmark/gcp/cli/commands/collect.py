@@ -17,7 +17,8 @@ def collect(
         Optional[str], typer.Option(help="Specific case IDs to collect")
     ] = None,
     run_id: Annotated[
-        Optional[str], typer.Option("--run-id", "-r", help="Collect results for a specific run only")
+        Optional[str],
+        typer.Option("--run-id", "-r", help="Collect results for a specific run only"),
     ] = None,
 ) -> None:
     """Collect results from GCS.
@@ -39,6 +40,7 @@ def collect(
     # If run_id specified, get the manifest to know which cases/agents to collect
     if run_id:
         from .runs import get_run_manifest
+
         manifest = get_run_manifest(run_id, bucket)
         if not manifest:
             echo_error(f"Run not found: {run_id}")
@@ -58,14 +60,21 @@ def collect(
                 if agent == "gt":
                     result_path = f"gs://{bucket}/results/case_{case_id}/gt/{run_id}/"
                 else:
-                    result_path = f"gs://{bucket}/results/case_{case_id}/{agent}/{run_id}/"
+                    result_path = (
+                        f"gs://{bucket}/results/case_{case_id}/{agent}/{run_id}/"
+                    )
 
                 # Check if path exists
                 check = run_gsutil(["ls", result_path], check=False)
                 if check.returncode == 0:
                     echo_info(f"Downloading case_{case_id}/{agent}/{run_id}...")
                     # Create output directory structure
-                    local_path = output / f"case_{case_id}" / (agent if agent != "gt" else "gt") / run_id
+                    local_path = (
+                        output
+                        / f"case_{case_id}"
+                        / (agent if agent != "gt" else "gt")
+                        / run_id
+                    )
                     local_path.mkdir(parents=True, exist_ok=True)
                     run_gsutil(
                         ["-m", "cp", "-r", f"{result_path}*", str(local_path)],

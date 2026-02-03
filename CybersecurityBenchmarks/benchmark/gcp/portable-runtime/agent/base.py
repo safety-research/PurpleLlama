@@ -75,6 +75,9 @@ class AgentResult:
     crash_fixed: bool = False
     verification_output: str = ""
 
+    # Binary path (for fuzzing the patched binary)
+    fuzzer_binary_path: str = ""
+
     # Errors
     error: str = ""
     exception: str = ""
@@ -100,6 +103,7 @@ class AgentResult:
             "llm_tokens_used": self.llm_tokens_used,
             "build_success": self.build_success,
             "crash_fixed": self.crash_fixed,
+            "fuzzer_binary_path": self.fuzzer_binary_path,
             "error": self.error,
         }
 
@@ -212,6 +216,11 @@ class BaseAgent(ABC):
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Save rebuilt binary if crash was fixed (do this BEFORE saving result.json
+        # so the fuzzer_binary_path is included in the result)
+        if self.result.crash_fixed:
+            self._save_rebuilt_binary()
+
         # Save result JSON
         result_file = self.output_dir / "result.json"
         result_file.write_text(json.dumps(self.result.to_dict(), indent=2))
@@ -227,17 +236,129 @@ class BaseAgent(ABC):
             crash_file = self.output_dir / "crash_output.txt"
             crash_file.write_text(self.result.original_crash_output)
 
-        # Save chat history as markdown
-        if self.result.chat_history:
-            chat_file = self.output_dir / "chat.md"
-            with open(chat_file, "w") as f:
-                f.write("# Chat History\n\n")
-                f.write(f"## Case ID {self.result.case_id}, Status: {self.result.status.value}\n\n")
-                for i, msg in enumerate(self.result.chat_history):
-                    f.write(f"### Message {i + 1}\n\n")
-                    # Escape markdown headers to avoid conflicts
-                    msg = msg.replace("###", "@@@")
-                    msg = msg.replace("##", "@@")
-                    msg = msg.replace("# ", "#### ")
-                    msg = msg.replace("@@", "##### ")
-                    f.write(msg + "\n\n")
+        # Allow subclasses to save additional agent-specific data
+        self._save_additional_results()
+
+    def _finalize_and_save(self) -> "AgentResult":
+        """Finalize result and save to disk. Returns the result."""
+        self._finalize_result()
+        self._save_results()
+        return self.result
+
+    def _save_additional_results(self) -> None:
+        """
+        Hook for subclasses to save agent-specific results.
+
+        Override this method in subclasses to save additional data
+        (e.g., chat history, debug logs, intermediate outputs).
+
+        The output directory is already created when this is called.
+        """
+        pass
+
+    def _find_fuzzer_binary(
+        self, arvo_script: str = "/bin/arvo", out_dir: str = "/out"
+    ) -> Optional[str]:
+        """
+        Find the fuzzer binary path from the ARVO container.
+
+        The /bin/arvo script specifies which fuzzer to use for each case.
+        This function parses that script to extract the correct binary path.
+
+        Args:
+            arvo_script: Path to the /bin/arvo script
+            out_dir: Fallback directory to search for executables
+
+        Returns:
+            Path to the fuzzer binary, or None if not found
+        """
+        import os
+        import re
+
+        # Priority 1: Parse /bin/arvo to get the exact binary path
+        # The script has lines like: /out/png_transforms_fuzzer /tmp/poc
+        arvo_path = Path(arvo_script)
+        if arvo_path.exists():
+            try:
+                content = arvo_path.read_text()
+
+                # Look for pattern: <binary_path> /tmp/poc (or /tmp/corpus)
+                # This is how ARVO specifies which fuzzer to use
+                match = re.search(r"(/out/[\w\-\.]+)\s+/tmp/(poc|corpus)", content)
+                if match:
+                    binary_path = match.group(1)
+                    if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
+                        LOG.info(f"Found fuzzer binary from /bin/arvo: {binary_path}")
+                        return binary_path
+                    else:
+                        LOG.warning(
+                            f"Binary from /bin/arvo not found or not executable: {binary_path}"
+                        )
+
+                # Alternative pattern: look after 'run' command
+                match = re.search(r'"run"[^/]*/([^\s]+)\s', content)
+                if match:
+                    binary_path = (
+                        "/" + match.group(1)
+                        if not match.group(1).startswith("/")
+                        else match.group(1)
+                    )
+                    if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
+                        LOG.info(
+                            f"Found fuzzer binary from /bin/arvo (run command): {binary_path}"
+                        )
+                        return binary_path
+
+            except Exception as e:
+                LOG.warning(f"Failed to parse {arvo_script}: {e}")
+
+        # Priority 2: Fallback to finding executable in /out/
+        out_path = Path(out_dir)
+        if out_path.exists():
+            executables = [
+                f
+                for f in out_path.iterdir()
+                if f.is_file()
+                and os.access(f, os.X_OK)
+                and not f.name.endswith((".dict", ".options", ".zip", ".txt"))
+            ]
+            if executables:
+                # Prefer files with "fuzzer" in name
+                fuzzer_bins = [f for f in executables if "fuzzer" in f.name.lower()]
+                selected = fuzzer_bins[0] if fuzzer_bins else executables[0]
+                LOG.warning(f"Using fallback fuzzer binary: {selected}")
+                return str(selected)
+
+        LOG.error("Could not find fuzzer binary")
+        return None
+
+    def _save_rebuilt_binary(self) -> bool:
+        """
+        Copy the rebuilt fuzzer binary to output directory if crash was fixed.
+
+        Returns:
+            True if binary was saved successfully, False otherwise
+        """
+        import shutil
+
+        if not self.result.crash_fixed:
+            LOG.debug("Crash not fixed, skipping binary save")
+            return False
+
+        # Find the binary path
+        binary_path = self._find_fuzzer_binary()
+        if not binary_path:
+            LOG.warning("Could not find fuzzer binary to save")
+            return False
+
+        self.result.fuzzer_binary_path = binary_path
+
+        # Copy to output directory
+        dest_path = self.output_dir / "rebuilt_binary"
+        try:
+            shutil.copy2(binary_path, dest_path)
+            LOG.info(f"Saved rebuilt binary to {dest_path}")
+            return True
+        except Exception as e:
+            LOG.error(f"Failed to copy binary: {e}")
+            return False

@@ -267,15 +267,17 @@ def check_deps_artifacts_exist(bucket: str) -> bool:
     return True
 
 
-def check_deps_need_rebuild(bucket: str, build_dir: Path) -> tuple[bool, str]:
+def check_deps_need_rebuild(bucket: str, build_dir: Path) -> tuple[bool, str, bool]:
     """Check if deps need to be rebuilt.
 
     Returns:
-        Tuple of (needs_rebuild, reason)
+        Tuple of (needs_rebuild, reason, needs_dd_rebuild)
+        needs_dd_rebuild is True if DD (differential-debugging-deps) needs rebuild,
+        which requires 32 cores due to LLDB compilation.
     """
     # Check if artifacts exist
     if not check_deps_artifacts_exist(bucket):
-        return True, "deps artifacts missing in GCS"
+        return True, "deps artifacts missing in GCS", True  # Assume DD needed if missing
 
     # Compare hashes
     local_casr_hash, local_dd_hash = compute_deps_source_hash(build_dir)
@@ -284,15 +286,26 @@ def check_deps_need_rebuild(bucket: str, build_dir: Path) -> tuple[bool, str]:
     gcs_casr_hash = manifest.get("casr_hash", "")[:16]
     gcs_dd_hash = manifest.get("dd_hash", "")[:16]
 
-    if local_casr_hash != gcs_casr_hash:
+    casr_changed = local_casr_hash != gcs_casr_hash
+    dd_changed = local_dd_hash != gcs_dd_hash
+
+    if casr_changed and dd_changed:
         return (
             True,
-            f"CASR source changed ({gcs_casr_hash[:8]}... -> {local_casr_hash[:8]}...)",
+            f"CASR and DD changed",
+            True,  # DD needs rebuild
         )
-    if local_dd_hash != gcs_dd_hash:
+    if dd_changed:
         return (
             True,
             f"DD script changed ({gcs_dd_hash[:8]}... -> {local_dd_hash[:8]}...)",
+            True,  # DD needs rebuild
+        )
+    if casr_changed:
+        return (
+            True,
+            f"CASR source changed ({gcs_casr_hash[:8]}... -> {local_casr_hash[:8]}...)",
+            False,  # Only CASR, no DD rebuild needed
         )
 
-    return False, "deps up to date"
+    return False, "deps up to date", False

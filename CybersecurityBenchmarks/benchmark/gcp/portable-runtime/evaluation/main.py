@@ -258,7 +258,8 @@ def main() -> int:
     target = FuzzingTarget(args.target)
 
     # Create output directory
-    output_dir = Path(args.output_dir) / f"case_{args.case_id}" / args.model
+    # Use flat structure - caller is responsible for the full path
+    output_dir = Path(args.output_dir)
 
     # Run fuzzing
     LOG.info(f"Running fuzzing for case {args.case_id} ({target.value})")

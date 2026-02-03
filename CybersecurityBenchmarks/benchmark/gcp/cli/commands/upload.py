@@ -67,7 +67,9 @@ def rebuild_runtime(quiet: bool = False) -> bool:
     return True
 
 
-def upload_runtime_impl(bucket: str, quiet: bool = False, auto_rebuild: bool = True) -> bool:
+def upload_runtime_impl(
+    bucket: str, quiet: bool = False, auto_rebuild: bool = True
+) -> bool:
     """Upload portable runtime to GCS.
 
     Args:
@@ -390,9 +392,7 @@ def upload_build_assets(
 # =============================================================================
 
 
-def upload_deps_sources_impl(
-    bucket: str, build_dir, quiet: bool = False
-) -> bool:
+def upload_deps_sources_impl(bucket: str, build_dir, quiet: bool = False) -> bool:
     """Upload deps sources to GCS.
 
     Returns:

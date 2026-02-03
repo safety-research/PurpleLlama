@@ -3,6 +3,7 @@ Configuration constants, types, and parsing utilities for the ARVO GCP CLI.
 """
 
 import json
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -15,12 +16,32 @@ from typing import Optional
 DEFAULT_REGION = "us-central1"
 DEFAULT_MODEL = "claude-sonnet-4-20250514"
 DEFAULT_FUZZING_DURATION = 300
+DEFAULT_EXPERIMENT_ID = "default"
 SECRET_NAME = "anthropic-api-key"
 # Default parallelism for each job type
 DEFAULT_PARALLELISM = 50
 
 # Special agent name for ground truth (no LLM, just fuzzing)
 GT_AGENT = "gt"
+
+
+# =============================================================================
+# CLI Temp Directory
+# =============================================================================
+
+
+def get_cli_tmp_dir() -> Path:
+    """Get the temp directory for CLI-generated files (job specs, logs, etc.).
+
+    Uses system temp directory with a dedicated subdirectory for arvo-cli.
+    This avoids cluttering the repository with generated files.
+
+    Returns:
+        Path to the CLI temp directory (created if it doesn't exist).
+    """
+    tmp_dir = Path(tempfile.gettempdir()) / "arvo-cli"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return tmp_dir
 
 
 # =============================================================================
@@ -36,6 +57,8 @@ class RunConfig:
     agents: list[str] = field(default_factory=lambda: [DEFAULT_MODEL])
     fuzzing_duration: int = DEFAULT_FUZZING_DURATION
     run_id: Optional[str] = None
+    # Experiment ID for grouping results across runs
+    experiment_id: str = DEFAULT_EXPERIMENT_ID
     # Max concurrent VMs (workers) for each job type
     max_concurrent_vms: int = DEFAULT_PARALLELISM
     build_max_concurrent_vms: Optional[int] = None
@@ -143,6 +166,8 @@ def merge_run_config(file_config: dict, cli_overrides: dict) -> RunConfig:
         config.fuzzing_duration = int(file_config["fuzzing_duration"])
     if "run_id" in file_config:
         config.run_id = file_config["run_id"]
+    if "experiment_id" in file_config:
+        config.experiment_id = str(file_config["experiment_id"])
     if "max_concurrent_vms" in file_config:
         config.max_concurrent_vms = int(file_config["max_concurrent_vms"])
     if "build_max_concurrent_vms" in file_config:

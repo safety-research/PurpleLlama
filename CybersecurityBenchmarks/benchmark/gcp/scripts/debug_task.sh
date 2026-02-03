@@ -151,6 +151,8 @@ docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 CONTAINER_ID=$(docker run -d \
     --name "${CONTAINER_NAME}" \
     --platform linux/amd64 \
+    --security-opt seccomp=unconfined \
+    --init \
     -v "${RUNTIME_DIR}:/agent-runtime:ro" \
     -v "${OUTPUT_DIR}:/output" \
     -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \

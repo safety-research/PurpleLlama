@@ -4,6 +4,14 @@
 # Unified fuzzing script that handles both Ground Truth and LLM patches.
 # Uses the -fix image which has CASR for crash deduplication.
 #
+# Storage structure:
+#   Results (persistent experiment data):
+#     gs://{bucket}/results/{experiment_id}/{case_id}/{model}/
+#       - crashes.json, metadata.json (for both LLM and GT)
+#   Run logs (debugging):
+#     gs://{bucket}/runs/{run_id}/logs/{case_id}/{model}/
+#       - fuzz.log, casr/ directory
+#
 # Environment variables (set by Cloud Batch):
 #   BATCH_TASK_INDEX   - Task index (0-based)
 #   BUCKET_NAME        - GCS bucket for results
@@ -11,6 +19,7 @@
 #   ARVO_CASES         - Comma-separated list of ARVO case IDs
 #   FUZZING_DURATION   - Fuzzing duration in seconds (default: 300)
 #   RUN_ID             - Unique run identifier
+#   EXPERIMENT_ID      - Experiment ID for grouping results
 #   BUILD_VERSION      - Version hash for container images (default: "latest")
 #   TARGET             - Fuzzing target: "ground_truth" or "llm_patch"
 #   MODEL              - Model name (e.g., "claude-sonnet-4-20250514" or "ground_truth")
@@ -50,9 +59,16 @@ BUILD_VERSION="${BUILD_VERSION:-latest}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 TARGET="${TARGET:-ground_truth}"
 MODEL="${MODEL:-ground_truth}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-default}"
 
-# Patch cache location (for LLM patches)
-PATCH_CACHE="gs://${BUCKET_NAME}/patches/case_${CASE_ID}/${MODEL}"
+# GCS paths
+if [ "${TARGET}" = "ground_truth" ]; then
+    RESULTS_PATH="gs://${BUCKET_NAME}/results/${EXPERIMENT_ID}/${CASE_ID}/gt"
+    RUN_LOGS_PATH="gs://${BUCKET_NAME}/runs/${RUN_ID}/logs/${CASE_ID}/gt"
+else
+    RESULTS_PATH="gs://${BUCKET_NAME}/results/${EXPERIMENT_ID}/${CASE_ID}/${MODEL}"
+    RUN_LOGS_PATH="gs://${BUCKET_NAME}/runs/${RUN_ID}/logs/${CASE_ID}/${MODEL}"
+fi
 
 echo "==========================================="
 echo "Fuzz Task (Unified Fuzzing)"
@@ -62,13 +78,13 @@ echo "Case ID:           ${CASE_ID}"
 echo "Target:            ${TARGET}"
 echo "Model:             ${MODEL}"
 echo "Run ID:            ${RUN_ID}"
+echo "Experiment ID:     ${EXPERIMENT_ID}"
 echo "Fuzzing Duration:  ${FUZZING_DURATION}s"
 echo "Build Version:     ${BUILD_VERSION}"
+echo "Results Path:      ${RESULTS_PATH}"
+echo "Run Logs Path:     ${RUN_LOGS_PATH}"
 echo "Bucket:            ${BUCKET_NAME}"
 echo "Artifact Registry: ${ARTIFACT_REGISTRY}"
-if [ "${TARGET}" = "llm_patch" ]; then
-    echo "Patch Cache:       ${PATCH_CACHE}"
-fi
 echo "==========================================="
 
 # =============================================================================
@@ -105,19 +121,19 @@ ORIGINAL_CRASH_TYPE=""
 
 if [ "${TARGET}" = "llm_patch" ]; then
     echo ""
-    echo "[*] Checking patch cache for LLM binary..."
+    echo "[*] Checking experiment results for LLM binary..."
     
-    # Check if patch result exists (job dependency ensures patch job completed)
-    CACHED_RESULT=$(gsutil cat "${PATCH_CACHE}/result.json" 2>/dev/null || echo "")
+    # Check if patch result exists in experiment
+    PATCH_RESULT=$(gsutil cat "${RESULTS_PATH}/result.json" 2>/dev/null || echo "")
     
-    if [ -z "${CACHED_RESULT}" ]; then
-        echo "ERROR: No patch result found at ${PATCH_CACHE}/result.json"
+    if [ -z "${PATCH_RESULT}" ]; then
+        echo "ERROR: No patch result found at ${RESULTS_PATH}/result.json"
         echo "Patch job may have failed to produce a result."
         exit 1
     fi
     
     # Check if patch fixed the crash
-    CRASH_FIXED=$(echo "${CACHED_RESULT}" | grep -o '"crash_fixed": *[^,}]*' | grep -o 'true\|false' || echo "false")
+    CRASH_FIXED=$(echo "${PATCH_RESULT}" | grep -o '"crash_fixed": *[^,}]*' | grep -o 'true\|false' || echo "false")
     
     if [ "${CRASH_FIXED}" != "true" ]; then
         echo "[*] Patch did not fix crash (crash_fixed=${CRASH_FIXED}), skipping fuzzing"
@@ -128,10 +144,10 @@ if [ "${TARGET}" = "llm_patch" ]; then
         exit 0
     fi
     
-    # Download rebuilt binary
-    echo "[*] Downloading rebuilt binary from cache..."
-    if ! gsutil cp "${PATCH_CACHE}/rebuilt_binary" "/tmp/rebuilt_binary" 2>/dev/null; then
-        echo "ERROR: Could not download rebuilt binary from ${PATCH_CACHE}/rebuilt_binary"
+    # Download rebuilt binary from experiment results
+    echo "[*] Downloading rebuilt binary from experiment results..."
+    if ! gsutil cp "${RESULTS_PATH}/rebuilt_binary" "/tmp/rebuilt_binary" 2>/dev/null; then
+        echo "ERROR: Could not download rebuilt binary from ${RESULTS_PATH}/rebuilt_binary"
         exit 1
     fi
     
@@ -139,7 +155,7 @@ if [ "${TARGET}" = "llm_patch" ]; then
     echo "[*] Downloaded LLM binary to ${BINARY_PATH}"
     
     # Get original crash type for reproduction checking
-    ORIGINAL_CRASH_TYPE=$(echo "${CACHED_RESULT}" | grep -o '"original_crash_type": *"[^"]*"' | sed 's/.*: *"\([^"]*\)"/\1/' || echo "")
+    ORIGINAL_CRASH_TYPE=$(echo "${PATCH_RESULT}" | grep -o '"original_crash_type": *"[^"]*"' | sed 's/.*: *"\([^"]*\)"/\1/' || echo "")
     if [ -n "${ORIGINAL_CRASH_TYPE}" ]; then
         echo "[*] Original crash type: ${ORIGINAL_CRASH_TYPE}"
     fi
@@ -183,6 +199,8 @@ echo ""
 # Start container in background
 CONTAINER_ID=$(docker run -d \
     --platform linux/amd64 \
+    --security-opt seccomp=unconfined \
+    --init \
     -v "${RUNTIME_DIR}:/agent-runtime:ro" \
     -v "${OUTPUT_DIR}:/output" \
     "${IMAGE}" \
@@ -220,7 +238,7 @@ fi
 
 # Run fuzzing
 echo "[*] Running: ${EVAL_CMD}"
-docker exec "${CONTAINER_ID}" /agent-runtime/bin/agent-entrypoint.sh ${EVAL_CMD} 2>&1 | tee "${OUTPUT_DIR}/fuzz_${TARGET}.log"
+docker exec "${CONTAINER_ID}" /agent-runtime/bin/agent-entrypoint.sh ${EVAL_CMD} 2>&1 | tee "${OUTPUT_DIR}/fuzz.log"
 
 # Stop container
 echo "[*] Stopping container..."
@@ -233,45 +251,99 @@ docker rm "${CONTAINER_ID}" > /dev/null
 
 echo "[*] Processing results..."
 
-# Determine result file path based on target
+# Find the result file (handle both old nested and new flat structure)
+RESULT_FILE=""
+CRASHES_FILE=""
+EVAL_OUTPUT_DIR=""
+
 if [ "${TARGET}" = "ground_truth" ]; then
-    RESULT_FILE="${OUTPUT_DIR}/case_${CASE_ID}/ground_truth/fuzzing_result_ground_truth.json"
+    # Try flat structure first
+    if [ -f "${OUTPUT_DIR}/fuzzing_result_ground_truth.json" ]; then
+        RESULT_FILE="${OUTPUT_DIR}/fuzzing_result_ground_truth.json"
+        CRASHES_FILE="${OUTPUT_DIR}/crashes.json"
+        EVAL_OUTPUT_DIR="${OUTPUT_DIR}"
+    elif [ -f "${OUTPUT_DIR}/case_${CASE_ID}/ground_truth/fuzzing_result_ground_truth.json" ]; then
+        RESULT_FILE="${OUTPUT_DIR}/case_${CASE_ID}/ground_truth/fuzzing_result_ground_truth.json"
+        CRASHES_FILE="${OUTPUT_DIR}/case_${CASE_ID}/ground_truth/crashes.json"
+        EVAL_OUTPUT_DIR="${OUTPUT_DIR}/case_${CASE_ID}/ground_truth"
+    fi
 else
-    RESULT_FILE="${OUTPUT_DIR}/case_${CASE_ID}/${MODEL}/fuzzing_result_llm_patch.json"
+    # LLM patch - try flat structure first
+    if [ -f "${OUTPUT_DIR}/fuzzing_result_llm_patch.json" ]; then
+        RESULT_FILE="${OUTPUT_DIR}/fuzzing_result_llm_patch.json"
+        CRASHES_FILE="${OUTPUT_DIR}/crashes.json"
+        EVAL_OUTPUT_DIR="${OUTPUT_DIR}"
+    elif [ -f "${OUTPUT_DIR}/case_${CASE_ID}/${MODEL}/fuzzing_result_llm_patch.json" ]; then
+        RESULT_FILE="${OUTPUT_DIR}/case_${CASE_ID}/${MODEL}/fuzzing_result_llm_patch.json"
+        CRASHES_FILE="${OUTPUT_DIR}/case_${CASE_ID}/${MODEL}/crashes.json"
+        EVAL_OUTPUT_DIR="${OUTPUT_DIR}/case_${CASE_ID}/${MODEL}"
+    fi
 fi
 
-if [ -f "${RESULT_FILE}" ]; then
+CRASH_COUNT=0
+UNIQUE_CRASHES=0
+
+if [ -n "${RESULT_FILE}" ] && [ -f "${RESULT_FILE}" ]; then
     CRASH_COUNT=$(grep -o '"total_crashes": *[0-9]*' "${RESULT_FILE}" | grep -o '[0-9]*' || echo "0")
     UNIQUE_CRASHES=$(grep -o '"unique_crashes": *[0-9]*' "${RESULT_FILE}" | grep -o '[0-9]*' || echo "0")
 else
-    echo "[!] Warning: Result file not found at ${RESULT_FILE}"
-    CRASH_COUNT=0
-    UNIQUE_CRASHES=0
+    echo "[!] Warning: Result file not found"
 fi
 
 # =============================================================================
-# Upload results to GCS
+# Upload RESULTS (persistent experiment data)
 # =============================================================================
 
-echo "[*] Uploading results to GCS..."
+echo "[*] Uploading results to experiment..."
 
-# The evaluation module creates output at ${OUTPUT_DIR}/case_${CASE_ID}/${MODEL}/
-# We upload from the case directory to avoid duplicating case_id in the path
-LOCAL_RESULT_DIR="${OUTPUT_DIR}/case_${CASE_ID}"
-
-if [ "${TARGET}" = "ground_truth" ]; then
-    RESULT_PATH="gs://${BUCKET_NAME}/results/case_${CASE_ID}/gt/${RUN_ID}/"
-else
-    RESULT_PATH="gs://${BUCKET_NAME}/results/case_${CASE_ID}/${MODEL}/${RUN_ID}/fuzz/"
+# Upload crashes.json if it exists
+if [ -n "${CRASHES_FILE}" ] && [ -f "${CRASHES_FILE}" ]; then
+    gsutil cp "${CRASHES_FILE}" "${RESULTS_PATH}/"
 fi
 
-# Upload the case results (without the case_id directory wrapper)
-gsutil -m cp -r "${LOCAL_RESULT_DIR}/*" "${RESULT_PATH}" || {
-    echo "WARNING: Failed to upload some results"
+# Create and upload fuzz metadata.json
+cat > /tmp/fuzz_metadata.json << EOF
+{
+    "run_id": "${RUN_ID}",
+    "experiment_id": "${EXPERIMENT_ID}",
+    "case_id": ${CASE_ID},
+    "model": "${MODEL}",
+    "target": "${TARGET}",
+    "fuzzing_duration": ${FUZZING_DURATION},
+    "total_crashes": ${CRASH_COUNT},
+    "unique_crashes": ${UNIQUE_CRASHES},
+    "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
+EOF
 
-# Also upload the top-level fuzz log
-gsutil cp "${OUTPUT_DIR}/fuzz_${TARGET}.log" "${RESULT_PATH}" || true
+# For GT, this is the main metadata. For LLM, append fuzz info.
+if [ "${TARGET}" = "ground_truth" ]; then
+    gsutil cp "/tmp/fuzz_metadata.json" "${RESULTS_PATH}/metadata.json"
+else
+    # For LLM patches, we already have patch metadata, so save as fuzz_metadata.json
+    gsutil cp "/tmp/fuzz_metadata.json" "${RESULTS_PATH}/fuzz_metadata.json"
+fi
+
+# =============================================================================
+# Upload RUN LOGS (debugging/ephemeral)
+# =============================================================================
+
+echo "[*] Uploading run logs..."
+
+# Upload fuzz log
+if [ -f "${OUTPUT_DIR}/fuzz.log" ]; then
+    gsutil cp "${OUTPUT_DIR}/fuzz.log" "${RUN_LOGS_PATH}/"
+fi
+
+# Upload fuzzing result JSON (detailed, for debugging)
+if [ -n "${RESULT_FILE}" ] && [ -f "${RESULT_FILE}" ]; then
+    gsutil cp "${RESULT_FILE}" "${RUN_LOGS_PATH}/"
+fi
+
+# Upload CASR files if they exist
+if [ -n "${EVAL_OUTPUT_DIR}" ] && [ -d "${EVAL_OUTPUT_DIR}/casr" ]; then
+    gsutil -m cp -r "${EVAL_OUTPUT_DIR}/casr" "${RUN_LOGS_PATH}/" || true
+fi
 
 # =============================================================================
 # Cleanup
@@ -287,5 +359,6 @@ echo "Target:         ${TARGET}"
 echo "Model:          ${MODEL}"
 echo "Total crashes:  ${CRASH_COUNT}"
 echo "Unique crashes: ${UNIQUE_CRASHES}"
-echo "Results:        ${RESULT_PATH}"
+echo "Results:        ${RESULTS_PATH}"
+echo "Run Logs:       ${RUN_LOGS_PATH}"
 echo "==========================================="

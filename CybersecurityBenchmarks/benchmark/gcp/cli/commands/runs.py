@@ -1,5 +1,5 @@
 """
-Run management commands: runs list, runs status, runs jobs, runs logs, runs delete.
+Run management commands: runs list, runs status, runs jobs, runs logs, runs delete, runs get-result.
 """
 
 import json
@@ -76,6 +76,7 @@ def create_run_manifest(
         config={
             "cases": run_config.cases,
             "agents": run_config.agents,
+            "experiment_id": run_config.experiment_id,
             "fuzzing_duration": run_config.fuzzing_duration,
             "force_repatch": run_config.force_repatch,
             "fuzz_only": run_config.fuzz_only,
@@ -106,7 +107,9 @@ def upload_run_manifest(manifest: RunManifest, bucket: str) -> bool:
     return result.returncode == 0
 
 
-def get_run_manifest(run_id: str, bucket: Optional[str] = None) -> Optional[RunManifest]:
+def get_run_manifest(
+    run_id: str, bucket: Optional[str] = None
+) -> Optional[RunManifest]:
     """Fetch run manifest from GCS.
 
     Args:
@@ -245,9 +248,7 @@ def format_time_ago(iso_timestamp: str) -> str:
 
 def runs_list(
     limit: Annotated[int, typer.Option(help="Maximum number of runs to list")] = 20,
-    owner: Annotated[
-        Optional[str], typer.Option(help="Filter by owner")
-    ] = None,
+    owner: Annotated[Optional[str], typer.Option(help="Filter by owner")] = None,
 ) -> None:
     """List all benchmark runs."""
     config = load_config()
@@ -271,7 +272,9 @@ def runs_list(
 
     # Print header
     typer.echo()
-    typer.echo(f"{'RUN_ID':<20} {'OWNER':<12} {'CASES':>6} {'AGENTS':<20} {'STATUS':<12} {'CREATED':<10}")
+    typer.echo(
+        f"{'RUN_ID':<20} {'OWNER':<12} {'CASES':>6} {'AGENTS':<20} {'STATUS':<12} {'CREATED':<10}"
+    )
     typer.echo("-" * 85)
 
     for run in runs:
@@ -282,7 +285,9 @@ def runs_list(
         status = run.get("status", "?")[:12]
         created = format_time_ago(run.get("created_at", ""))
 
-        typer.echo(f"{run_id:<20} {run_owner:<12} {cases:>6} {agents:<20} {status:<12} {created:<10}")
+        typer.echo(
+            f"{run_id:<20} {run_owner:<12} {cases:>6} {agents:<20} {status:<12} {created:<10}"
+        )
 
     typer.echo()
     typer.echo(f"Total: {len(runs)} run(s)")
@@ -470,7 +475,9 @@ def runs_logs(
         if open_editor:
             # Stream to temp file and open in Cursor
             case_suffix = f"_case{case_id}" if case_id else ""
-            log_path = Path(tempfile.gettempdir()) / f"logs_{run_id}_{job}{case_suffix}.log"
+            log_path = (
+                Path(tempfile.gettempdir()) / f"logs_{run_id}_{job}{case_suffix}.log"
+            )
             echo_info(f"Streaming logs to {log_path}")
 
             with open(log_path, "w") as f:
@@ -513,7 +520,9 @@ def runs_logs(
 
         if open_editor:
             case_suffix = f"_case{case_id}" if case_id else ""
-            log_path = Path(tempfile.gettempdir()) / f"logs_{run_id}_{job}{case_suffix}.log"
+            log_path = (
+                Path(tempfile.gettempdir()) / f"logs_{run_id}_{job}{case_suffix}.log"
+            )
             log_path.write_text(result.stdout)
             subprocess.run(["cursor", str(log_path)], check=False)
             echo_success(f"Opened {log_path} in Cursor")
@@ -525,7 +534,9 @@ def runs_logs(
                 if result.stderr:
                     echo_info(f"stderr: {result.stderr[:500]}")
                 echo_info("Try running manually:")
-                echo_info(f"  gcloud logging read '{log_filter}' --project={project} --limit=10")
+                echo_info(
+                    f"  gcloud logging read '{log_filter}' --project={project} --limit=10"
+                )
 
 
 def runs_delete(
@@ -578,7 +589,240 @@ def runs_delete(
                 if agent == "gt":
                     result_path = f"gs://{bucket}/results/case_{case_id}/gt/{run_id}/"
                 else:
-                    result_path = f"gs://{bucket}/results/case_{case_id}/{agent}/{run_id}/"
+                    result_path = (
+                        f"gs://{bucket}/results/case_{case_id}/{agent}/{run_id}/"
+                    )
                 run_gsutil(["-m", "rm", "-r", result_path], check=False)
 
     echo_success(f"Run {run_id} deleted.")
+
+
+# =============================================================================
+# Result Key Registry
+# =============================================================================
+
+# Registry of result keys mapping to their storage location and path
+# Format: "key" -> (location, path_pattern, description)
+# location: "results" (persistent experiment data) or "logs" (run logs)
+# Path patterns can use {model} placeholder
+RESULT_KEY_REGISTRY = {
+    # Results (persistent experiment data)
+    "result": ("results", "result.json", "Patch result JSON (status, metrics)"),
+    "patch": ("results", "patch.txt", "Generated patch content"),
+    "crashes": ("results", "crashes.json", "Fuzzing crashes JSON"),
+    "metadata": ("results", "metadata.json", "Result metadata (run info)"),
+    # Run logs (debugging/ephemeral)
+    "chat": ("logs", "chat.md", "LLM chat history from patching"),
+    "crash-output": ("logs", "crash_output.txt", "Original crash output"),
+    "fuzz-log": ("logs", "fuzz.log", "Fuzzing log output"),
+    "fuzz-result": (
+        "logs",
+        "fuzzing_result_llm_patch.json",
+        "Detailed fuzzing result JSON",
+    ),
+    # Ground truth
+    "gt-crashes": ("results", "crashes.json", "Ground truth fuzzing crashes"),
+    "gt-metadata": ("results", "metadata.json", "Ground truth metadata"),
+    "gt-fuzz-log": ("logs", "fuzz.log", "Ground truth fuzzing log"),
+}
+
+
+def get_result_path(
+    bucket: str,
+    run_id: str,
+    experiment_id: str,
+    case_id: int,
+    model: str,
+    key: str,
+) -> str:
+    """
+    Resolve a result key to a GCS path.
+
+    Args:
+        bucket: GCS bucket name
+        run_id: Run ID
+        experiment_id: Experiment ID
+        case_id: Case ID
+        model: Model name (e.g., "claude-sonnet-4-20250514") or "gt"
+        key: Result key (e.g., "chat", "result") or raw path
+
+    Returns:
+        Full GCS path to the result
+    """
+    # Check if it's a registered key
+    if key in RESULT_KEY_REGISTRY:
+        location, filename, _ = RESULT_KEY_REGISTRY[key]
+
+        # Handle ground truth special case
+        if key.startswith("gt-"):
+            model = "gt"
+
+        if location == "results":
+            return f"gs://{bucket}/results/{experiment_id}/{case_id}/{model}/{filename}"
+        else:  # logs
+            return f"gs://{bucket}/runs/{run_id}/logs/{case_id}/{model}/{filename}"
+
+    # Otherwise treat as raw path - try to find it in run logs first
+    return f"gs://{bucket}/runs/{run_id}/logs/{case_id}/{model}/{key}"
+
+
+def runs_get_result(
+    run_id: Annotated[str, typer.Argument(help="Run ID")],
+    key: Annotated[
+        str,
+        typer.Argument(
+            help="Result key (chat, result, patch, crashes) or raw GCS path"
+        ),
+    ],
+    case_id: Annotated[
+        Optional[int],
+        typer.Option("--case-id", "-c", help="Case ID (required if run has multiple)"),
+    ] = None,
+    model: Annotated[
+        Optional[str],
+        typer.Option("--model", "-m", help="Model name (required if run has multiple)"),
+    ] = None,
+    experiment_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--experiment-id", "-e", help="Experiment ID (default: from run config)"
+        ),
+    ] = None,
+    output: Annotated[
+        Optional[Path],
+        typer.Option("--output", "-o", help="Save to file instead of printing"),
+    ] = None,
+    list_keys: Annotated[
+        bool, typer.Option("--list-keys", "-l", help="List available result keys")
+    ] = False,
+) -> None:
+    """Get a result file from a run.
+
+    Results are stored in two locations:
+      - Results (persistent): gs://{bucket}/results/{experiment_id}/{case_id}/{model}/
+      - Run logs (ephemeral): gs://{bucket}/runs/{run_id}/logs/{case_id}/{model}/
+
+    Use registered keys for common files:
+      - result: Patch result JSON (from results)
+      - patch: Generated patch content (from results)
+      - crashes: Fuzzing crashes JSON (from results)
+      - chat: LLM chat history (from run logs)
+      - fuzz-log: Fuzzing log (from run logs)
+
+    Or provide a raw filename/path to fetch from run logs.
+
+    Examples:
+      runs {run_id} get-result chat
+      runs {run_id} get-result result --case-id 42
+      runs {run_id} get-result crashes --model claude-sonnet-4-20250514
+    """
+    # List keys mode
+    if list_keys:
+        typer.echo("\nAvailable result keys:\n")
+        typer.echo(f"{'KEY':<15} {'LOCATION':<10} {'DESCRIPTION':<45}")
+        typer.echo("-" * 70)
+        for k, (loc, _, desc) in RESULT_KEY_REGISTRY.items():
+            typer.echo(f"{k:<15} {loc:<10} {desc:<45}")
+        typer.echo()
+        return
+
+    config = load_config()
+    if not config:
+        echo_error("GCP not configured. Run 'setup' first.")
+        raise typer.Exit(1)
+
+    bucket = config["bucket_name"]
+
+    # Get run manifest
+    manifest = get_run_manifest(run_id, bucket)
+    if not manifest:
+        echo_error(f"Run not found: {run_id}")
+        raise typer.Exit(1)
+
+    # Resolve case_id
+    cases = manifest.config.get("cases", [])
+    if case_id is None:
+        if len(cases) == 1:
+            case_id = cases[0]
+        else:
+            echo_error(f"Run has {len(cases)} cases. Please specify --case-id")
+            echo_info(f"Available cases: {cases[:10]}{'...' if len(cases) > 10 else ''}")
+            raise typer.Exit(1)
+    elif case_id not in cases:
+        echo_error(f"Case {case_id} not found in this run")
+        raise typer.Exit(1)
+
+    # Resolve experiment_id
+    resolved_experiment_id = experiment_id or manifest.config.get(
+        "experiment_id", "default"
+    )
+
+    # Resolve model
+    agents = manifest.config.get("agents", [])
+    # Filter out "gt" for model selection (gt uses special paths)
+    llm_agents = [a for a in agents if a != "gt"]
+
+    if key.startswith("gt-"):
+        # Ground truth results don't need a model
+        resolved_model = "gt"
+    elif model is None:
+        if len(llm_agents) == 1:
+            resolved_model = llm_agents[0]
+        elif len(llm_agents) == 0:
+            echo_error("No LLM agents in this run (only ground truth)")
+            raise typer.Exit(1)
+        else:
+            echo_error(f"Run has {len(llm_agents)} models. Please specify --model")
+            echo_info(f"Available models: {llm_agents}")
+            raise typer.Exit(1)
+    else:
+        if model not in agents:
+            echo_error(f"Model '{model}' not found in this run")
+            echo_info(f"Available models: {agents}")
+            raise typer.Exit(1)
+        resolved_model = model
+
+    # Build GCS path
+    gcs_path = get_result_path(
+        bucket, run_id, resolved_experiment_id, case_id, resolved_model, key
+    )
+
+    # Handle directory listing for crashes keys
+    if key in ("crashes", "gt-crashes") or gcs_path.endswith("/"):
+        echo_info(f"Listing: {gcs_path}")
+        result = run_gsutil(["ls", "-l", gcs_path], check=False)
+        if result.returncode == 0:
+            typer.echo(result.stdout)
+        else:
+            echo_warning(f"No files found at {gcs_path}")
+            if result.stderr:
+                echo_info(result.stderr.strip())
+        return
+
+    # Fetch the file
+    echo_info(f"Fetching: {gcs_path}")
+
+    if output:
+        # Download to file
+        result = run_gsutil(["cp", gcs_path, str(output)], check=False)
+        if result.returncode == 0:
+            echo_success(f"Saved to {output}")
+        else:
+            echo_error(f"Failed to download: {result.stderr}")
+            raise typer.Exit(1)
+    else:
+        # Print to stdout
+        result = run_gsutil(["cat", gcs_path], check=False)
+        if result.returncode == 0:
+            typer.echo(result.stdout)
+        else:
+            echo_error(f"Failed to fetch result")
+            if "No URLs matched" in result.stderr or "not found" in result.stderr.lower():
+                echo_info("The result file may not exist yet (job still running?)")
+                # Try to list what's available
+                parent_path = "/".join(gcs_path.rsplit("/", 1)[:-1]) + "/"
+                echo_info(f"\nAvailable files in {parent_path}:")
+                list_result = run_gsutil(["ls", parent_path], check=False)
+                if list_result.returncode == 0:
+                    typer.echo(list_result.stdout)
+            raise typer.Exit(1)

@@ -11,6 +11,7 @@ from typing import Annotated, Optional
 
 import typer
 
+from ..config import get_cli_tmp_dir
 from ..gcp_utils import (
     get_gcp_username,
     get_script_dir,
@@ -242,7 +243,8 @@ def debug_vm(
         str, typer.Option("--job-type", "-j", help="Job type: build, patch, or fuzz")
     ] = "fuzz",
     target: Annotated[
-        str, typer.Option("--target", "-t", help="Fuzz target: ground_truth or llm_patch")
+        str,
+        typer.Option("--target", "-t", help="Fuzz target: ground_truth or llm_patch"),
     ] = "ground_truth",
     model: Annotated[
         str, typer.Option("--model", "-m", help="Model name for patches")
@@ -321,7 +323,9 @@ def debug_vm(
         typer.echo()
         typer.echo("Options:")
         typer.echo(f"  1. SSH into it:  gcloud compute ssh {vm_name} --zone={zone}")
-        typer.echo(f"  2. Delete it:    gcloud compute instances delete {vm_name} --zone={zone}")
+        typer.echo(
+            f"  2. Delete it:    gcloud compute instances delete {vm_name} --zone={zone}"
+        )
         typer.echo()
 
         if typer.confirm("Delete existing VM and create a new one?"):
@@ -444,7 +448,12 @@ echo "==========================================="
 
     # Use custom image if available (faster startup)
     if config.get("vm_image"):
-        create_cmd.extend([f"--image={config['vm_image'].split('/')[-1]}", f"--image-project={project}"])
+        create_cmd.extend(
+            [
+                f"--image={config['vm_image'].split('/')[-1]}",
+                f"--image-project={project}",
+            ]
+        )
     else:
         create_cmd.extend(["--image-family=debian-11", "--image-project=debian-cloud"])
 
@@ -526,7 +535,8 @@ def debug_job(
         str, typer.Option("--job-type", "-j", help="Job type: build, patch, or fuzz")
     ] = "fuzz",
     target: Annotated[
-        str, typer.Option("--target", "-t", help="Fuzz target: ground_truth or llm_patch")
+        str,
+        typer.Option("--target", "-t", help="Fuzz target: ground_truth or llm_patch"),
     ] = "ground_truth",
     model: Annotated[
         str, typer.Option("--model", "-m", help="Model name for patches")
@@ -631,8 +641,8 @@ def debug_job(
 
     spec = json.dumps(spec_json, indent=2)
 
-    # Write temp spec file
-    temp_spec = jobs_dir / f"{job_name}.json"
+    # Write temp spec file to CLI temp directory (not in repo)
+    temp_spec = get_cli_tmp_dir() / f"{job_name}.json"
     with open(temp_spec, "w") as f:
         f.write(spec)
 

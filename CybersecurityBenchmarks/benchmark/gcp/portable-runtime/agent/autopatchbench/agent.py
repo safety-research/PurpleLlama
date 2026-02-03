@@ -551,8 +551,20 @@ class AutoPatchBenchAgent(BaseAgent):
             self.result.error = f"LLM query failed: {e}"
             return ""
 
-    def _finalize_and_save(self) -> AgentResult:
-        """Finalize result and save to disk."""
-        self._finalize_result()
-        self._save_results()
-        return self.result
+    def _save_additional_results(self) -> None:
+        """Save APB-specific results like chat history."""
+        if self.result.chat_history:
+            chat_file = self.output_dir / "chat.md"
+            with open(chat_file, "w") as f:
+                f.write("# Chat History\n\n")
+                f.write(
+                    f"## Case ID {self.result.case_id}, Status: {self.result.status.value}\n\n"
+                )
+                for i, msg in enumerate(self.result.chat_history):
+                    f.write(f"### Message {i + 1}\n\n")
+                    # Escape markdown headers to avoid conflicts
+                    msg = msg.replace("###", "@@@")
+                    msg = msg.replace("##", "@@")
+                    msg = msg.replace("# ", "#### ")
+                    msg = msg.replace("@@", "##### ")
+                    f.write(msg + "\n\n")

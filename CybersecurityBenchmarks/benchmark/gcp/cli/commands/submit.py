@@ -10,8 +10,8 @@ from typing import Annotated, Optional
 import typer
 
 from ..config import (
-    DEFAULT_MODEL,
-    RunConfig,
+    DEFAULT_EXPERIMENT_ID,
+    get_cli_tmp_dir,
     load_run_config,
     merge_run_config,
     parse_agents,
@@ -34,7 +34,11 @@ from ..hashing import (
 from ..output import echo_error, echo_info, echo_success, echo_warning
 from .deps import submit_deps_job_impl
 from .runs import create_run_manifest, upload_run_manifest
-from .upload import upload_build_assets_impl, upload_deps_sources_impl, upload_runtime_impl
+from .upload import (
+    upload_build_assets_impl,
+    upload_deps_sources_impl,
+    upload_runtime_impl,
+)
 
 
 def submit(
@@ -81,6 +85,14 @@ def submit(
         bool,
         typer.Option("--fuzz-only", help="Require cached patches (fail if not found)"),
     ] = False,
+    experiment_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--experiment-id",
+            "-e",
+            help=f"Experiment ID for grouping results (default: {DEFAULT_EXPERIMENT_ID})",
+        ),
+    ] = None,
     force_rebuild: Annotated[
         bool,
         typer.Option(
@@ -155,6 +167,8 @@ def submit(
         cli_overrides["force_repatch"] = force_repatch
     if fuzz_only:
         cli_overrides["fuzz_only"] = fuzz_only
+    if experiment_id is not None:
+        cli_overrides["experiment_id"] = experiment_id
     if force_rebuild:
         cli_overrides["force_rebuild"] = force_rebuild
 
@@ -191,6 +205,7 @@ def submit(
     typer.echo("=" * 50)
     typer.echo()
     typer.echo(f"Run ID:           {run_config.run_id}")
+    typer.echo(f"Experiment ID:    {run_config.experiment_id}")
     typer.echo(f"Project:          {gcp_config['project_id']}")
     typer.echo(f"Region:           {gcp_config['region']}")
     typer.echo(f"Cases:            {task_count} cases")
@@ -263,14 +278,21 @@ def submit(
     if not skip_deps_check:
         typer.echo()
         echo_info("Checking dependencies (CASR + DD)...")
-        needs_rebuild, reason = check_deps_need_rebuild(bucket, AUTOPATCH_BUILD_DIR)
+        needs_rebuild, reason, needs_dd_rebuild = check_deps_need_rebuild(
+            bucket, AUTOPATCH_BUILD_DIR
+        )
 
         if force_deps_rebuild:
             needs_rebuild = True
+            needs_dd_rebuild = True  # Force includes DD
             reason = "forced rebuild requested"
 
         if needs_rebuild:
             echo_warning(f"Deps need rebuild: {reason}")
+            if needs_dd_rebuild:
+                echo_info("DD rebuild needed - using 32 vCPUs for LLDB compilation")
+            else:
+                echo_info("CASR only - using 4 vCPUs")
 
             if dry_run:
                 typer.echo("Would submit deps build job")
@@ -278,12 +300,13 @@ def submit(
                 # Upload deps sources
                 echo_info("Uploading deps sources...")
                 if upload_deps_sources_impl(bucket, AUTOPATCH_BUILD_DIR, quiet=True):
-                    # Submit deps job
+                    # Submit deps job with appropriate resources
                     deps_job_name = submit_deps_job_impl(
                         gcp_config,
                         username=get_gcp_username(),
                         run_id=run_config.run_id,
                         force_rebuild=force_deps_rebuild,
+                        build_lldb=needs_dd_rebuild,  # 32 cores if DD needs rebuild
                         quiet=False,
                     )
                     if deps_job_name:
@@ -292,9 +315,14 @@ def submit(
                             "Deps job submitted - build jobs may fail if deps aren't ready"
                         )
                         echo_info("Monitor deps progress: python -m cli monitor")
-                        echo_info(
-                            "Re-run submit after deps complete, or wait ~2-4 hours"
-                        )
+                        if needs_dd_rebuild:
+                            echo_info(
+                                "Re-run submit after deps complete, or wait ~2-4 hours"
+                            )
+                        else:
+                            echo_info(
+                                "Re-run submit after deps complete, or wait ~15-30 min"
+                            )
                     else:
                         echo_warning("Failed to submit deps job - continuing anyway")
                 else:
@@ -387,7 +415,9 @@ def submit(
 
         # Agent/model label (sanitize for GCP labels)
         agent_label = (agent or "none").replace(".", "_").replace("-", "_").lower()[:63]
-        target_label = (target or "none").replace(".", "_").replace("-", "_").lower()[:63]
+        target_label = (
+            (target or "none").replace(".", "_").replace("-", "_").lower()[:63]
+        )
 
         spec = spec.replace("${BUCKET_NAME}", bucket)
         spec = spec.replace(
@@ -404,6 +434,7 @@ def submit(
         spec = spec.replace("${SECRET_NAME}", gcp_config["secret_name"])
         spec = spec.replace("${FUZZING_DURATION}", str(run_config.fuzzing_duration))
         spec = spec.replace("${RUN_ID}", run_config.run_id)
+        spec = spec.replace("${EXPERIMENT_ID}", run_config.experiment_id)
         spec = spec.replace("${USERNAME}", username)
         spec = spec.replace(
             "${FORCE_REPATCH}", "true" if run_config.force_repatch else "false"
@@ -437,8 +468,8 @@ def submit(
 
         spec = json.dumps(spec_json, indent=2)
 
-        # Write temp spec file
-        temp_spec = jobs_dir / f"{job_name}.json"
+        # Write temp spec file to CLI temp directory (not in repo)
+        temp_spec = get_cli_tmp_dir() / f"{job_name}.json"
         with open(temp_spec, "w") as f:
             f.write(spec)
 
@@ -533,7 +564,9 @@ def submit(
         echo_info("Creating run manifest...")
         manifest = create_run_manifest(run_config, gcp_config, submitted_jobs)
         if upload_run_manifest(manifest, bucket):
-            echo_success(f"Run manifest created: gs://{bucket}/runs/{run_config.run_id}/manifest.json")
+            echo_success(
+                f"Run manifest created: gs://{bucket}/runs/{run_config.run_id}/manifest.json"
+            )
         else:
             echo_warning("Failed to upload run manifest")
 
@@ -549,4 +582,7 @@ def submit(
     typer.echo(f"  python -m cli runs logs {run_config.run_id} build --follow")
     typer.echo()
     typer.echo("Results will be saved to:")
-    typer.echo(f"  gs://{bucket}/results/")
+    typer.echo(f"  gs://{bucket}/results/{run_config.experiment_id}/")
+    typer.echo()
+    typer.echo("Run logs will be saved to:")
+    typer.echo(f"  gs://{bucket}/runs/{run_config.run_id}/")

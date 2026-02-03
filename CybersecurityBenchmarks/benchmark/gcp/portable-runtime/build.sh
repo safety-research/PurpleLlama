@@ -101,11 +101,28 @@ fi
 echo ""
 echo "=== Step 5: Creating tarball ==="
 cd "${OUTPUT_DIR}"
+
+# #region agent log
+DEBUG_LOG="/Users/camyang/Desktop/ant_fellow/PurpleLlama/CybersecurityBenchmarks/.cursor/debug.log"
+XATTR_BEFORE=$(xattr -lr agent-runtime 2>/dev/null | wc -l | tr -d ' ')
+echo "{\"location\":\"build.sh:step5\",\"message\":\"xattr count before strip\",\"data\":{\"count\":${XATTR_BEFORE}},\"timestamp\":$(date +%s)000,\"sessionId\":\"debug-session\",\"hypothesisId\":\"B\"}" >> "${DEBUG_LOG}"
+# #endregion
+
+# Strip macOS extended attributes (like com.apple.provenance) from all files
+# These xattrs get embedded in PAX headers and cause "Ignoring unknown extended
+# header keyword" warnings when extracted on Linux
+if command -v xattr &> /dev/null; then
+    echo "Stripping macOS extended attributes..."
+    xattr -cr agent-runtime
+fi
+
+# #region agent log
+XATTR_AFTER=$(xattr -lr agent-runtime 2>/dev/null | wc -l | tr -d ' ')
+echo "{\"location\":\"build.sh:step5\",\"message\":\"xattr count after strip\",\"data\":{\"count\":${XATTR_AFTER}},\"timestamp\":$(date +%s)000,\"sessionId\":\"debug-session\",\"hypothesisId\":\"B\"}" >> "${DEBUG_LOG}"
+# #endregion
+
 # COPYFILE_DISABLE=1 prevents macOS from including AppleDouble (._*) files
-# --no-mac-metadata prevents bsdtar/libarchive from including extended attributes
-# (like com.apple.provenance) in PAX headers, which causes "Ignoring unknown
-# extended header keyword" warnings when extracted on Linux
-COPYFILE_DISABLE=1 tar --no-mac-metadata -czf agent-runtime.tar.gz -C agent-runtime .
+COPYFILE_DISABLE=1 tar -czf agent-runtime.tar.gz -C agent-runtime .
 
 # Step 5b: Compute and save source hash for change detection
 echo ""

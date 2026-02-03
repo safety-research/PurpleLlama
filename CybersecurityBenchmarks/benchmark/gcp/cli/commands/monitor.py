@@ -45,7 +45,8 @@ def monitor(
         Optional[str], typer.Option(help="Specific job name to monitor")
     ] = None,
     run_id: Annotated[
-        Optional[str], typer.Option("--run-id", "-r", help="Monitor jobs for a specific run")
+        Optional[str],
+        typer.Option("--run-id", "-r", help="Monitor jobs for a specific run"),
     ] = None,
     watch: Annotated[
         bool, typer.Option("--watch", "-w", help="Continuous monitoring")
@@ -69,6 +70,7 @@ def monitor(
     manifest = None
     if run_id:
         from .runs import get_run_manifest
+
         manifest = get_run_manifest(run_id, bucket)
         if not manifest:
             echo_error(f"Run not found: {run_id}")

@@ -127,8 +127,8 @@ void FreeHook(const volatile void *ptr) {
 void Fuzzer::HandleMalloc(size_t Size) {
   if (!Options.MallocLimitMb || (Size >> 20) < (size_t)Options.MallocLimitMb)
     return;
-  // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
-  RedirectStderrToCrashLog("oom-");
+  // Finalize crash log - stderr already redirected at startup
+  FinalizeCrashLog("oom-");
   Printf("==%d== ERROR: libFuzzer: out-of-memory (malloc(%zd))\n", GetPid(),
          Size);
   Printf("   To change the out-of-memory limit use -rss_limit_mb=<N>\n\n");
@@ -146,6 +146,11 @@ Fuzzer::Fuzzer(UserCallback CB, InputCorpus &Corpus, MutationDispatcher &MD,
     EF->__sanitizer_set_death_callback(StaticDeathCallback);
   assert(!F);
   F = this;
+  
+  // NOTE: Don't setup crash log here - it would redirect stderr in the parent
+  // orchestrator process too. SetupPendingCrashLog() is called in Loop() instead,
+  // which only runs in actual worker processes that execute the fuzz target.
+  
   TPC.ResetMaps();
   IsMyThread = true;
   if (Options.DetectLeaks && EF->__sanitizer_install_malloc_and_free_hooks)
@@ -192,37 +197,59 @@ void Fuzzer::DumpCurrentUnit(const char *Prefix) {
                             Prefix);
 }
 
-// Redirect stderr to a per-crash log file for CASR-based stack trace deduplication.
-// This allows CASR to read stack traces from logs instead of re-running binaries.
-// Must be called BEFORE PrintStackTrace() so ASAN output goes to the log file.
-void Fuzzer::RedirectStderrToCrashLog(const char *Prefix) {
-  if (!CurrentUnitData || CurrentUnitSize == 0)
+// Static storage for pending crash log path
+std::string Fuzzer::PendingCrashLogPath;
+
+// Setup pending crash log at process start.
+// Redirects stderr to a temp file so ALL output (including ASAN) is captured.
+// Call this early in the process, before any fuzzing starts.
+void Fuzzer::SetupPendingCrashLog() {
+  // Only setup if we have an artifact prefix configured
+  if (!F || F->Options.ArtifactPrefix.empty())
+    return;
+
+  // Create logs directory
+  std::string LogsDir = F->Options.ArtifactPrefix + "logs";
+  MkDir(LogsDir);
+
+  // Create pending crash log with unique name (using PID)
+  PendingCrashLogPath = DirPlusFile(LogsDir, 
+      "pending_crash_" + std::to_string(GetPid()) + ".log");
+
+  // Open and redirect stderr
+  int LogFd = open(PendingCrashLogPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (LogFd < 0)
+    return;  // If we can't create log, continue without redirect
+
+  dup2(LogFd, STDERR_FILENO);
+  close(LogFd);
+}
+
+// Finalize crash log by renaming pending log to crash-specific name.
+// Uses rename() which is atomic and O(1) - no data copying.
+void Fuzzer::FinalizeCrashLog(const char *Prefix) {
+  if (PendingCrashLogPath.empty() || !CurrentUnitData || CurrentUnitSize == 0)
     return;
 
   // Compute crash filename using same hash as WriteUnitToFileWithPrefix
   std::string CrashName = std::string(Prefix) +
                           Hash({CurrentUnitData, CurrentUnitData + CurrentUnitSize});
 
-  // Create logs subdirectory under artifact prefix
   std::string LogsDir = Options.ArtifactPrefix + "logs";
-  MkDir(LogsDir);
+  std::string FinalLogPath = DirPlusFile(LogsDir, CrashName + ".log");
 
-  // Open per-crash log file
-  std::string LogPath = DirPlusFile(LogsDir, CrashName + ".log");
-  int LogFd = open(LogPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (LogFd < 0)
-    return;  // If we can't create log, continue without redirect
-
-  // Redirect stderr to the log file
-  // Note: We don't restore stderr since the process will exit after crash handling
-  dup2(LogFd, STDERR_FILENO);
-  close(LogFd);
+  // Rename is atomic and fast (no data copy, just directory entry update)
+  rename(PendingCrashLogPath.c_str(), FinalLogPath.c_str());
+  
+  // Clear the path so we don't try to rename again
+  PendingCrashLogPath.clear();
 }
 
 NO_SANITIZE_MEMORY
 void Fuzzer::DeathCallback() {
-  // Redirect stderr to per-crash log for CASR (ASAN output already on stderr)
-  RedirectStderrToCrashLog("crash-");
+  // Finalize crash log - renames pending log to crash-{hash}.log
+  // ASAN output is already in the pending log since stderr was redirected at startup
+  FinalizeCrashLog("crash-");
   DumpCurrentUnit("crash-");
   PrintFinalStats();
   _Exit(Options.ErrorExitCode); // Ensure proper exit code for sanitizer-detected bugs
@@ -263,8 +290,8 @@ void Fuzzer::CrashCallback() {
   if (EF->__sanitizer_acquire_crash_state &&
       !EF->__sanitizer_acquire_crash_state())
     return;
-  // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
-  RedirectStderrToCrashLog("crash-");
+  // Finalize crash log - stderr already redirected at startup, ASAN output captured
+  FinalizeCrashLog("crash-");
   Printf("==%lu== ERROR: libFuzzer: deadly signal\n", GetPid());
   PrintStackTrace();
   Printf("NOTE: libFuzzer has rudimentary signal handlers.\n"
@@ -282,8 +309,8 @@ void Fuzzer::ExitCallback() {
   if (EF->__sanitizer_acquire_crash_state &&
       !EF->__sanitizer_acquire_crash_state())
     return;
-  // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
-  RedirectStderrToCrashLog("crash-");
+  // Finalize crash log - stderr already redirected at startup
+  FinalizeCrashLog("crash-");
   Printf("==%lu== ERROR: libFuzzer: fuzz target exited\n", GetPid());
   PrintStackTrace();
   Printf("SUMMARY: libFuzzer: fuzz target exited\n");
@@ -330,8 +357,8 @@ void Fuzzer::AlarmCallback() {
     if (EF->__sanitizer_acquire_crash_state &&
         !EF->__sanitizer_acquire_crash_state())
       return;
-    // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
-    RedirectStderrToCrashLog("timeout-");
+    // Finalize crash log - stderr already redirected at startup
+    FinalizeCrashLog("timeout-");
     Printf("ALARM: working on the last Unit for %zd seconds\n", Seconds);
     Printf("       and the timeout value is %d (use -timeout=N to change)\n",
            Options.UnitTimeoutSec);
@@ -349,8 +376,8 @@ void Fuzzer::RssLimitCallback() {
   if (EF->__sanitizer_acquire_crash_state &&
       !EF->__sanitizer_acquire_crash_state())
     return;
-  // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
-  RedirectStderrToCrashLog("oom-");
+  // Finalize crash log - stderr already redirected at startup
+  FinalizeCrashLog("oom-");
   Printf(
       "==%lu== ERROR: libFuzzer: out-of-memory (used: %zdMb; limit: %zdMb)\n",
       GetPid(), GetPeakRSSMb(), Options.RssLimitMb);
@@ -556,8 +583,8 @@ size_t Fuzzer::GetCurrentUnitInFuzzingThead(const uint8_t **Data) const {
 }
 
 void Fuzzer::CrashOnOverwrittenData() {
-  // Redirect stderr to per-crash log BEFORE printing stack trace for CASR
-  RedirectStderrToCrashLog("crash-");
+  // Finalize crash log - stderr already redirected at startup
+  FinalizeCrashLog("crash-");
   Printf("==%d== ERROR: libFuzzer: fuzz target overwrites its const input\n",
          GetPid());
   PrintStackTrace();
@@ -692,9 +719,9 @@ void Fuzzer::TryDetectingAMemoryLeak(const uint8_t *Data, size_t Size,
   // Now perform the actual lsan pass. This is expensive and we must ensure
   // we don't call it too often.
   if (EF->__lsan_do_recoverable_leak_check()) { // Leak is found, report it.
-    // Redirect stderr to per-crash log for CASR
-    CurrentUnitSize = Size;  // Set size before redirect so hash is computed
-    RedirectStderrToCrashLog("leak-");
+    // Finalize crash log - stderr already redirected at startup
+    CurrentUnitSize = Size;  // Set size before finalize so hash is computed
+    FinalizeCrashLog("leak-");
     if (DuringInitialCorpusExecution)
       Printf("\nINFO: a leak has been found in the initial corpus.\n\n");
     Printf("INFO: to ignore leaks on libFuzzer side use -detect_leaks=0.\n\n");
@@ -832,6 +859,12 @@ void Fuzzer::ReadAndExecuteSeedCorpora(Vector<SizedFile> &CorporaFiles) {
 }
 
 void Fuzzer::Loop(Vector<SizedFile> &CorporaFiles) {
+  // Setup crash log redirection here (not in constructor) because Loop() only
+  // runs in actual worker processes. In fork mode, the parent orchestrator
+  // creates a Fuzzer but calls FuzzWithFork() instead of Loop(), so this
+  // ensures we don't redirect the parent's stderr.
+  SetupPendingCrashLog();
+  
   auto FocusFunctionOrAuto = Options.FocusFunction;
   DFT.Init(Options.DataFlowTrace, &FocusFunctionOrAuto, CorporaFiles,
            MD.GetRand());

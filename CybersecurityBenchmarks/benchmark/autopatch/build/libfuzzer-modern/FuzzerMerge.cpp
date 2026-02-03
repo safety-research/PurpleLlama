@@ -195,6 +195,10 @@ Set<uint32_t> Merger::AllFeatures() const {
 
 // Inner process. May crash if the target crashes.
 void Fuzzer::CrashResistantMergeInternalStep(const std::string &CFPath) {
+  // Setup crash log redirection for merge phase crashes.
+  // This is needed because merge doesn't go through Loop().
+  SetupPendingCrashLog();
+  
   Printf("MERGE-INNER: using the control file '%s'\n", CFPath.c_str());
   Merger M;
   std::ifstream IF(CFPath);
@@ -390,31 +394,9 @@ void CrashResistantMerge(const Vector<std::string> &Args,
       VPrintf(V, "MERGE-OUTER: succesfull in %zd attempt(s)\n", Attempt);
       break;
     }
-    // Crash detected - save the log content to per-crash log for CASR
-    if (!ArtifactPrefix.empty()) {
-      std::string LogContent = FileToString(LogFilePath);
-      if (!LogContent.empty()) {
-        // Create logs directory and save to each crash file's log
-        std::string LogsDir = ArtifactPrefix + "logs";
-        MkDir(LogsDir);
-        Vector<std::string> CrashFiles;
-        ListFilesInDirRecursive(ArtifactPrefix, nullptr, &CrashFiles, false);
-        for (const auto &CrashPath : CrashFiles) {
-          size_t LastSlash = CrashPath.rfind('/');
-          std::string CrashName = (LastSlash != std::string::npos)
-                                      ? CrashPath.substr(LastSlash + 1)
-                                      : CrashPath;
-          // Only process crash/oom/timeout/leak files, skip .log files
-          if ((CrashName.find("crash-") != 0 && CrashName.find("oom-") != 0 &&
-               CrashName.find("timeout-") != 0 && CrashName.find("leak-") != 0) ||
-              (CrashName.size() > 4 &&
-               CrashName.substr(CrashName.size() - 4) == ".log"))
-            continue;
-          std::string CrashLogPath = DirPlusFile(LogsDir, CrashName + ".log");
-          WriteToFile(LogContent, CrashLogPath);
-        }
-      }
-    }
+    // NOTE: Per-crash logs are now handled by the child process itself via
+    // SetupPendingCrashLog() and FinalizeCrashLog() in FuzzerLoop.cpp.
+    // The crash logs created during fuzzing will have the correct stacktraces.
   }
   RemoveFile(LogFilePath);
   // Read the control file and do the merge.

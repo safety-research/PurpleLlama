@@ -1,0 +1,73 @@
+{
+  "taskGroups": [
+    {
+      "taskSpec": {
+        "runnables": [
+          {
+            "script": {
+              "text": "#!/bin/bash\nset -e\n\n# Download and run eval script from GCS\ngsutil cp gs://${BUCKET_NAME}/scripts/eval_task.sh /tmp/eval_task.sh\nchmod +x /tmp/eval_task.sh\n/tmp/eval_task.sh"
+            },
+            "environment": {
+              "secretVariables": {
+                "ANTHROPIC_API_KEY": "projects/${PROJECT_NUMBER}/secrets/${SECRET_NAME}/versions/latest"
+              }
+            }
+          }
+        ],
+        "computeResource": {
+          "cpuMilli": 4000,
+          "memoryMib": 16384,
+          "bootDiskMib": 50000
+        },
+        "maxRunDuration": "7200s",
+        "maxRetryCount": 1,
+        "environment": {
+          "variables": {
+            "BUCKET_NAME": "${BUCKET_NAME}",
+            "ARTIFACT_REGISTRY": "${ARTIFACT_REGISTRY}",
+            "ARVO_CASES": "${ARVO_CASES}",
+            "MODEL": "${MODEL}",
+            "RUN_ID": "${RUN_ID}",
+            "FUZZING_DURATION": "${FUZZING_DURATION}",
+            "FORCE_REPATCH": "${FORCE_REPATCH}",
+            "FUZZ_ONLY": "${FUZZ_ONLY}",
+            "BUILD_VERSION": "${BUILD_VERSION}"
+          }
+        }
+      },
+      "taskCount": "${TASK_COUNT}",
+      "parallelism": 50,
+      "taskCountPerNode": 1
+    }
+  ],
+  "allocationPolicy": {
+    "instances": [
+      {
+        "policy": {
+          "machineType": "e2-standard-4",
+          "provisioningModel": "SPOT",
+          "bootDisk": {
+            "sizeGb": 50,
+            "type": "pd-balanced"
+          }
+        }
+      }
+    ],
+    "labels": {
+      "owner": "${USERNAME}",
+      "run-id": "${RUN_ID}",
+      "job-type": "eval"
+    },
+    "serviceAccount": {
+      "email": "${SERVICE_ACCOUNT_EMAIL}"
+    }
+  },
+  "logsPolicy": {
+    "destination": "CLOUD_LOGGING"
+  },
+  "labels": {
+    "benchmark": "arvo",
+    "job-type": "eval",
+    "model": "${MODEL_LABEL}"
+  }
+}

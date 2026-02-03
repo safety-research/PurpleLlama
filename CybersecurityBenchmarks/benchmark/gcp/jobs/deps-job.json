@@ -1,0 +1,58 @@
+{
+  "taskGroups": [
+    {
+      "taskSpec": {
+        "runnables": [
+          {
+            "script": {
+              "text": "#!/bin/bash\nset -e\n\n# Download and run deps build script from GCS\ngsutil cp gs://${BUCKET_NAME}/scripts/deps_task.sh /tmp/deps_task.sh\nchmod +x /tmp/deps_task.sh\n/tmp/deps_task.sh"
+            }
+          }
+        ],
+        "computeResource": {
+          "cpuMilli": 8000,
+          "memoryMib": 32768,
+          "bootDiskMib": 100000
+        },
+        "maxRunDuration": "14400s",
+        "maxRetryCount": 1,
+        "environment": {
+          "variables": {
+            "BUCKET_NAME": "${BUCKET_NAME}",
+            "FORCE_REBUILD": "${FORCE_REBUILD}"
+          }
+        }
+      },
+      "taskCount": 1,
+      "parallelism": 1
+    }
+  ],
+  "allocationPolicy": {
+    "instances": [
+      {
+        "policy": {
+          "machineType": "e2-standard-8",
+          "provisioningModel": "SPOT",
+          "bootDisk": {
+            "sizeGb": 100,
+            "type": "pd-balanced"
+          }
+        }
+      }
+    ],
+    "labels": {
+      "owner": "${USERNAME}",
+      "job-type": "deps"
+    },
+    "serviceAccount": {
+      "email": "${SERVICE_ACCOUNT_EMAIL}"
+    }
+  },
+  "logsPolicy": {
+    "destination": "CLOUD_LOGGING"
+  },
+  "labels": {
+    "benchmark": "arvo",
+    "job-type": "deps"
+  }
+}

@@ -25,6 +25,7 @@ COPY ./libfuzzer-modern/ /src/libfuzzer/
 # - OLD compile_libfuzzer (compiles from source): source replacement works, library optional
 # Note: 80% of cases use NEW, 20% use OLD (based on benchmark analysis)
 RUN cd /src/libfuzzer && \
+    chmod +x ./build.sh && \
     PROJECT_ARCH=$(grep -oP 'ARCHITECTURE=\K\w+' /bin/arvo 2>/dev/null || echo "x86_64") && \
     if [ "$PROJECT_ARCH" = "i386" ]; then FUZZER_ARCH="i386"; else FUZZER_ARCH="x86_64"; fi && \
     echo "Detected project architecture: $PROJECT_ARCH -> target: $FUZZER_ARCH" && \

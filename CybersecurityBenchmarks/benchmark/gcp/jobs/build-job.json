@@ -1,0 +1,63 @@
+{
+  "taskGroups": [
+    {
+      "taskSpec": {
+        "runnables": [
+          {
+            "script": {
+              "text": "#!/bin/bash\nset -e\n\n# Download and run build script from GCS\ngsutil cp gs://${BUCKET_NAME}/scripts/build_task.sh /tmp/build_task.sh\nchmod +x /tmp/build_task.sh\n/tmp/build_task.sh"
+            }
+          }
+        ],
+        "computeResource": {
+          "cpuMilli": 4000,
+          "memoryMib": 8192,
+          "bootDiskMib": 50000
+        },
+        "maxRunDuration": "3600s",
+        "maxRetryCount": 2,
+        "environment": {
+          "variables": {
+            "BUCKET_NAME": "${BUCKET_NAME}",
+            "ARTIFACT_REGISTRY": "${ARTIFACT_REGISTRY}",
+            "ARVO_CASES": "${ARVO_CASES}",
+            "BUILD_VERSION": "${BUILD_VERSION}",
+            "FORCE_REBUILD": "${FORCE_REBUILD}"
+          }
+        }
+      },
+      "taskCount": "${TASK_COUNT}",
+      "parallelism": 50,
+      "taskCountPerNode": 1
+    }
+  ],
+  "allocationPolicy": {
+    "instances": [
+      {
+        "policy": {
+          "machineType": "e2-standard-4",
+          "provisioningModel": "SPOT",
+          "bootDisk": {
+            "sizeGb": 50,
+            "type": "pd-balanced"
+          }
+        }
+      }
+    ],
+    "labels": {
+      "owner": "${USERNAME}",
+      "run-id": "${RUN_ID}",
+      "job-type": "build"
+    },
+    "serviceAccount": {
+      "email": "${SERVICE_ACCOUNT_EMAIL}"
+    }
+  },
+  "logsPolicy": {
+    "destination": "CLOUD_LOGGING"
+  },
+  "labels": {
+    "benchmark": "arvo",
+    "job-type": "build"
+  }
+}

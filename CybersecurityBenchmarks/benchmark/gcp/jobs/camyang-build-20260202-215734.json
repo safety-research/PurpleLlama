@@ -1,0 +1,64 @@
+{
+  "taskGroups": [
+    {
+      "taskSpec": {
+        "runnables": [
+          {
+            "script": {
+              "text": "#!/bin/bash\nset -e\n\n# Download and run build script from GCS\ngsutil cp gs://fellows-safety-research-camyang-arvo-benchmark/scripts/build_task.sh /tmp/build_task.sh\nchmod +x /tmp/build_task.sh\n/tmp/build_task.sh"
+            }
+          }
+        ],
+        "computeResource": {
+          "cpuMilli": 4000,
+          "memoryMib": 8192,
+          "bootDiskMib": 50000
+        },
+        "maxRunDuration": "3600s",
+        "maxRetryCount": 2,
+        "environment": {
+          "variables": {
+            "BUCKET_NAME": "fellows-safety-research-camyang-arvo-benchmark",
+            "ARTIFACT_REGISTRY": "us-central1-docker.pkg.dev/fellows-safety-research/camyang-arvo",
+            "ARVO_CASES": "12803",
+            "BUILD_VERSION": "93114303",
+            "FORCE_REBUILD": "false"
+          }
+        }
+      },
+      "taskCount": "1",
+      "parallelism": 50,
+      "taskCountPerNode": 1
+    }
+  ],
+  "allocationPolicy": {
+    "instances": [
+      {
+        "policy": {
+          "machineType": "e2-standard-2",
+          "provisioningModel": "SPOT",
+          "bootDisk": {
+            "sizeGb": 50,
+            "type": "pd-balanced",
+            "image": "projects/fellows-safety-research/global/images/camyang-arvo-docker-vm"
+          }
+        }
+      }
+    ],
+    "labels": {
+      "owner": "camyang",
+      "run-id": "20260202-215734",
+      "job-type": "build"
+    },
+    "serviceAccount": {
+      "email": "camyang-arvo-runner@fellows-safety-research.iam.gserviceaccount.com"
+    }
+  },
+  "logsPolicy": {
+    "destination": "CLOUD_LOGGING"
+  },
+  "labels": {
+    "benchmark": "arvo",
+    "job-type": "build"
+  }
+}

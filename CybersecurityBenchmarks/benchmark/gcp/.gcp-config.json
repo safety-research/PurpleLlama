@@ -1,0 +1,11 @@
+{
+  "project_id": "fellows-safety-research",
+  "project_number": "616370374083",
+  "region": "us-central1",
+  "bucket_name": "fellows-safety-research-camyang-arvo-benchmark",
+  "service_account_email": "camyang-arvo-runner@fellows-safety-research.iam.gserviceaccount.com",
+  "secret_name": "anthropic-api-key",
+  "artifact_registry": "us-central1-docker.pkg.dev/fellows-safety-research/camyang-arvo",
+  "created_at": "2026-02-03T00:19:13.544240Z",
+  "vm_image": "projects/fellows-safety-research/global/images/camyang-arvo-docker-vm"
+}

@@ -44,7 +44,9 @@ else
     echo "Building CASR in container from local submodule ($CASR_SUBMODULE)..."
 
     # Build the container image with CASR binaries (only builder stage)
+    # Use --platform linux/amd64 to ensure x86_64 binaries even on ARM hosts
     $CONTAINER_CMD build \
+        --platform linux/amd64 \
         --target builder \
         -f "$CASR_DOCKERFILE" \
         -t casr-builder:latest \
@@ -52,7 +54,7 @@ else
 
     # Create a temporary container to extract binaries
     echo "Extracting binaries from container..."
-    TEMP_CONTAINER=$($CONTAINER_CMD create casr-builder:latest /bin/true)
+    TEMP_CONTAINER=$($CONTAINER_CMD create --platform linux/amd64 casr-builder:latest /bin/true)
 
     # Create temporary directory for extraction
     mkdir -p casr-binaries/bin
@@ -62,6 +64,17 @@ else
 
     # Clean up temporary container
     $CONTAINER_CMD rm "$TEMP_CONTAINER"
+
+    # Verify binaries are x86_64 (not ARM)
+    echo "Verifying binary architecture..."
+    BINARY_ARCH=$(file casr-binaries/bin/casr-san | grep -o 'x86-64\|ARM aarch64' || echo "unknown")
+    if [ "$BINARY_ARCH" != "x86-64" ]; then
+        echo "ERROR: Expected x86-64 binaries but got: $BINARY_ARCH"
+        echo "Make sure Docker/Podman supports --platform linux/amd64 emulation"
+        rm -rf casr-binaries
+        exit 1
+    fi
+    echo "Binary architecture: $BINARY_ARCH (correct)"
 
     # Package the binaries
     echo "Packaging CASR binaries..."

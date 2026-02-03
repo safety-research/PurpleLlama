@@ -1159,6 +1159,9 @@ class FuzzingOnlyBenchmark(Benchmark):
         CASR (Crash Analysis and Severity Reporting) analyzes crashes and groups them
         into clusters based on stack traces and crash characteristics.
 
+        Note: OOM and timeout crashes are handled separately since they don't produce
+        stack traces that CASR can analyze. They are assigned to special pseudo-clusters.
+
         Args:
             container: The container with the fuzzer and crashes
             fuzzer_type: Type of fuzzer used (affects crash file location)
@@ -1175,6 +1178,20 @@ class FuzzingOnlyBenchmark(Benchmark):
         if not crash_files:
             LOG.info(f"Case {case_id}: No crashes to deduplicate")
             return crash_to_cluster
+
+        # Count crash types for logging
+        oom_count = sum(1 for f in crash_files if f.startswith("oom-"))
+        timeout_count = sum(1 for f in crash_files if f.startswith("timeout-"))
+        regular_count = len(crash_files) - oom_count - timeout_count
+
+        LOG.info(
+            f"Case {case_id}: Processing {len(crash_files)} crashes with CASR "
+            f"({regular_count} regular, {oom_count} OOM, {timeout_count} timeout)"
+        )
+        
+        # NOTE: CASR now handles ALL crash types including OOM and timeout
+        # The casr-cluster-map tool creates pseudo-clusters for OOM/timeout
+        # since they don't have stacktraces to cluster by
 
         # Determine paths based on fuzzer type and target
         if fuzzer_type == FuzzerType.AFL_PLUS_PLUS:
@@ -1267,13 +1284,13 @@ class FuzzingOnlyBenchmark(Benchmark):
                     f"Case {case_id}: CASR clustering returned non-zero exit code {result.returncode}"
                 )
 
-                # Case 1: Only 1 unique crash type - this is OK, assign all to cluster 1
+                # Case 1: Only 1 unique crash type - this is OK, CASR handles it
+                # (CASR now creates pseudo-clusters for OOM/timeout automatically)
                 if "Not enough valid reports" in stderr or "Less than 2" in stderr:
                     LOG.info(
-                        f"Case {case_id}: Only 1 unique crash type, assigning all to cluster 1"
+                        f"Case {case_id}: CASR found only 1 unique stacktrace type"
                     )
-                    for crash_file in crash_files:
-                        crash_to_cluster[crash_file] = "cl1"
+                    # Don't fail - CASR will still produce a valid mapping with pseudo-clusters
 
                 # Case 2: CASR couldn't reproduce crashes - preserve container for debugging
                 elif (
@@ -1313,12 +1330,16 @@ class FuzzingOnlyBenchmark(Benchmark):
                     )
 
             # Parse JSON mapping file to get COMPLETE crash-to-cluster mapping
-            if not crash_to_cluster:
+            # CASR now handles ALL crash types including OOM and timeout (as pseudo-clusters)
+            crashes_mapped = any(
+                crash_file in crash_to_cluster for crash_file in crash_files
+            )
+            if not crashes_mapped:
                 parsed_mapping = await self._parse_casr_json_mapping(
                     container, mapping_file, case_id
                 )
                 if parsed_mapping:
-                    crash_to_cluster = parsed_mapping
+                    crash_to_cluster.update(parsed_mapping)
                 elif crash_files:
                     # No fallback - CASR must work reliably
                     error_msg = (

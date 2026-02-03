@@ -107,8 +107,12 @@ private:
   void DumpCurrentUnit(const char *Prefix);
   void DeathCallback();
 
-  // Redirect stderr to a per-crash log file for CASR-based deduplication
-  void RedirectStderrToCrashLog(const char *Prefix);
+  // Setup and finalize per-crash log files for CASR-based deduplication
+  static void SetupPendingCrashLog();  // Call at process start, redirects stderr
+  void FinalizeCrashLog(const char *Prefix);  // Call on crash, renames to crash-{hash}.log
+  
+  // Path to pending crash log (set by SetupPendingCrashLog, used by FinalizeCrashLog)
+  static std::string PendingCrashLogPath;
 
   void AllocateCurrentUnitData();
   uint8_t *CurrentUnitData = nullptr;

@@ -61,48 +61,10 @@ static Stats ParseFinalStatsFromLog(const std::string &LogPath) {
   return Res;
 }
 
-// Save crash log content from worker's log to artifact directory for CASR.
-// This copies the ASAN/crash output from Job->LogPath to {ArtifactPrefix}/logs/
-// so that CASR can use log-based clustering instead of re-running binaries.
-static void SaveCrashLogsForCASR(const std::string &JobLogPath,
-                                  const std::string &ArtifactPrefix) {
-  // Read the entire job log
-  std::string LogContent = FileToString(JobLogPath);
-  if (LogContent.empty())
-    return;
-
-  // Create logs directory
-  std::string LogsDir = ArtifactPrefix + "logs";
-  MkDir(LogsDir);
-
-  // Find crash files in ArtifactPrefix and save corresponding logs
-  // Crash files are named: crash-{hash}, oom-{hash}, timeout-{hash}, leak-{hash}
-  Vector<std::string> CrashFiles;
-  ListFilesInDirRecursive(ArtifactPrefix, nullptr, &CrashFiles, false);
-
-  for (const auto &CrashPath : CrashFiles) {
-    // Extract filename from path
-    size_t LastSlash = CrashPath.rfind('/');
-    std::string CrashName = (LastSlash != std::string::npos)
-                                ? CrashPath.substr(LastSlash + 1)
-                                : CrashPath;
-
-    // Only process crash/oom/timeout/leak files, not other artifacts
-    // Also skip .log files (they're in the logs/ subdirectory, not crash artifacts)
-    if (CrashName.find("crash-") != 0 && CrashName.find("oom-") != 0 &&
-        CrashName.find("timeout-") != 0 && CrashName.find("leak-") != 0)
-      continue;
-    if (CrashName.size() > 4 && 
-        CrashName.substr(CrashName.size() - 4) == ".log")
-      continue;
-
-    // Always overwrite - Job->LogPath has full ASAN output, while any existing
-    // log file from RedirectStderrToCrashLog only has partial output (ASAN
-    // prints BEFORE our crash callback runs in fork mode)
-    std::string LogPath = DirPlusFile(LogsDir, CrashName + ".log");
-    WriteToFile(LogContent, LogPath);
-  }
-}
+// NOTE: Per-crash log handling is now done in FuzzerLoop.cpp via SetupPendingCrashLog()
+// and FinalizeCrashLog(). The child process redirects stderr at startup and renames
+// the log file on crash, ensuring each crash gets its own accurate log without the
+// race conditions that affected the old SaveCrashLogsForCASR approach.
 
 struct FuzzJob {
   // Inputs.
@@ -411,12 +373,9 @@ void FuzzWithFork(Random &Rand, const FuzzingOptions &Options,
       }
     }
 
-    // Save crash log content to artifact directory for CASR log-based clustering.
-    // This copies ASAN/crash output from the worker's log so CASR doesn't need
-    // to re-run binaries.
-    if (ExitCode != 0 && !Options.ArtifactPrefix.empty()) {
-      SaveCrashLogsForCASR(Job->LogPath, Options.ArtifactPrefix);
-    }
+    // NOTE: Per-crash logs are now handled by the child process itself via
+    // SetupPendingCrashLog() and FinalizeCrashLog() in FuzzerLoop.cpp.
+    // This ensures each crash gets its own accurate log with the correct stacktrace.
 
     Env.RunOneMergeJob(Job.get());
 

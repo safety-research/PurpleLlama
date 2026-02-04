@@ -39,7 +39,7 @@ spec:
         backoff:
           duration: "30s"
           factor: 2
-          maxDuration: "5m"
+          maxDuration: "1h"
       container:
         image: gcr.io/kaniko-project/executor:latest
         args:
@@ -57,10 +57,10 @@ spec:
             readOnly: true
         resources:
           requests:
-            cpu: "8"
+            cpu: "7"
             memory: "16G"
           limits:
-            cpu: "8"
+            cpu: "7"
             memory: "16G"
       initContainers:
         - name: prepare-build-context
@@ -128,7 +128,7 @@ spec:
         backoff:
           duration: "30s"
           factor: 2
-          maxDuration: "5m"
+          maxDuration: "1h"
       container:
         image: gcr.io/kaniko-project/executor:latest
         args:
@@ -138,6 +138,7 @@ spec:
           - "--destination={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:latest"
           - "--cache=true"
           - "--cache-repo={{inputs.parameters.registry}}/kaniko-cache"
+          - "--single-snapshot"
         volumeMounts:
           - name: workspace
             mountPath: /workspace
@@ -146,11 +147,11 @@ spec:
             readOnly: true
         resources:
           requests:
-            cpu: "8"
-            memory: "16G"
+            cpu: "7"
+            memory: "24G"
           limits:
-            cpu: "8"
-            memory: "16G"
+            cpu: "7"
+            memory: "24G"
       initContainers:
         - name: prepare-build-context
           image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim

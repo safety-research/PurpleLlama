@@ -16,7 +16,44 @@ from ..hashing import (
     compute_deps_source_hash,
     get_deps_manifest_from_gcs,
 )
-from ..output import echo_info, echo_success, echo_warning
+from ..output import echo_error, echo_info, echo_success, echo_warning
+
+
+def _apply_argo_templates(dry_run: bool = False) -> bool:
+    """Apply Argo workflow templates to the cluster.
+
+    Args:
+        dry_run: If True, only show what would be done
+
+    Returns:
+        True if successful, False otherwise
+    """
+    templates_dir = get_script_dir() / "argo" / "templates"
+
+    if not templates_dir.exists():
+        echo_error(f"Templates directory not found: {templates_dir}")
+        return False
+
+    if dry_run:
+        typer.echo(f"  [DRY RUN] Would apply templates from {templates_dir}")
+        return True
+
+    result = subprocess.run(
+        ["kubectl", "apply", "-f", str(templates_dir)],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        echo_error(f"Failed to apply templates: {result.stderr}")
+        return False
+
+    # Show what was applied
+    for line in result.stdout.strip().split("\n"):
+        if line:
+            typer.echo(f"  {line}")
+
+    return True
 
 
 def _check_deps_status(
@@ -308,6 +345,13 @@ def submit(
         "build-casr": str(build_casr).lower(),
         "build-dd": str(build_dd).lower(),
     }
+
+    # Apply Argo workflow templates
+    typer.echo("Applying Argo workflow templates...")
+    if not _apply_argo_templates(dry_run=dry_run):
+        typer.echo("Error: Failed to apply workflow templates.")
+        raise typer.Exit(1)
+    typer.echo()
 
     if dry_run:
         typer.echo("Dry run - would submit workflow with:")

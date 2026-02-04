@@ -36,6 +36,7 @@ spec:
               key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/crashes.json"
           - name: success-marker
             path: /output/_SUCCESS
+            optional: true
             archive:
               none: {}
             gcs:
@@ -57,7 +58,7 @@ spec:
         backoff:
           duration: "30s"
           factor: 2
-          maxDuration: "5m"
+          cap: "5m"
 
       initContainers:
         - name: fetch-runtime

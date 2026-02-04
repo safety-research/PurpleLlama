@@ -32,7 +32,7 @@ spec:
         backoff:
           duration: "30s"
           factor: 2
-          maxDuration: "5m"
+          maxDuration: "3h"
       container:
         image: docker.io/library/rust:1.83-bookworm
         command:
@@ -163,7 +163,7 @@ spec:
         backoff:
           duration: "30s"
           factor: 2
-          maxDuration: "5m"
+          maxDuration: "3h"
       # Use Docker-in-Docker sidecar for container builds
       sidecars:
         - name: docker
@@ -337,7 +337,7 @@ spec:
         backoff:
           duration: "30s"
           factor: 2
-          maxDuration: "5m"
+          maxDuration: "3h"
       container:
         image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
         command:

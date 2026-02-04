@@ -293,7 +293,6 @@ async def run_fuzzer(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     start_time = time.time()
-    total_executions = 0
 
     try:
         process = await asyncio.create_subprocess_exec(
@@ -324,18 +323,6 @@ async def run_fuzzer(
                     f.write(decoded + "\n")
                     f.flush()
 
-                    # Parse execution count
-                    if fuzzer_type == FuzzerType.AFL_PLUS_PLUS:
-                        exec_match = re.search(
-                            r"(?:execs_done|total_execs)\s*:\s*(\d+)", decoded
-                        )
-                        if exec_match:
-                            total_executions = int(exec_match.group(1))
-                    else:
-                        exec_match = re.search(r"#(\d+):", decoded)
-                        if exec_match:
-                            total_executions = int(exec_match.group(1))
-
                 except asyncio.TimeoutError:
                     if process.returncode is not None:
                         break
@@ -349,7 +336,6 @@ async def run_fuzzer(
     # Record timing
     end_time = time.time()
     timeline.duration_seconds = end_time - start_time
-    timeline.total_executions = total_executions
 
     # Collect crashes
     if fuzzer_type == FuzzerType.AFL_PLUS_PLUS:
@@ -365,7 +351,6 @@ async def run_fuzzer(
     LOG.info(
         f"Case {case_id}: Fuzzing complete. "
         f"Duration: {timeline.duration_seconds:.1f}s, "
-        f"Executions: {total_executions}, "
         f"Crashes: {len(timeline.crashes)}"
     )
 
@@ -441,7 +426,6 @@ async def collect_libfuzzer_crashes(
                 crash_id=crash_file.name,
                 corpus_file=str(crash_file),
                 first_seen_time=max(0, first_seen),
-                first_seen_executions=0,  # libFuzzer doesn't provide this per-crash
                 target=target,
                 crash_type=crash_type,  # Initial type from filename, CASR may refine
             )
@@ -500,7 +484,6 @@ async def collect_afl_crashes(
                 crash_id=crash_file.name,
                 corpus_file=str(crash_file),
                 first_seen_time=max(0, first_seen),
-                first_seen_executions=0,
                 target=target,
                 crash_type="unknown",
             )

@@ -1,306 +1,478 @@
 """
-Dependencies build command: build-deps.
+Dependencies build command: build-deps, upload-build-assets.
 """
 
 import json
+import subprocess
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
 
-from ..config import get_cli_tmp_dir
-from ..gcp_utils import (
-    get_gcp_username,
-    get_script_dir,
-    load_config,
-    run_gcloud,
-    run_gsutil,
-)
-from ..hashing import AUTOPATCH_BUILD_DIR
+from ..argo import submit_workflow
+from ..config import GKEConfig, get_script_dir
 from ..output import echo_error, echo_info, echo_success, echo_warning
-from .upload import upload_deps_sources_impl
 
 
-def submit_deps_job_impl(
-    config: dict,
-    username: str,
-    run_id: str,
-    force_rebuild: bool = False,
-    build_lldb: bool = False,
-    quiet: bool = False,
-) -> Optional[str]:
-    """Submit deps build job.
+# Path to autopatch build directory
+AUTOPATCH_BUILD_DIR = Path(__file__).parent.parent.parent.parent / "autopatch" / "build"
 
-    Returns:
-        Job name if submitted, None if failed
-    """
-    project = config["project_id"]
-    region = config["region"]
-    bucket = config["bucket_name"]
 
-    # Upload deps_task.sh script
-    script_path = get_script_dir() / "scripts" / "deps_task.sh"
-    if script_path.exists():
-        run_gsutil(["cp", str(script_path), f"gs://{bucket}/scripts/"], check=False)
-
-    # Generate job name
-    job_name = f"{username}-deps-{run_id}"
-
-    # Load job template
-    jobs_dir = get_script_dir() / "jobs"
-    template_path = jobs_dir / "deps-job.json"
-
-    if not template_path.exists():
-        if not quiet:
-            echo_error(f"Job template not found: {template_path}")
-        return None
-
-    with open(template_path) as f:
-        spec = f.read()
-
-    # Substitute variables
-    spec = spec.replace("${BUCKET_NAME}", bucket)
-    spec = spec.replace("${SERVICE_ACCOUNT_EMAIL}", config["service_account_email"])
-    spec = spec.replace("${USERNAME}", username)
-    spec = spec.replace("${FORCE_REBUILD}", "true" if force_rebuild else "false")
-
-    # Parse and optionally add VM image
-    spec_json = json.loads(spec)
-    if config.get("vm_image"):
-        instances = spec_json.get("allocationPolicy", {}).get("instances", [])
-        if instances:
-            boot_disk = instances[0].get("policy", {}).get("bootDisk", {})
-            boot_disk["image"] = config["vm_image"]
-            instances[0]["policy"]["bootDisk"] = boot_disk
-
-    # Scale up to 32 cores if building LLDB (it's a heavy compile)
-    if build_lldb:
-        # Update compute resource requirements
-        task_spec = spec_json["taskGroups"][0]["taskSpec"]
-        task_spec["computeResource"]["cpuMilli"] = 32000
-        task_spec["computeResource"]["memoryMib"] = 131072  # 128GB
-        # Update machine type
-        instances = spec_json["allocationPolicy"]["instances"]
-        instances[0]["policy"]["machineType"] = "e2-standard-32"
-
-    # Add BUILD_LLDB environment variable
-    env_vars = spec_json["taskGroups"][0]["taskSpec"]["environment"]["variables"]
-    env_vars["BUILD_LLDB"] = "true" if build_lldb else "false"
-
-    spec = json.dumps(spec_json, indent=2)
-
-    # Write temp spec file to CLI temp directory (not in repo)
-    temp_spec = get_cli_tmp_dir() / f"{job_name}.json"
-    with open(temp_spec, "w") as f:
-        f.write(spec)
-
-    # Submit job
-    if not quiet:
-        echo_info(f"Submitting deps job: {job_name}")
-
-    result = run_gcloud(
-        [
-            "batch",
-            "jobs",
-            "submit",
-            job_name,
-            f"--project={project}",
-            f"--location={region}",
-            f"--config={temp_spec}",
-        ],
-        check=False,
+def _run_gsutil(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    """Run gsutil command."""
+    result = subprocess.run(
+        ["gsutil"] + args,
+        capture_output=True,
+        text=True,
     )
+    if check and result.returncode != 0:
+        raise RuntimeError(f"gsutil failed: {result.stderr}")
+    return result
 
-    temp_spec.unlink(missing_ok=True)
 
-    if result.returncode == 0:
+def upload_deps_sources(
+    quiet: Annotated[bool, typer.Option("--quiet", "-q", help="Reduce output")] = False,
+) -> None:
+    """Upload CASR source and DD build scripts to GCS.
+
+    This uploads the source files needed by the deps build jobs:
+    - benchmark/autopatch/build/casr/ (CASR submodule)
+    - benchmark/autopatch/build/build_deb_packages.sh
+    - benchmark/gcp/scripts/compute_hashes.sh
+
+    Run this before submitting deps build jobs.
+    """
+    gke_config = GKEConfig.load()
+    if not gke_config.is_configured():
+        echo_error("GKE not configured. Run: python -m cli setup")
+        raise typer.Exit(1)
+
+    bucket = gke_config.bucket_name
+    build_dir = AUTOPATCH_BUILD_DIR
+
+    if not quiet:
+        typer.echo("=" * 50)
+        typer.echo("Upload Dependencies Sources")
+        typer.echo("=" * 50)
+        typer.echo(f"Source:      {build_dir}")
+        typer.echo(f"Destination: gs://{bucket}/deps-sources/")
+        typer.echo()
+
+    # Upload CASR submodule
+    casr_dir = build_dir / "casr"
+    if casr_dir.exists():
         if not quiet:
-            echo_success(f"Deps job submitted: {job_name}")
-        return job_name
+            echo_info("Uploading CASR source (this may take a moment)...")
+        result = subprocess.run(
+            [
+                "gsutil",
+                "-m",
+                "rsync",
+                "-r",
+                "-x",
+                r"\.git|target|\.build-cache",
+                str(casr_dir),
+                f"gs://{bucket}/deps-sources/casr/",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            if not quiet:
+                echo_success("CASR source uploaded")
+        else:
+            echo_error("Failed to upload CASR source")
+            typer.echo(result.stderr)
+            raise typer.Exit(1)
     else:
+        echo_error(f"CASR submodule not found at {casr_dir}")
+        echo_info("Initialize with: git submodule update --init")
+        raise typer.Exit(1)
+
+    # Upload build_deb_packages.sh
+    build_script = build_dir / "build_deb_packages.sh"
+    if build_script.exists():
         if not quiet:
-            echo_error("Failed to submit deps job")
-            if result.stderr:
-                typer.echo(result.stderr)
-        return None
+            echo_info("Uploading build_deb_packages.sh...")
+        _run_gsutil(["cp", str(build_script), f"gs://{bucket}/deps-sources/"])
+        if not quiet:
+            echo_success("build_deb_packages.sh uploaded")
+    else:
+        echo_warning(f"build_deb_packages.sh not found at {build_script}")
+
+    # Upload Dockerfile.casr-builder
+    dockerfile = build_dir / "Dockerfile.casr-builder"
+    if dockerfile.exists():
+        if not quiet:
+            echo_info("Uploading Dockerfile.casr-builder...")
+        _run_gsutil(["cp", str(dockerfile), f"gs://{bucket}/deps-sources/"])
+        if not quiet:
+            echo_success("Dockerfile.casr-builder uploaded")
+
+    # Upload compute_hashes.sh
+    hash_script = get_script_dir() / "scripts" / "compute_hashes.sh"
+    if hash_script.exists():
+        if not quiet:
+            echo_info("Uploading compute_hashes.sh...")
+        _run_gsutil(["cp", str(hash_script), f"gs://{bucket}/deps-sources/"])
+        if not quiet:
+            echo_success("compute_hashes.sh uploaded")
+    else:
+        echo_warning(f"compute_hashes.sh not found at {hash_script}")
+
+    if not quiet:
+        typer.echo()
+        echo_success("Dependencies sources uploaded!")
+        typer.echo()
+        typer.echo("Verify with:")
+        typer.echo(f"  gsutil ls gs://{bucket}/deps-sources/")
 
 
-def build_deps(
-    force_rebuild: Annotated[
-        bool, typer.Option("--force", "-f", help="Force rebuild even if hashes match")
-    ] = False,
-    build_lldb: Annotated[
-        bool,
-        typer.Option(
-            "--build-lldb", help="Build LLDB (uses 32 vCPUs instead of 4)"
-        ),
+def upload_build_assets(
+    quiet: Annotated[bool, typer.Option("--quiet", "-q", help="Reduce output")] = False,
+) -> None:
+    """Upload build assets to GCS.
+
+    Uploads Dockerfile templates, libfuzzer-modern, and other build assets
+    from benchmark/autopatch/build/ to GCS.
+    """
+    gke_config = GKEConfig.load()
+    if not gke_config.is_configured():
+        echo_error("GKE not configured. Run: python -m cli setup")
+        raise typer.Exit(1)
+
+    bucket = gke_config.bucket_name
+    build_dir = AUTOPATCH_BUILD_DIR
+
+    if not quiet:
+        typer.echo("=" * 50)
+        typer.echo("Upload Build Assets")
+        typer.echo("=" * 50)
+        typer.echo(f"Source:      {build_dir}")
+        typer.echo(f"Destination: gs://{bucket}/build-assets/")
+        typer.echo()
+
+    # Upload Dockerfile templates
+    templates = [
+        "dockerfile_vul_template",
+        "dockerfile_fix_template",
+        "dockerfile_fuzzing_template",
+    ]
+    for template_name in templates:
+        template_file = build_dir / template_name
+        if template_file.exists():
+            if not quiet:
+                echo_info(f"Uploading {template_name}...")
+            _run_gsutil(["cp", str(template_file), f"gs://{bucket}/build-assets/"])
+            if not quiet:
+                echo_success(f"{template_name} uploaded")
+        else:
+            echo_warning(f"{template_name} not found")
+
+    # Upload libfuzzer-modern directory
+    libfuzzer_dir = build_dir / "libfuzzer-modern"
+    if libfuzzer_dir.exists():
+        if not quiet:
+            echo_info("Uploading libfuzzer-modern/...")
+        _run_gsutil(
+            ["-m", "cp", "-r", str(libfuzzer_dir), f"gs://{bucket}/build-assets/"]
+        )
+        if not quiet:
+            echo_success("libfuzzer-modern uploaded")
+    else:
+        echo_warning(f"libfuzzer-modern not found at {libfuzzer_dir}")
+
+    # Upload casr-binaries.tar.gz
+    casr_tarball = build_dir / "casr-binaries.tar.gz"
+    if casr_tarball.exists():
+        if not quiet:
+            echo_info("Uploading casr-binaries.tar.gz...")
+        _run_gsutil(["cp", str(casr_tarball), f"gs://{bucket}/build-assets/"])
+        if not quiet:
+            echo_success("casr-binaries.tar.gz uploaded")
+    else:
+        echo_warning("casr-binaries.tar.gz not found (run build-casr first)")
+
+    # Upload glibc 2.35
+    glibc_deb = build_dir / "libc6_2.35-0ubuntu3_amd64.deb"
+    if glibc_deb.exists():
+        if not quiet:
+            echo_info("Uploading libc6_2.35-0ubuntu3_amd64.deb...")
+        _run_gsutil(["cp", str(glibc_deb), f"gs://{bucket}/build-assets/"])
+        if not quiet:
+            echo_success("libc6_2.35-0ubuntu3_amd64.deb uploaded")
+
+    # Upload differential-debugging-deps debs
+    for deb_file in sorted(build_dir.glob("differential-debugging-deps-*.deb")):
+        if not quiet:
+            echo_info(f"Uploading {deb_file.name}...")
+        _run_gsutil(["cp", str(deb_file), f"gs://{bucket}/build-assets/"])
+        if not quiet:
+            echo_success(f"{deb_file.name} uploaded")
+
+    # Upload microsnapshots directory
+    microsnapshots_dir = build_dir / "microsnapshots"
+    if microsnapshots_dir.exists():
+        if not quiet:
+            echo_info("Uploading microsnapshots/...")
+        _run_gsutil(
+            ["-m", "cp", "-r", str(microsnapshots_dir), f"gs://{bucket}/build-assets/"]
+        )
+        if not quiet:
+            echo_success("microsnapshots uploaded")
+
+    # Upload casr_cluster.py
+    casr_cluster_py = build_dir / "casr_cluster.py"
+    if casr_cluster_py.exists():
+        if not quiet:
+            echo_info("Uploading casr_cluster.py...")
+        _run_gsutil(["cp", str(casr_cluster_py), f"gs://{bucket}/build-assets/"])
+        if not quiet:
+            echo_success("casr_cluster.py uploaded")
+
+    if not quiet:
+        typer.echo()
+        echo_success("Build assets uploaded!")
+        typer.echo()
+        typer.echo("Verify with:")
+        typer.echo(f"  gsutil ls gs://{bucket}/build-assets/")
+
+
+def build_casr(
+    force: Annotated[
+        bool, typer.Option("--force", "-f", help="Force rebuild even if unchanged")
     ] = False,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Show what would be done")
     ] = False,
 ) -> None:
-    """Submit a Cloud Batch job to build CASR and differential-debugging-deps.
+    """Build CASR binaries on GKE.
 
-    This builds the heavy dependencies on native x86_64 GCP VMs:
-    - CASR (Crash Analysis and Severity Reporting) binaries
-    - differential-debugging-deps .deb packages (Python 3.7, optionally LLDB 13)
+    Submits an Argo workflow to build CASR from source.
+    CASR is built using the Rust compiler (~15-30 minutes).
 
-    The job uses hash-based change detection - it only rebuilds if the
-    source files have changed since the last build.
-
-    This command automatically uploads deps sources before submitting the job.
-
-    Use --build-lldb to include LLDB compilation (requires 32 vCPUs, ~2-4 hours).
-    Without --build-lldb, only CASR is built (4 vCPUs, much faster).
+    The workflow:
+    1. Downloads CASR source from GCS (upload with: upload-deps-sources)
+    2. Compiles with cargo build --release
+    3. Uploads casr-binaries.tar.gz to GCS
     """
-    config = load_config()
-    if not config:
-        echo_error("GCP not configured. Run 'setup' first.")
+    gke_config = GKEConfig.load()
+    if not gke_config.is_configured():
+        echo_error("GKE not configured. Run: python -m cli setup")
         raise typer.Exit(1)
-
-    project = config["project_id"]
-    region = config["region"]
-    bucket = config["bucket_name"]
-    username = get_gcp_username()
 
     typer.echo("=" * 50)
-    typer.echo("Build Dependencies Job")
+    typer.echo("Build CASR")
     typer.echo("=" * 50)
+    typer.echo(f"Bucket:        gs://{gke_config.bucket_name}")
+    typer.echo(f"Force Rebuild: {force}")
     typer.echo()
-    typer.echo(f"Project:       {project}")
-    typer.echo(f"Region:        {region}")
-    typer.echo(f"Bucket:        gs://{bucket}")
-    typer.echo(f"Force Rebuild: {force_rebuild}")
-    typer.echo(f"Build LLDB:    {build_lldb}" + (" (32 vCPUs)" if build_lldb else " (4 vCPUs)"))
-    typer.echo()
-
-    # Check if CASR submodule exists locally
-    casr_dir = AUTOPATCH_BUILD_DIR / "casr"
-    if not casr_dir.exists():
-        echo_error(f"CASR submodule not found at {casr_dir}")
-        echo_info("Initialize with: git submodule update --init")
-        raise typer.Exit(1)
-
-    # Upload deps sources to GCS
-    echo_info("Uploading deps sources to GCS...")
-    if not dry_run:
-        if not upload_deps_sources_impl(bucket, AUTOPATCH_BUILD_DIR, quiet=False):
-            echo_error("Failed to upload deps sources")
-            raise typer.Exit(1)
-    else:
-        typer.echo("Would upload deps sources")
-
-    # Upload deps_task.sh script
-    echo_info("Uploading deps_task.sh to GCS...")
-    script_path = get_script_dir() / "scripts" / "deps_task.sh"
-    if not script_path.exists():
-        echo_error(f"deps_task.sh not found at {script_path}")
-        raise typer.Exit(1)
-
-    if not dry_run:
-        run_gsutil(["cp", str(script_path), f"gs://{bucket}/scripts/"])
-
-    # Generate job name
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-    job_name = f"{username}-deps-{run_id}"
-
-    # Load job template
-    jobs_dir = get_script_dir() / "jobs"
-    template_path = jobs_dir / "deps-job.json"
-
-    if not template_path.exists():
-        echo_error(f"Job template not found: {template_path}")
-        raise typer.Exit(1)
-
-    with open(template_path) as f:
-        spec = f.read()
-
-    # Substitute variables
-    spec = spec.replace("${BUCKET_NAME}", bucket)
-    spec = spec.replace("${SERVICE_ACCOUNT_EMAIL}", config["service_account_email"])
-    spec = spec.replace("${USERNAME}", username)
-    spec = spec.replace("${FORCE_REBUILD}", "true" if force_rebuild else "false")
-
-    # Parse and optionally add VM image
-    spec_json = json.loads(spec)
-    if config.get("vm_image"):
-        instances = spec_json.get("allocationPolicy", {}).get("instances", [])
-        if instances:
-            boot_disk = instances[0].get("policy", {}).get("bootDisk", {})
-            boot_disk["image"] = config["vm_image"]
-            instances[0]["policy"]["bootDisk"] = boot_disk
-
-    # Scale up to 32 cores if building LLDB (it's a heavy compile)
-    if build_lldb:
-        # Update compute resource requirements
-        task_spec = spec_json["taskGroups"][0]["taskSpec"]
-        task_spec["computeResource"]["cpuMilli"] = 32000
-        task_spec["computeResource"]["memoryMib"] = 131072  # 128GB
-        # Update machine type
-        instances = spec_json["allocationPolicy"]["instances"]
-        instances[0]["policy"]["machineType"] = "e2-standard-32"
-
-    # Add BUILD_LLDB environment variable
-    env_vars = spec_json["taskGroups"][0]["taskSpec"]["environment"]["variables"]
-    env_vars["BUILD_LLDB"] = "true" if build_lldb else "false"
-
-    spec = json.dumps(spec_json, indent=2)
-
-    # Write temp spec file to CLI temp directory (not in repo)
-    temp_spec = get_cli_tmp_dir() / f"{job_name}.json"
-    with open(temp_spec, "w") as f:
-        f.write(spec)
 
     if dry_run:
         echo_warning("DRY RUN MODE")
-        typer.echo(f"Would submit job: {job_name}")
-        typer.echo()
-        typer.echo("Job spec:")
-        typer.echo(spec[:500] + "..." if len(spec) > 500 else spec)
-        temp_spec.unlink()
+        typer.echo("Would submit workflow to build CASR")
         return
 
-    # Submit job
-    echo_info(f"Submitting job: {job_name}")
-
-    result = run_gcloud(
-        [
-            "batch",
-            "jobs",
-            "submit",
-            job_name,
-            f"--project={project}",
-            f"--location={region}",
-            f"--config={temp_spec}",
-        ],
+    # Check if deps sources are uploaded
+    result = _run_gsutil(
+        ["ls", f"gs://{gke_config.bucket_name}/deps-sources/casr/"],
         check=False,
     )
-
-    if result.returncode == 0:
-        echo_success(f"Job submitted: {job_name}")
-        temp_spec.unlink()
-    else:
-        echo_error(f"Failed to submit job: {job_name}")
-        if result.stderr:
-            typer.echo(result.stderr)
-        if result.stdout:
-            typer.echo(result.stdout)
-        typer.echo(f"Job spec saved at: {temp_spec}")
+    if result.returncode != 0:
+        echo_error("CASR source not found in GCS")
+        echo_info("Upload with: python -m cli upload-deps-sources")
         raise typer.Exit(1)
 
-    typer.echo()
-    typer.echo("=" * 50)
-    typer.echo(f"Job: {job_name}")
-    typer.echo()
-    if build_lldb:
-        typer.echo("This job builds CASR and LLDB (~2-4 hours)")
+    # Submit workflow
+    workflow_yaml = f"""
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: casr-build-
+  namespace: argo
+spec:
+  entrypoint: build-casr
+  serviceAccountName: arvo-workflow-sa
+  templates:
+    - name: build-casr
+      templateRef:
+        name: arvo-deps-build
+        template: build-casr
+      arguments:
+        parameters:
+          - name: bucket
+            value: "{gke_config.bucket_name}"
+          - name: force-rebuild
+            value: "{str(force).lower()}"
+"""
+
+    # Write temp workflow file
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write(workflow_yaml)
+        temp_path = f.name
+
+    echo_info("Submitting CASR build workflow...")
+    workflow_name = submit_workflow(temp_path, {})
+
+    Path(temp_path).unlink()
+
+    if workflow_name:
+        typer.echo()
+        echo_success(f"Workflow submitted: {workflow_name}")
+        typer.echo()
+        typer.echo("Monitor with:")
+        typer.echo(f"  python -m cli status {workflow_name}")
+        typer.echo(f"  python -m cli logs {workflow_name}")
     else:
-        typer.echo("This job builds CASR only (~15-30 minutes)")
+        echo_error("Failed to submit workflow")
+        raise typer.Exit(1)
+
+
+def build_dd(
+    force: Annotated[
+        bool, typer.Option("--force", "-f", help="Force rebuild even if unchanged")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show what would be done")
+    ] = False,
+) -> None:
+    """Build differential-debugging-deps packages on GKE.
+
+    Submits an Argo workflow to build DD packages from source.
+    This requires Docker-in-Docker and takes 2-4 hours.
+
+    The workflow:
+    1. Downloads build script from GCS (upload with: upload-deps-sources)
+    2. Builds Python 3.7 and LLDB 13 in containers
+    3. Creates .deb packages for Ubuntu 16.04 and 20.04
+    4. Uploads packages to GCS
+    """
+    gke_config = GKEConfig.load()
+    if not gke_config.is_configured():
+        echo_error("GKE not configured. Run: python -m cli setup")
+        raise typer.Exit(1)
+
+    typer.echo("=" * 50)
+    typer.echo("Build Differential Debugging Deps")
+    typer.echo("=" * 50)
+    typer.echo(f"Bucket:        gs://{gke_config.bucket_name}")
+    typer.echo(f"Force Rebuild: {force}")
     typer.echo()
-    typer.echo("Monitor with:")
-    typer.echo(f"  python -m cli monitor --job {job_name}")
+    echo_warning("This build takes 2-4 hours!")
     typer.echo()
-    typer.echo("View logs:")
-    typer.echo(
-        f"  gcloud logging read 'resource.labels.job_uid=\"{job_name}\"' --project={project} --limit=100"
+
+    if dry_run:
+        echo_warning("DRY RUN MODE")
+        typer.echo("Would submit workflow to build DD packages")
+        return
+
+    # Check if deps sources are uploaded
+    result = _run_gsutil(
+        ["ls", f"gs://{gke_config.bucket_name}/deps-sources/build_deb_packages.sh"],
+        check=False,
     )
+    if result.returncode != 0:
+        echo_error("DD build script not found in GCS")
+        echo_info("Upload with: python -m cli upload-deps-sources")
+        raise typer.Exit(1)
+
+    # Submit workflow
+    workflow_yaml = f"""
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: dd-build-
+  namespace: argo
+spec:
+  entrypoint: build-dd
+  serviceAccountName: arvo-workflow-sa
+  templates:
+    - name: build-dd
+      templateRef:
+        name: arvo-deps-build
+        template: build-dd
+      arguments:
+        parameters:
+          - name: bucket
+            value: "{gke_config.bucket_name}"
+          - name: force-rebuild
+            value: "{str(force).lower()}"
+"""
+
+    # Write temp workflow file
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write(workflow_yaml)
+        temp_path = f.name
+
+    echo_info("Submitting DD build workflow...")
+    workflow_name = submit_workflow(temp_path, {})
+
+    Path(temp_path).unlink()
+
+    if workflow_name:
+        typer.echo()
+        echo_success(f"Workflow submitted: {workflow_name}")
+        typer.echo()
+        typer.echo("Monitor with:")
+        typer.echo(f"  python -m cli status {workflow_name}")
+        typer.echo(f"  python -m cli logs {workflow_name}")
+        typer.echo()
+        echo_warning("This build takes 2-4 hours. Check status periodically.")
+    else:
+        echo_error("Failed to submit workflow")
+        raise typer.Exit(1)
+
+
+def build_deps(
+    casr_only: Annotated[
+        bool, typer.Option("--casr-only", help="Only build CASR (skip DD)")
+    ] = False,
+    dd_only: Annotated[
+        bool, typer.Option("--dd-only", help="Only build DD (skip CASR)")
+    ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", "-f", help="Force rebuild even if unchanged")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show what would be done")
+    ] = False,
+) -> None:
+    """Build all dependencies (CASR and DD).
+
+    This submits Argo workflows to build:
+    - CASR: Crash Analysis and Severity Reporting binaries (~15-30 min)
+    - DD: Differential debugging deps (Python 3.7 + LLDB 13) (~2-4 hours)
+
+    Prerequisites:
+    1. Upload source files: python -m cli upload-deps-sources
+    2. Apply workflow template: kubectl apply -f argo/templates/deps-build-template.yaml
+    """
+    gke_config = GKEConfig.load()
+    if not gke_config.is_configured():
+        echo_error("GKE not configured. Run: python -m cli setup")
+        raise typer.Exit(1)
+
+    typer.echo("=" * 50)
+    typer.echo("Build Dependencies")
+    typer.echo("=" * 50)
+    typer.echo(f"Bucket:        gs://{gke_config.bucket_name}")
+    typer.echo(f"Force Rebuild: {force}")
+    typer.echo(f"Build CASR:    {not dd_only}")
+    typer.echo(f"Build DD:      {not casr_only}")
+    typer.echo()
+
+    if not casr_only and not dd_only:
+        echo_warning("Building both CASR (~30 min) and DD (~2-4 hours)")
+        typer.echo()
+
+    if not dd_only:
+        build_casr(force=force, dry_run=dry_run)
+        typer.echo()
+
+    if not casr_only:
+        build_dd(force=force, dry_run=dry_run)

@@ -284,12 +284,12 @@ def main() -> int:
     print_summary(result)
 
     # Return appropriate exit code
-    if result.is_success():
-        return 0
-    elif result.error or result.exception:
-        return 1
+    # Only fail (exit 1) on unexpected exceptions - all other outcomes are "graceful"
+    # The actual status (SUCCESS, PARTIAL, FAILED, NOT_SUPPORTED) is captured in result.json
+    if result.exception:
+        return 1  # Unexpected exception - infrastructure failure
     else:
-        return 2  # Partial success (patch generated but didn't fix)
+        return 0  # Graceful completion (patch may or may not have been generated)
 
 
 if __name__ == "__main__":

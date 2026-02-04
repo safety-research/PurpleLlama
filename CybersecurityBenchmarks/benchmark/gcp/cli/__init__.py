@@ -1,6 +1,4 @@
-"""
-ARVO Benchmark GCP CLI package.
-"""
+"""ARVO Benchmark CLI for Argo Workflows on GKE."""
 
 from .main import app, main
 

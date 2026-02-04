@@ -8,8 +8,28 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from .gcp_utils import get_script_dir, run_gsutil
+from .config import get_script_dir
 from .output import echo_warning
+
+
+def run_gsutil(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    """Run gsutil command.
+
+    Args:
+        args: Arguments to pass to gsutil
+        check: If True, raise on non-zero exit
+
+    Returns:
+        CompletedProcess with stdout/stderr
+    """
+    result = subprocess.run(
+        ["gsutil"] + args,
+        capture_output=True,
+        text=True,
+    )
+    if check and result.returncode != 0:
+        raise RuntimeError(f"gsutil failed: {result.stderr}")
+    return result
 
 
 # Path to autopatch build directory (relative to benchmark/gcp/)
@@ -277,7 +297,11 @@ def check_deps_need_rebuild(bucket: str, build_dir: Path) -> tuple[bool, str, bo
     """
     # Check if artifacts exist
     if not check_deps_artifacts_exist(bucket):
-        return True, "deps artifacts missing in GCS", True  # Assume DD needed if missing
+        return (
+            True,
+            "deps artifacts missing in GCS",
+            True,
+        )  # Assume DD needed if missing
 
     # Compare hashes
     local_casr_hash, local_dd_hash = compute_deps_source_hash(build_dir)

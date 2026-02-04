@@ -746,7 +746,9 @@ def runs_get_result(
             case_id = cases[0]
         else:
             echo_error(f"Run has {len(cases)} cases. Please specify --case-id")
-            echo_info(f"Available cases: {cases[:10]}{'...' if len(cases) > 10 else ''}")
+            echo_info(
+                f"Available cases: {cases[:10]}{'...' if len(cases) > 10 else ''}"
+            )
             raise typer.Exit(1)
     elif case_id not in cases:
         echo_error(f"Case {case_id} not found in this run")
@@ -817,7 +819,10 @@ def runs_get_result(
             typer.echo(result.stdout)
         else:
             echo_error(f"Failed to fetch result")
-            if "No URLs matched" in result.stderr or "not found" in result.stderr.lower():
+            if (
+                "No URLs matched" in result.stderr
+                or "not found" in result.stderr.lower()
+            ):
                 echo_info("The result file may not exist yet (job still running?)")
                 # Try to list what's available
                 parent_path = "/".join(gcs_path.rsplit("/", 1)[:-1]) + "/"

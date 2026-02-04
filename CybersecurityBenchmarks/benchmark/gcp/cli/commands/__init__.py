@@ -1,3 +1,1 @@
-"""
-CLI commands for the ARVO GCP CLI.
-"""
+"""CLI commands for Argo/GKE benchmark infrastructure."""

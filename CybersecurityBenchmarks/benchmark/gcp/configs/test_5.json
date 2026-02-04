@@ -1,0 +1,9 @@
+{
+  "cases": [12803, 10445, 11429, 1236, 1273],
+  "agents": ["gt", "claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"],
+  "fuzzing_duration": 600,
+  "max_concurrent_vms": 50,
+  "build_max_concurrent_vms": 5,
+  "eval_max_concurrent_vms": 5,
+  "gt_max_concurrent_vms": 5
+}

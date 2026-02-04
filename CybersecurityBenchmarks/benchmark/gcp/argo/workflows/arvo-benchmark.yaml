@@ -1,0 +1,195 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: arvo-benchmark-
+  namespace: argo
+spec:
+  entrypoint: benchmark-pipeline
+  serviceAccountName: arvo-workflow-sa
+
+  # Resource quota for parallel execution
+  parallelism: 100
+
+  # Propagate labels to all pods (for GCP resource tracking)
+  podMetadata:
+    labels:
+      owner: "{{workflow.labels.owner}}"
+      experiment: "{{workflow.parameters.experiment-id}}"
+    annotations:
+      owner: "{{workflow.labels.owner}}"
+
+  arguments:
+    parameters:
+      - name: cases
+        value: "[]"
+      - name: model
+        value: "claude-sonnet-4-20250514"
+      - name: experiment-id
+        value: "default"
+      - name: bucket
+        value: ""
+      - name: registry
+        value: ""
+      - name: build-version
+        value: "latest"
+      - name: fuzzing-duration
+        value: "300"
+      - name: run-gt
+        value: "true"
+      # Dependency build flags
+      - name: build-casr
+        value: "false"
+      - name: build-dd
+        value: "false"
+
+  templates:
+    # Main entry point - builds deps first, then fans out to all cases
+    - name: benchmark-pipeline
+      dag:
+        tasks:
+          # Build CASR (if needed)
+          - name: build-casr
+            when: "{{workflow.parameters.build-casr}} == true"
+            templateRef:
+              name: arvo-deps-build
+              template: build-casr
+            arguments:
+              parameters:
+                - name: bucket
+                  value: "{{workflow.parameters.bucket}}"
+                - name: force-rebuild
+                  value: "true"
+
+          # Build DD (if needed)
+          - name: build-dd
+            when: "{{workflow.parameters.build-dd}} == true"
+            templateRef:
+              name: arvo-deps-build
+              template: build-dd
+            arguments:
+              parameters:
+                - name: bucket
+                  value: "{{workflow.parameters.bucket}}"
+                - name: force-rebuild
+                  value: "true"
+
+          # Process all cases (depends on dep builds)
+          - name: process-case
+            dependencies: [build-casr, build-dd]
+            template: per-case-pipeline
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{item}}"
+            withParam: "{{workflow.parameters.cases}}"
+
+    # Per-case pipeline with fine-grained dependencies
+    - name: per-case-pipeline
+      inputs:
+        parameters:
+          - name: case-id
+      dag:
+        tasks:
+          # Build vulnerable image (for LLM patching)
+          - name: build-vul
+            templateRef:
+              name: arvo-build
+              template: build-vul
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{inputs.parameters.case-id}}"
+                - name: build-version
+                  value: "{{workflow.parameters.build-version}}"
+                - name: bucket
+                  value: "{{workflow.parameters.bucket}}"
+                - name: registry
+                  value: "{{workflow.parameters.registry}}"
+
+          # Build fixed image (for fuzzing)
+          - name: build-fix
+            templateRef:
+              name: arvo-build
+              template: build-fix
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{inputs.parameters.case-id}}"
+                - name: build-version
+                  value: "{{workflow.parameters.build-version}}"
+                - name: bucket
+                  value: "{{workflow.parameters.bucket}}"
+                - name: registry
+                  value: "{{workflow.parameters.registry}}"
+
+          # LLM Patch (depends on vul build)
+          - name: patch
+            dependencies: [build-vul]
+            templateRef:
+              name: arvo-patch
+              template: patch-case
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{inputs.parameters.case-id}}"
+                - name: model
+                  value: "{{workflow.parameters.model}}"
+                - name: experiment-id
+                  value: "{{workflow.parameters.experiment-id}}"
+                - name: bucket
+                  value: "{{workflow.parameters.bucket}}"
+                - name: registry
+                  value: "{{workflow.parameters.registry}}"
+                - name: build-version
+                  value: "{{workflow.parameters.build-version}}"
+
+          # LLM Fuzz (depends on patch AND fix build)
+          - name: fuzz-llm
+            dependencies: [patch, build-fix]
+            templateRef:
+              name: arvo-fuzz
+              template: fuzz-case
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{inputs.parameters.case-id}}"
+                - name: target
+                  value: "llm_patch"
+                - name: model
+                  value: "{{workflow.parameters.model}}"
+                - name: experiment-id
+                  value: "{{workflow.parameters.experiment-id}}"
+                - name: bucket
+                  value: "{{workflow.parameters.bucket}}"
+                - name: registry
+                  value: "{{workflow.parameters.registry}}"
+                - name: build-version
+                  value: "{{workflow.parameters.build-version}}"
+                - name: fuzzing-duration
+                  value: "{{workflow.parameters.fuzzing-duration}}"
+
+          # GT Fuzz (depends only on fix build - runs parallel with patch!)
+          - name: fuzz-gt
+            dependencies: [build-fix]
+            when: "{{workflow.parameters.run-gt}} == true"
+            templateRef:
+              name: arvo-fuzz
+              template: fuzz-case
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{inputs.parameters.case-id}}"
+                - name: target
+                  value: "ground_truth"
+                - name: model
+                  value: "gt"
+                - name: experiment-id
+                  value: "{{workflow.parameters.experiment-id}}"
+                - name: bucket
+                  value: "{{workflow.parameters.bucket}}"
+                - name: registry
+                  value: "{{workflow.parameters.registry}}"
+                - name: build-version
+                  value: "{{workflow.parameters.build-version}}"
+                - name: fuzzing-duration
+                  value: "{{workflow.parameters.fuzzing-duration}}"

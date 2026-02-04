@@ -6,6 +6,9 @@
 """
 CASR integration for crash analysis and deduplication.
 
+Uses casr-cluster-map to generate reports and cluster crashes in a single call.
+This matches the implementation in fuzzing_only_benchmark.py.
+
 CASR (Crash Analysis and Severity Rating) provides:
 1. Crash type classification (heap-buffer-overflow, use-after-free, etc.)
 2. Stack trace extraction
@@ -17,9 +20,10 @@ See: https://github.com/ispras/casr
 import json
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from .types import CrashInfo, CrashTimeline
 
@@ -30,100 +34,13 @@ def is_casr_available() -> bool:
     """Check if CASR tools are available."""
     try:
         result = subprocess.run(
-            ["casr-san", "--version"],
+            ["casr-cluster-map", "--version"],
             capture_output=True,
             timeout=10,
         )
         return result.returncode == 0
     except Exception:
         return False
-
-
-def analyze_crash(
-    crash_file: str,
-    binary_path: str,
-    output_dir: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Analyze a single crash file using CASR.
-
-    Args:
-        crash_file: Path to the crash input file
-        binary_path: Path to the fuzzer binary
-        output_dir: Optional directory for CASR reports
-
-    Returns:
-        Dictionary with crash analysis results
-    """
-    result = {
-        "crash_type": "unknown",
-        "severity": "unknown",
-        "stack_trace": [],
-        "casr_report": {},
-    }
-
-    if not is_casr_available():
-        LOG.warning("CASR not available, skipping crash analysis")
-        return result
-
-    try:
-        # Run casr-san to analyze the crash
-        report_path = None
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-            crash_name = Path(crash_file).name
-            report_path = os.path.join(output_dir, f"{crash_name}.casrep")
-
-        cmd = [
-            "casr-san",
-            "-i",
-            crash_file,
-            "-o",
-            report_path or "/dev/stdout",
-            "--",
-            binary_path,
-            crash_file,
-        ]
-
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-
-        if proc.returncode == 0:
-            # Parse CASR report
-            if report_path and os.path.exists(report_path):
-                with open(report_path) as f:
-                    casr_data = json.load(f)
-            else:
-                casr_data = json.loads(proc.stdout) if proc.stdout else {}
-
-            result["casr_report"] = casr_data
-            result["crash_type"] = casr_data.get("CrashSeverity", {}).get(
-                "Type", "unknown"
-            )
-            result["severity"] = casr_data.get("CrashSeverity", {}).get(
-                "ShortDescription", "unknown"
-            )
-
-            # Extract stack trace
-            if "Stacktrace" in casr_data:
-                result["stack_trace"] = [
-                    frame.get("function", "unknown")
-                    for frame in casr_data["Stacktrace"][:10]
-                ]
-
-        else:
-            LOG.warning(f"CASR analysis failed for {crash_file}: {proc.stderr}")
-
-    except subprocess.TimeoutExpired:
-        LOG.warning(f"CASR analysis timed out for {crash_file}")
-    except Exception as e:
-        LOG.warning(f"CASR analysis error for {crash_file}: {e}")
-
-    return result
 
 
 def get_all_crash_files(crash_dir: str) -> List[Path]:
@@ -154,89 +71,193 @@ def get_all_crash_files(crash_dir: str) -> List[Path]:
     return crash_files
 
 
-def cluster_crashes(
-    crash_dir: str,
+def run_casr_cluster_map(
+    crashes_dir: str,
     output_dir: str,
-) -> Dict[str, List[str]]:
+    binary_path: str,
+    timeout_per_crash: int = 120,
+    jobs: int = 4,
+) -> Dict[str, str]:
     """
-    Cluster crashes using CASR for deduplication.
+    Run casr-cluster-map to generate reports and cluster crashes.
 
-    Note: CASR now handles ALL crash types including OOM and timeout.
-    OOM/timeout crashes don't produce stack traces, so CASR creates
-    pseudo-clusters for them (e.g., all OOMs in one cluster).
+    This matches fuzzing_only_benchmark.py lines 1228-1375.
 
     Args:
-        crash_dir: Directory containing crash files
-        output_dir: Directory for CASR cluster output
+        crashes_dir: Directory containing crash files
+        output_dir: Directory for CASR reports and clusters
+        binary_path: Path to the fuzzer binary
+        timeout_per_crash: Timeout in seconds per crash (default: 120)
+        jobs: Number of parallel jobs (default: 4)
 
     Returns:
-        Dictionary mapping cluster_id to list of crash files
+        Dict mapping crash filename to cluster ID (e.g., "crash-abc123" -> "cl1")
     """
-    clusters: Dict[str, List[str]] = {}
+    crash_to_cluster: Dict[str, str] = {}
 
-    # Get all crash files (crash-*, oom-*, timeout-*, leak-*)
-    all_crashes = get_all_crash_files(crash_dir)
-
-    if not all_crashes:
-        return clusters
+    # Check for crash files
+    crash_files = get_all_crash_files(crashes_dir)
+    if not crash_files:
+        LOG.info("No crash files to cluster")
+        return crash_to_cluster
 
     # Count crash types for logging
-    oom_count = sum(1 for f in all_crashes if f.name.startswith("oom-"))
-    timeout_count = sum(1 for f in all_crashes if f.name.startswith("timeout-"))
-    regular_count = len(all_crashes) - oom_count - timeout_count
+    oom_count = sum(1 for f in crash_files if f.name.startswith("oom-"))
+    timeout_count = sum(1 for f in crash_files if f.name.startswith("timeout-"))
+    leak_count = sum(1 for f in crash_files if f.name.startswith("leak-"))
+    regular_count = len(crash_files) - oom_count - timeout_count - leak_count
 
     LOG.info(
-        f"Clustering {len(all_crashes)} crashes "
-        f"({regular_count} regular, {oom_count} OOM, {timeout_count} timeout)"
+        f"Processing {len(crash_files)} crashes with CASR "
+        f"({regular_count} regular, {oom_count} OOM, {timeout_count} timeout, {leak_count} leak)"
     )
 
     if not is_casr_available():
-        LOG.warning("CASR not available, skipping clustering")
+        LOG.warning("casr-cluster-map not available, skipping clustering")
         # Return each crash as its own cluster
-        for crash_file in all_crashes:
-            clusters[crash_file.name] = [str(crash_file)]
-        return clusters
+        for i, crash_file in enumerate(crash_files, 1):
+            crash_to_cluster[crash_file.name] = f"cl{i}"
+        return crash_to_cluster
+
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    mapping_file = os.path.join(output_dir, "crash_mapping.json")
+
+    # Build casr-cluster-map command
+    # Matching fuzzing_only_benchmark.py lines 1228-1258
+    cmd = [
+        "casr-cluster-map",
+        "-i", crashes_dir,
+        "-o", output_dir,
+        "-t", str(timeout_per_crash),
+        "-j", str(jobs),
+        "--mapping", mapping_file,
+        "--use-logs",  # For libFuzzer log-based clustering
+        "--",
+        binary_path,
+        "@@",  # Placeholder for crash input file
+    ]
+
+    LOG.info(f"Running CASR clustering: {' '.join(cmd)}")
 
     try:
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Run casr-cluster on the crash directory
-        # CASR will handle all crash types, creating pseudo-clusters for OOM/timeout
-        cmd = [
-            "casr-cluster",
-            "-c",
-            crash_dir,
-            "-o",
-            output_dir,
-        ]
-
-        proc = subprocess.run(
+        result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=300,  # 5 minutes total timeout
         )
 
-        if proc.returncode == 0:
-            # Parse cluster output
-            cluster_file = os.path.join(output_dir, "clusters.json")
-            if os.path.exists(cluster_file):
-                with open(cluster_file) as f:
-                    cluster_data = json.load(f)
-                    for cluster_id, crash_list in cluster_data.items():
-                        clusters[cluster_id] = crash_list
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+
+        # Save CASR output to log file
+        casr_log_file = os.path.join(output_dir, "casr_output.log")
+        with open(casr_log_file, "w") as f:
+            f.write(f"=== CASR Clustering (casr-cluster-map) ===\n")
+            f.write(f"Command: {' '.join(cmd)}\n")
+            f.write(f"Return code: {result.returncode}\n\n")
+            f.write("=== STDOUT ===\n")
+            f.write(stdout)
+            f.write("\n\n=== STDERR ===\n")
+            f.write(stderr)
+        LOG.info(f"CASR output saved to {casr_log_file}")
+
+        if result.returncode != 0:
+            LOG.warning(f"CASR clustering returned non-zero exit code {result.returncode}")
+
+            # Case 1: Only 1 unique crash type - this is OK
+            if "Not enough valid reports" in stderr or "Less than 2" in stderr:
+                LOG.info("CASR found only 1 unique stacktrace type")
+                # Continue - CASR may still produce a valid mapping
+
+            # Case 2: CASR couldn't reproduce crashes
+            elif "No reports generated" in stderr or "Program terminated (no crash)" in stderr:
+                LOG.warning(f"CASR failed to reproduce crashes: {stderr}")
+
+            # Case 3: Unknown error
+            else:
+                LOG.warning(f"CASR clustering failed: {stderr}")
+
+        # Parse JSON mapping file
+        crash_to_cluster = parse_casr_json_mapping(mapping_file)
+
+        if crash_to_cluster:
+            num_clusters = len(set(crash_to_cluster.values()))
+            LOG.info(f"CASR mapped {len(crash_to_cluster)} crashes to {num_clusters} clusters")
         else:
-            LOG.warning(f"CASR clustering failed: {proc.stderr}")
             # Fallback: each crash is its own cluster
-            for crash_file in all_crashes:
-                clusters[crash_file.name] = [str(crash_file)]
+            LOG.warning("CASR produced no mapping, using fallback (each crash = own cluster)")
+            for i, crash_file in enumerate(crash_files, 1):
+                crash_to_cluster[crash_file.name] = f"cl{i}"
 
     except subprocess.TimeoutExpired:
-        LOG.warning("CASR clustering timed out")
+        LOG.warning("CASR clustering timed out after 300s")
+        # Fallback
+        for i, crash_file in enumerate(crash_files, 1):
+            crash_to_cluster[crash_file.name] = f"cl{i}"
+
     except Exception as e:
         LOG.warning(f"CASR clustering error: {e}")
+        # Fallback
+        for i, crash_file in enumerate(crash_files, 1):
+            crash_to_cluster[crash_file.name] = f"cl{i}"
 
-    return clusters
+    return crash_to_cluster
+
+
+def parse_casr_json_mapping(mapping_file: str) -> Dict[str, str]:
+    """
+    Parse JSON mapping file from casr-cluster-map tool.
+
+    Matching fuzzing_only_benchmark.py lines 1559-1638.
+
+    JSON format from casr-cluster-map:
+    {
+        "mappings": [{"crash": "crash-abc123", "cluster_id": 2}, ...],
+        "clusters": {"1": [...], "2": [...]},
+        "num_clusters": N
+    }
+
+    Args:
+        mapping_file: Path to crash_mapping.json file
+
+    Returns:
+        Dict mapping crash filename to cluster ID (e.g., "crash-abc123" -> "cl1")
+    """
+    crash_to_cluster: Dict[str, str] = {}
+
+    if not os.path.exists(mapping_file):
+        LOG.warning(f"CASR mapping file not found: {mapping_file}")
+        return crash_to_cluster
+
+    try:
+        with open(mapping_file) as f:
+            mapping_data = json.load(f)
+
+        # Build crash-to-cluster mapping from the mappings array
+        # Each mapping has: {"crash": "crash-abc123", "cluster_id": 2, "is_representative": bool}
+        mappings = mapping_data.get("mappings", [])
+        for mapping in mappings:
+            crash_name = mapping.get("crash", "")
+            cluster_int = mapping.get("cluster_id", 0)
+            if crash_name and cluster_int > 0:
+                crash_to_cluster[crash_name] = f"cl{cluster_int}"
+
+        num_clusters = mapping_data.get("num_clusters", 0)
+        LOG.info(f"Loaded mapping for {len(crash_to_cluster)} crashes across {num_clusters} clusters")
+
+        # Log cluster distribution
+        clusters = mapping_data.get("clusters", {})
+        for cluster_id, crash_list in sorted(clusters.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+            LOG.debug(f"Cluster {cluster_id} has {len(crash_list)} crashes")
+
+    except json.JSONDecodeError as e:
+        LOG.warning(f"Failed to parse CASR mapping JSON: {e}")
+    except Exception as e:
+        LOG.warning(f"Error reading CASR mapping: {e}")
+
+    return crash_to_cluster
 
 
 def deduplicate_timeline(
@@ -247,8 +268,7 @@ def deduplicate_timeline(
     """
     Deduplicate crashes in a timeline using CASR.
 
-    Note: OOM and timeout crashes are handled separately since they don't produce
-    stack traces that CASR can analyze. They are assigned to special pseudo-clusters.
+    Uses casr-cluster-map to analyze and cluster all crashes in one call.
 
     Args:
         timeline: CrashTimeline with crashes to deduplicate
@@ -256,7 +276,7 @@ def deduplicate_timeline(
         output_dir: Directory for CASR reports
 
     Returns:
-        Updated CrashTimeline with cluster IDs and crash types
+        Updated CrashTimeline with cluster IDs
     """
     if not timeline.crashes:
         return timeline
@@ -275,52 +295,38 @@ def deduplicate_timeline(
         f"({regular_count} regular, {oom_count} OOM, {timeout_count} timeout, {leak_count} leak)"
     )
 
-    # Analyze each crash with CASR (may refine crash_type for regular crashes)
-    # Note: OOM/timeout crashes don't have useful stack traces
+    # Create temp directory with crash files for clustering
+    crash_files_dir = casr_dir / "crashes"
+    crash_files_dir.mkdir(exist_ok=True)
+
+    # Copy crash files to temp directory
     for crash in timeline.crashes:
-        # Skip CASR analysis for OOM/timeout - they don't have stack traces
-        if crash.crash_type in ("oom", "timeout"):
-            # Keep the filename-derived type, no stack trace to analyze
-            crash.stack_trace = []
-            crash.casr_report = {}
-            continue
+        if os.path.exists(crash.corpus_file):
+            # Use crash_id as filename to match back later
+            dest = crash_files_dir / crash.crash_id
+            shutil.copy2(crash.corpus_file, dest)
 
-        analysis = analyze_crash(
-            crash.corpus_file,
-            binary_path,
-            str(casr_dir),
-        )
-        # CASR may provide more specific type (e.g., "heap-buffer-overflow")
-        if analysis["crash_type"] != "unknown":
-            crash.crash_type = analysis["crash_type"]
-        crash.stack_trace = analysis["stack_trace"]
-        crash.casr_report = analysis["casr_report"]
+            # Also copy log file if it exists (for --use-logs)
+            log_file = crash.corpus_file + ".log"
+            if os.path.exists(log_file):
+                logs_dir = crash_files_dir / "logs"
+                logs_dir.mkdir(exist_ok=True)
+                shutil.copy2(log_file, logs_dir / (crash.crash_id + ".log"))
 
-    # Cluster crashes if we have multiple
-    if len(timeline.crashes) > 1:
-        # Create temp directory with crash files for clustering
-        crash_files_dir = casr_dir / "crashes"
-        crash_files_dir.mkdir(exist_ok=True)
+    # Run casr-cluster-map
+    crash_to_cluster = run_casr_cluster_map(
+        crashes_dir=str(crash_files_dir),
+        output_dir=str(casr_dir / "output"),
+        binary_path=binary_path,
+    )
 
-        for crash in timeline.crashes:
-            if os.path.exists(crash.corpus_file):
-                dest = crash_files_dir / crash.crash_id
-                subprocess.run(["cp", crash.corpus_file, str(dest)], check=False)
-
-        clusters = cluster_crashes(str(crash_files_dir), str(casr_dir / "clusters"))
-
-        # Assign cluster IDs
-        crash_to_cluster = {}
-        for cluster_id, crash_files in clusters.items():
-            for crash_file in crash_files:
-                crash_name = Path(crash_file).name
-                crash_to_cluster[crash_name] = cluster_id
-
-        for crash in timeline.crashes:
-            crash.cluster_id = crash_to_cluster.get(crash.crash_id, crash.crash_id)
-    else:
-        # Single crash is its own cluster
-        for crash in timeline.crashes:
+    # Assign cluster IDs to crashes
+    for crash in timeline.crashes:
+        cluster_id = crash_to_cluster.get(crash.crash_id)
+        if cluster_id:
+            crash.cluster_id = cluster_id
+        else:
+            # Fallback: use crash_id as cluster_id
             crash.cluster_id = crash.crash_id
 
     return timeline

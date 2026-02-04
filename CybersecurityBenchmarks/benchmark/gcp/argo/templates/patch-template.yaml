@@ -1,0 +1,161 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: arvo-patch
+  namespace: argo
+spec:
+  templates:
+    - name: patch-case
+      inputs:
+        parameters:
+          - name: case-id
+          - name: model
+          - name: experiment-id
+          - name: bucket
+          - name: registry
+          - name: build-version
+      # Outputs for memoization and artifact upload
+      outputs:
+        parameters:
+          - name: patch-key
+            value: "{{inputs.parameters.case-id}}-{{inputs.parameters.model}}-{{inputs.parameters.experiment-id}}"
+        artifacts:
+          - name: result
+            path: /output/result.json
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/result.json"
+          - name: patch
+            path: /output/patch.txt
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/patch.txt"
+          - name: chat
+            path: /output/chat.md
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/chat.md"
+          - name: rebuilt-binary
+            path: /output/rebuilt_binary
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/rebuilt_binary"
+          - name: success-marker
+            path: /output/_SUCCESS
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/_SUCCESS"
+      memoize:
+        key: "patch-{{inputs.parameters.case-id}}-{{inputs.parameters.model}}-{{inputs.parameters.experiment-id}}"
+        cache:
+          configMap:
+            name: arvo-patch-cache
+        maxAge: "720h"
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "work"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+        workload-type: work
+      serviceAccountName: arvo-workflow-sa
+      retryStrategy:
+        limit: 3
+        retryPolicy: "Always"
+        expression: "lastRetry.message matches 'imminent node shutdown|pod deleted|Evicted|Preempted'"
+        backoff:
+          duration: "30s"
+          factor: 2
+          maxDuration: "5m"
+
+      initContainers:
+        - name: fetch-runtime
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              gsutil cp gs://{{inputs.parameters.bucket}}/agent-runtime/agent-runtime.tar.gz /tmp/
+              tar -xzf /tmp/agent-runtime.tar.gz -C /agent-runtime --strip-components=1
+              chmod +x /agent-runtime/bin/* 2>/dev/null || true
+          volumeMounts:
+            - name: agent-runtime
+              mountPath: /agent-runtime
+
+      container:
+        image: "{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{inputs.parameters.build-version}}"
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+            CASE_ID="{{inputs.parameters.case-id}}"
+            MODEL="{{inputs.parameters.model}}"
+
+            /agent-runtime/bin/agent-entrypoint.sh python3 -m agent.main \
+              --case-id ${CASE_ID} \
+              --agent autopatchbench \
+              --model ${MODEL} \
+              --output-dir /output \
+              --verbose
+
+            # Copy rebuilt binary to output if crash was fixed (Argo artifacts handle upload)
+            if grep -q '"crash_fixed": true' /output/result.json 2>/dev/null; then
+              FUZZER_BINARY=$(cat /bin/arvo 2>/dev/null | grep -oE '/out/[a-zA-Z0-9_.-]+' | head -1)
+              if [ -n "${FUZZER_BINARY}" ] && [ -f "${FUZZER_BINARY}" ]; then
+                cp "${FUZZER_BINARY}" /output/rebuilt_binary
+              fi
+            fi
+
+            # Write completion marker (Argo artifacts handle upload)
+            # This marker is uploaded last, so its presence indicates all results uploaded successfully
+            cat > /output/_SUCCESS << EOF
+            {
+              "completed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "pod": "{{pod.name}}",
+              "case_id": "${CASE_ID}",
+              "model": "${MODEL}"
+            }
+            EOF
+        env:
+          - name: ANTHROPIC_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: anthropic-api-key
+                key: key
+          - name: PYTHONPATH
+            value: "/agent-runtime"
+        volumeMounts:
+          - name: agent-runtime
+            mountPath: /agent-runtime
+            readOnly: true
+          - name: output
+            mountPath: /output
+        resources:
+          requests:
+            cpu: "1.8"
+            memory: "6G"
+          limits:
+            cpu: "1.8"
+            memory: "6G"
+
+      volumes:
+        - name: agent-runtime
+          emptyDir: {}
+        - name: output
+          emptyDir: {}

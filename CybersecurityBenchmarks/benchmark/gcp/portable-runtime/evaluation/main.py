@@ -134,7 +134,6 @@ async def run_fuzzing(
         result.timeline = timeline
         result.total_crashes = len(timeline.crashes)
         result.unique_crashes = timeline.unique_crashes()
-        result.total_executions = timeline.total_executions
         result.duration_seconds = timeline.duration_seconds
         result.reproduced_original = timeline.reproduced_original
         result.time_to_original_crash = timeline.time_to_original_crash
@@ -171,7 +170,6 @@ def print_summary(result: FuzzingResult) -> None:
     print(f"Target:           {result.target.value}")
     print(f"Fuzzer:           {result.fuzzer_type.value}")
     print(f"Duration:         {result.duration_seconds:.1f}s")
-    print(f"Total Executions: {result.total_executions:,}")
     print(f"Total Crashes:    {result.total_crashes}")
     print(f"Unique Crashes:   {result.unique_crashes}")
     print(f"Reproduced PoC:   {result.reproduced_original}")
@@ -285,8 +283,9 @@ def main() -> int:
     # Print summary
     print_summary(result)
 
-    # Return code based on whether we found crashes
-    return 0 if result.total_crashes == 0 else 1
+    # Return 0 on success - crashes found is a valid result, not an error
+    # Only return 1 if there was an actual error during fuzzing
+    return 1 if result.error else 0
 
 
 if __name__ == "__main__":

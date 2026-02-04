@@ -1,0 +1,10 @@
+{
+  "project_id": "fellows-safety-research",
+  "region": "us-central1",
+  "zone": "us-central1-a",
+  "cluster_name": "camyang-arvo-cluster",
+  "bucket_name": "fellows-safety-research-camyang-arvo-benchmark",
+  "artifact_registry": "us-central1-docker.pkg.dev/fellows-safety-research/arvo",
+  "gcp_service_account": "camyang-arvo-runner@fellows-safety-research.iam.gserviceaccount.com",
+  "secret_name": "anthropic-api-key"
+}

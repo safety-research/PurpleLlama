@@ -1,0 +1,190 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: arvo-build
+  namespace: argo
+spec:
+  templates:
+    - name: build-vul
+      inputs:
+        parameters:
+          - name: case-id
+          - name: build-version
+          - name: bucket
+          - name: registry
+      # Outputs required for memoization to work correctly (Argo < 3.5 requirement)
+      outputs:
+        parameters:
+          - name: image
+            value: "{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{inputs.parameters.build-version}}"
+      memoize:
+        key: "build-vul-{{inputs.parameters.case-id}}-{{inputs.parameters.build-version}}"
+        cache:
+          configMap:
+            name: arvo-build-cache
+        maxAge: "720h"
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "build"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+        workload-type: build
+      serviceAccountName: arvo-workflow-sa
+      retryStrategy:
+        limit: 3
+        retryPolicy: "Always"
+        expression: "lastRetry.message matches 'imminent node shutdown|pod deleted|Evicted|Preempted'"
+        backoff:
+          duration: "30s"
+          factor: 2
+          maxDuration: "5m"
+      container:
+        image: gcr.io/kaniko-project/executor:latest
+        args:
+          - "--dockerfile=/workspace/Dockerfile"
+          - "--context=/workspace"
+          - "--destination={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{inputs.parameters.build-version}}"
+          - "--destination={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:latest"
+          - "--cache=true"
+          - "--cache-repo={{inputs.parameters.registry}}/kaniko-cache"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+          - name: docker-config
+            mountPath: /kaniko/.docker
+            readOnly: true
+        resources:
+          requests:
+            cpu: "8"
+            memory: "16G"
+          limits:
+            cpu: "8"
+            memory: "16G"
+      initContainers:
+        - name: prepare-build-context
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              CASE_ID="{{inputs.parameters.case-id}}"
+              BUCKET="{{inputs.parameters.bucket}}"
+
+              # Download Dockerfile template and build assets
+              gsutil cp gs://${BUCKET}/build-assets/dockerfile_vul_template /workspace/
+              gsutil cp -r gs://${BUCKET}/build-assets/libfuzzer-modern/ /workspace/ || true
+
+              # Generate Dockerfile from template
+              sed "s|{ARVO_ID}|${CASE_ID}|g" /workspace/dockerfile_vul_template > /workspace/Dockerfile
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        # Docker Hub credentials for Kaniko to pull n132/arvo base images
+        - name: docker-config
+          secret:
+            secretName: dockerhub-registry
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+            optional: true
+
+    - name: build-fix
+      inputs:
+        parameters:
+          - name: case-id
+          - name: build-version
+          - name: bucket
+          - name: registry
+      # Outputs required for memoization to work correctly (Argo < 3.5 requirement)
+      outputs:
+        parameters:
+          - name: image
+            value: "{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{inputs.parameters.build-version}}"
+      memoize:
+        key: "build-fix-{{inputs.parameters.case-id}}-{{inputs.parameters.build-version}}"
+        cache:
+          configMap:
+            name: arvo-build-cache
+        maxAge: "720h"
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "build"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+        workload-type: build
+      serviceAccountName: arvo-workflow-sa
+      retryStrategy:
+        limit: 3
+        retryPolicy: "Always"
+        expression: "lastRetry.message matches 'imminent node shutdown|pod deleted|Evicted|Preempted'"
+        backoff:
+          duration: "30s"
+          factor: 2
+          maxDuration: "5m"
+      container:
+        image: gcr.io/kaniko-project/executor:latest
+        args:
+          - "--dockerfile=/workspace/Dockerfile"
+          - "--context=/workspace"
+          - "--destination={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{inputs.parameters.build-version}}"
+          - "--destination={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:latest"
+          - "--cache=true"
+          - "--cache-repo={{inputs.parameters.registry}}/kaniko-cache"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+          - name: docker-config
+            mountPath: /kaniko/.docker
+            readOnly: true
+        resources:
+          requests:
+            cpu: "8"
+            memory: "16G"
+          limits:
+            cpu: "8"
+            memory: "16G"
+      initContainers:
+        - name: prepare-build-context
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              CASE_ID="{{inputs.parameters.case-id}}"
+              BUCKET="{{inputs.parameters.bucket}}"
+
+              # Download Dockerfile template and build assets
+              gsutil cp gs://${BUCKET}/build-assets/dockerfile_fuzzing_template /workspace/
+              gsutil cp gs://${BUCKET}/build-assets/casr-binaries.tar.gz /workspace/ || true
+              gsutil cp gs://${BUCKET}/build-assets/libc6_2.35-0ubuntu3_amd64.deb /workspace/ || true
+              gsutil cp -r gs://${BUCKET}/build-assets/libfuzzer-modern/ /workspace/ || true
+              gsutil cp gs://${BUCKET}/build-assets/differential-debugging-deps-16.04.deb /workspace/ || true
+              gsutil cp gs://${BUCKET}/build-assets/differential-debugging-deps-20.04.deb /workspace/ || true
+              gsutil cp gs://${BUCKET}/build-assets/casr_cluster.py /workspace/ || true
+              gsutil cp -r gs://${BUCKET}/build-assets/microsnapshots/ /workspace/ || true
+
+              # Generate Dockerfile from template
+              sed "s|{ARVO_ID}|${CASE_ID}|g" /workspace/dockerfile_fuzzing_template > /workspace/Dockerfile
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        # Docker Hub credentials for Kaniko to pull n132/arvo base images
+        - name: docker-config
+          secret:
+            secretName: dockerhub-registry
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+            optional: true

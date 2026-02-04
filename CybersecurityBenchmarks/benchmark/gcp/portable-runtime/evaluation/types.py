@@ -7,7 +7,7 @@
 Data types for the evaluation (fuzzing) module.
 
 Mirrors the types from fuzzing_types.py for:
-- Crash timeline tracking with timestamps and execution counts
+- Crash timeline tracking with timestamps
 - CASR-based crash deduplication
 - Fuzzer configuration
 """
@@ -40,7 +40,6 @@ class CrashInfo:
     crash_id: str
     corpus_file: str
     first_seen_time: float  # Seconds since fuzzing started
-    first_seen_executions: int
     target: FuzzingTarget
     crash_type: str  # CASR-determined type (e.g., "heap-buffer-overflow")
     stack_trace: List[str] = field(default_factory=list)
@@ -72,7 +71,6 @@ class CrashTimeline:
     model: str
     crashes: List[CrashInfo] = field(default_factory=list)
     duration_seconds: float = 0.0
-    total_executions: int = 0
 
     # Key metrics
     time_to_original_crash: Optional[float] = None
@@ -102,7 +100,6 @@ class CrashTimeline:
             "model": self.model,
             "crashes": [c.to_dict() for c in self.crashes],
             "duration_seconds": self.duration_seconds,
-            "total_executions": self.total_executions,
             "time_to_original_crash": self.time_to_original_crash,
             "reproduced_original": self.reproduced_original,
             "total_crashes": len(self.crashes),
@@ -121,12 +118,10 @@ class CrashTimeline:
             "case_id": self.case_id,
             "model": self.model,
             "duration_seconds": self.duration_seconds,
-            "total_executions": self.total_executions,
             "crashes": [
                 {
                     "crash_id": c.crash_id,
                     "first_seen_time": c.first_seen_time,
-                    "first_seen_executions": c.first_seen_executions,
                     "cluster_id": c.cluster_id,
                 }
                 for c in self.crashes
@@ -147,7 +142,6 @@ class CrashTimeline:
             case_id=data["case_id"],
             model=data.get("model", "ground_truth"),
             duration_seconds=data.get("duration_seconds", 0.0),
-            total_executions=data.get("total_executions", 0),
         )
 
         # Restore summary fields if present
@@ -161,7 +155,6 @@ class CrashTimeline:
                 crash_id=crash_data["crash_id"],
                 corpus_file=crash_data.get("corpus_file", crash_data["crash_id"]),
                 first_seen_time=crash_data["first_seen_time"],
-                first_seen_executions=crash_data.get("first_seen_executions", 0),
                 target=timeline.target,
                 crash_type=crash_data.get("crash_type", "unknown"),
                 cluster_id=crash_data.get("cluster_id"),
@@ -271,7 +264,6 @@ class FuzzingResult:
     # Summary metrics
     total_crashes: int = 0
     unique_crashes: int = 0
-    total_executions: int = 0
     reproduced_original: bool = False
     time_to_original_crash: Optional[float] = None
 
@@ -291,7 +283,6 @@ class FuzzingResult:
             "timeline": self.timeline.to_dict() if self.timeline else None,
             "total_crashes": self.total_crashes,
             "unique_crashes": self.unique_crashes,
-            "total_executions": self.total_executions,
             "reproduced_original": self.reproduced_original,
             "time_to_original_crash": self.time_to_original_crash,
             "error": self.error,

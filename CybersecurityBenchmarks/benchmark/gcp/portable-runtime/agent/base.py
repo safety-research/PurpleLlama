@@ -85,6 +85,11 @@ class AgentResult:
     # Chat history (for debugging)
     chat_history: List[str] = field(default_factory=list)
 
+    # Indicates if rebuilt_binary contains a successful patch
+    # True = patched binary that fixes the crash
+    # False = original vulnerable binary (baseline for fuzzing)
+    patch_successful: bool = False
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -105,6 +110,7 @@ class AgentResult:
             "crash_fixed": self.crash_fixed,
             "fuzzer_binary_path": self.fuzzer_binary_path,
             "error": self.error,
+            "patch_successful": self.patch_successful,
         }
 
     def is_success(self) -> bool:
@@ -216,10 +222,11 @@ class BaseAgent(ABC):
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save rebuilt binary if crash was fixed (do this BEFORE saving result.json
-        # so the fuzzer_binary_path is included in the result)
-        if self.result.crash_fixed:
-            self._save_rebuilt_binary()
+        # Always save a binary for fuzzing (do this BEFORE saving result.json
+        # so the fuzzer_binary_path and patch_successful are included in the result)
+        # - If crash_fixed: save the patched binary (patch_successful=True)
+        # - Otherwise: save the original binary as baseline (patch_successful=False)
+        self._save_binary_for_fuzzing()
 
         # Save result JSON
         result_file = self.output_dir / "result.json"
@@ -332,32 +339,41 @@ class BaseAgent(ABC):
         LOG.error("Could not find fuzzer binary")
         return None
 
-    def _save_rebuilt_binary(self) -> bool:
+    def _save_binary_for_fuzzing(self) -> bool:
         """
-        Copy the rebuilt fuzzer binary to output directory if crash was fixed.
+        Always copy a fuzzer binary to output directory for downstream fuzzing.
+
+        - If crash_fixed: copies the patched binary (patch_successful=True)
+        - Otherwise: copies the original vulnerable binary as baseline (patch_successful=False)
+
+        This ensures the fuzz-llm step always has a binary to fuzz, enabling
+        baseline fuzzing data collection even when patching fails.
 
         Returns:
             True if binary was saved successfully, False otherwise
         """
         import shutil
 
-        if not self.result.crash_fixed:
-            LOG.debug("Crash not fixed, skipping binary save")
-            return False
-
         # Find the binary path
         binary_path = self._find_fuzzer_binary()
         if not binary_path:
             LOG.warning("Could not find fuzzer binary to save")
+            self.result.patch_successful = False
             return False
 
         self.result.fuzzer_binary_path = binary_path
+
+        # Set patch_successful based on whether the patch actually fixed the crash
+        self.result.patch_successful = self.result.crash_fixed
 
         # Copy to output directory
         dest_path = self.output_dir / "rebuilt_binary"
         try:
             shutil.copy2(binary_path, dest_path)
-            LOG.info(f"Saved rebuilt binary to {dest_path}")
+            if self.result.patch_successful:
+                LOG.info(f"Saved patched binary to {dest_path}")
+            else:
+                LOG.info(f"Saved original binary (baseline) to {dest_path}")
             return True
         except Exception as e:
             LOG.error(f"Failed to copy binary: {e}")

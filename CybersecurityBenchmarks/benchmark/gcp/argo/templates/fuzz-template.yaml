@@ -1,0 +1,168 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: arvo-fuzz
+  namespace: argo
+spec:
+  templates:
+    - name: fuzz-case
+      inputs:
+        parameters:
+          - name: case-id
+          - name: target # "ground_truth" or "llm_patch"
+          - name: model
+          - name: experiment-id
+          - name: bucket
+          - name: registry
+          - name: build-version
+          - name: fuzzing-duration
+      outputs:
+        artifacts:
+          - name: fuzzing-result
+            path: /output/fuzzing_result_{{inputs.parameters.target}}.json
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/fuzzing_result.json"
+          - name: crashes
+            path: /output/crashes.json
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/crashes.json"
+          - name: success-marker
+            path: /output/_SUCCESS
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/_SUCCESS"
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "work"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+        workload-type: work
+      serviceAccountName: arvo-workflow-sa
+      retryStrategy:
+        limit: 3
+        retryPolicy: "Always"
+        expression: "lastRetry.message matches 'imminent node shutdown|pod deleted|Evicted|Preempted'"
+        backoff:
+          duration: "30s"
+          factor: 2
+          maxDuration: "5m"
+
+      initContainers:
+        - name: fetch-runtime
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              gsutil cp gs://{{inputs.parameters.bucket}}/agent-runtime/agent-runtime.tar.gz /tmp/
+              tar -xzf /tmp/agent-runtime.tar.gz -C /agent-runtime --strip-components=1
+              chmod +x /agent-runtime/bin/* 2>/dev/null || true
+          volumeMounts:
+            - name: agent-runtime
+              mountPath: /agent-runtime
+
+        # For LLM patches: download the rebuilt binary from patch results
+        - name: fetch-binary
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              TARGET="{{inputs.parameters.target}}"
+              if [ "${TARGET}" = "llm_patch" ]; then
+                BUCKET="{{inputs.parameters.bucket}}"
+                EXPERIMENT_ID="{{inputs.parameters.experiment-id}}"
+                CASE_ID="{{inputs.parameters.case-id}}"
+                MODEL="{{inputs.parameters.model}}"
+                
+                # Download rebuilt binary from patch results
+                gsutil cp gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/${MODEL}/rebuilt_binary /binary/rebuilt_binary || {
+                  echo "Warning: Could not download rebuilt binary"
+                  exit 0
+                }
+                chmod +x /binary/rebuilt_binary
+              fi
+          volumeMounts:
+            - name: binary
+              mountPath: /binary
+
+      container:
+        image: "{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{inputs.parameters.build-version}}"
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+            TARGET="{{inputs.parameters.target}}"
+            CASE_ID="{{inputs.parameters.case-id}}"
+            MODEL="{{inputs.parameters.model}}"
+
+            # Build command
+            CMD="/agent-runtime/bin/agent-entrypoint.sh python3 -m evaluation.main \
+              --case-id ${CASE_ID} \
+              --model ${MODEL} \
+              --target ${TARGET} \
+              --duration {{inputs.parameters.fuzzing-duration}} \
+              --output-dir /output \
+              --verbose"
+
+            # Add binary path for LLM patches
+            if [ "${TARGET}" = "llm_patch" ] && [ -f /binary/rebuilt_binary ]; then
+              CMD="${CMD} --binary-path /binary/rebuilt_binary"
+            fi
+
+            # Run fuzzing
+            eval ${CMD}
+
+            # Write completion marker (Argo artifacts handle upload)
+            # This marker is uploaded last, so its presence indicates all results uploaded successfully
+            cat > /output/_SUCCESS << EOF
+            {
+              "completed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "pod": "{{pod.name}}",
+              "case_id": "${CASE_ID}",
+              "target": "${TARGET}",
+              "model": "${MODEL}"
+            }
+            EOF
+        env:
+          - name: PYTHONPATH
+            value: "/agent-runtime"
+        volumeMounts:
+          - name: agent-runtime
+            mountPath: /agent-runtime
+            readOnly: true
+          - name: binary
+            mountPath: /binary
+            readOnly: true
+          - name: output
+            mountPath: /output
+        resources:
+          requests:
+            cpu: "1.8"
+            memory: "6G"
+          limits:
+            cpu: "1.8"
+            memory: "6G"
+
+      volumes:
+        - name: agent-runtime
+          emptyDir: {}
+        - name: binary
+          emptyDir: {}
+        - name: output
+          emptyDir: {}

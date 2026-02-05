@@ -278,9 +278,56 @@ def setup(
     # Save config
     config.save()
 
+    # Configure Argo workflow controller for log archiving
+    if not skip_argo:
+        typer.echo()
+        typer.echo("[7/10] Configuring Argo log archiving to GCS...")
+        workflow_controller_config = f"""apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workflow-controller-configmap
+  namespace: argo
+data:
+  artifactRepository: |
+    archiveLogs: true
+    gcs:
+      bucket: {config.bucket_name}
+      keyFormat: "argo-logs/{{{{workflow.creationTimestamp.Y}}}}/{{{{workflow.creationTimestamp.m}}}}/{{{{workflow.creationTimestamp.d}}}}/{{{{workflow.name}}}}/{{{{pod.name}}}}"
+  retentionPolicy: |
+    completed: 604800
+    failed: 604800
+    errored: 604800
+"""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False
+        ) as config_file:
+            config_file.write(workflow_controller_config)
+            config_path = config_file.name
+
+        result = run_kubectl(["apply", "-f", config_path], check=False)
+        if result.returncode == 0:
+            typer.echo("  Log archiving configured (7-day retention to GCS).")
+            typer.echo(
+                f"  Logs will be archived to: gs://{config.bucket_name}/argo-logs/"
+            )
+            # Restart workflow controller to pick up new config
+            run_kubectl(
+                [
+                    "rollout",
+                    "restart",
+                    "deployment",
+                    "workflow-controller",
+                    "-n",
+                    "argo",
+                ],
+                check=False,
+            )
+        else:
+            typer.echo(f"  Warning: Could not configure log archiving: {result.stderr}")
+
     # Set up service account and RBAC
     typer.echo()
-    typer.echo("[7/9] Setting up Kubernetes service account...")
+    typer.echo("[8/10] Setting up Kubernetes service account...")
     rbac_dir = get_script_dir() / "argo" / "rbac"
     if rbac_dir.exists():
         result = run_kubectl(
@@ -292,7 +339,8 @@ def setup(
         else:
             typer.echo(f"  Warning: {result.stderr}")
 
-        # Annotate service account with GCP SA for Workload Identity
+        # Annotate service accounts with GCP SA for Workload Identity
+        # arvo-workflow-sa: for workflow pods to access GCS
         run_kubectl(
             [
                 "annotate",
@@ -305,33 +353,68 @@ def setup(
             ],
             check=False,
         )
+        # argo-server: for UI to access GCS artifacts
+        run_kubectl(
+            [
+                "annotate",
+                "serviceaccount",
+                "argo-server",
+                "-n",
+                "argo",
+                f"iam.gke.io/gcp-service-account={config.gcp_service_account}",
+                "--overwrite",
+            ],
+            check=False,
+        )
+        # argo: for workflow controller to archive logs to GCS
+        run_kubectl(
+            [
+                "annotate",
+                "serviceaccount",
+                "argo",
+                "-n",
+                "argo",
+                f"iam.gke.io/gcp-service-account={config.gcp_service_account}",
+                "--overwrite",
+            ],
+            check=False,
+        )
     else:
         typer.echo("  Warning: RBAC directory not found.")
 
-    # Set up Workload Identity binding
-    typer.echo("[8/9] Setting up Workload Identity...")
-    result = subprocess.run(
-        [
-            "gcloud",
-            "iam",
-            "service-accounts",
-            "add-iam-policy-binding",
-            config.gcp_service_account,
-            f"--project={config.project_id}",
-            "--role=roles/iam.workloadIdentityUser",
-            f"--member=serviceAccount:{config.project_id}.svc.id.goog[argo/arvo-workflow-sa]",
-            "--quiet",
-        ],
-        capture_output=True,
-        text=True,
+    # Set up Workload Identity bindings for all service accounts
+    typer.echo("[9/10] Setting up Workload Identity...")
+    # arvo-workflow-sa: workflow pods, argo-server: UI artifact access, argo: log archiving
+    for k8s_sa in ["arvo-workflow-sa", "argo-server", "argo"]:
+        result = subprocess.run(
+            [
+                "gcloud",
+                "iam",
+                "service-accounts",
+                "add-iam-policy-binding",
+                config.gcp_service_account,
+                f"--project={config.project_id}",
+                "--role=roles/iam.workloadIdentityUser",
+                f"--member=serviceAccount:{config.project_id}.svc.id.goog[argo/{k8s_sa}]",
+                "--quiet",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            typer.echo(f"  Workload Identity binding created for {k8s_sa}.")
+        else:
+            typer.echo(f"  Warning ({k8s_sa}): {result.stderr}")
+
+    # Restart argo-server to pick up Workload Identity for UI artifact access
+    typer.echo("  Restarting argo-server for Workload Identity...")
+    run_kubectl(
+        ["rollout", "restart", "deployment", "argo-server", "-n", "argo"],
+        check=False,
     )
-    if result.returncode == 0:
-        typer.echo("  Workload Identity binding created.")
-    else:
-        typer.echo(f"  Warning: {result.stderr}")
 
     # Configure GCS lifecycle policy for temp file cleanup
-    typer.echo("[9/9] Configuring GCS lifecycle policy for temp cleanup...")
+    typer.echo("[10/10] Configuring GCS lifecycle policy for temp cleanup...")
     lifecycle_config = {
         "rule": [
             {
@@ -359,7 +442,7 @@ def setup(
         typer.echo(f"  Warning: Could not set lifecycle policy: {result.stderr}")
         typer.echo("  You may need to create the bucket first, then re-run setup.")
 
-    # Create memoization cache ConfigMap with required label
+    # Create memoization cache ConfigMaps with required label
     run_kubectl(
         ["create", "configmap", "arvo-build-cache", "-n", "argo"],
         check=False,
@@ -369,6 +452,23 @@ def setup(
             "label",
             "configmap",
             "arvo-build-cache",
+            "-n",
+            "argo",
+            "workflows.argoproj.io/configmap-type=Cache",
+            "--overwrite",
+        ],
+        check=False,
+    )
+    # Create fuzz memoization cache ConfigMap
+    run_kubectl(
+        ["create", "configmap", "arvo-fuzz-cache", "-n", "argo"],
+        check=False,
+    )
+    run_kubectl(
+        [
+            "label",
+            "configmap",
+            "arvo-fuzz-cache",
             "-n",
             "argo",
             "workflows.argoproj.io/configmap-type=Cache",

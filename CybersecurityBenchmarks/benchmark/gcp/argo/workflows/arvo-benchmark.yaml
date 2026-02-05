@@ -22,6 +22,8 @@ spec:
     parameters:
       - name: cases
         value: "[]"
+      - name: models
+        value: "[]"
       - name: model
         value: "claude-sonnet-4-20250514"
       - name: experiment-id
@@ -122,41 +124,16 @@ spec:
                 - name: registry
                   value: "{{workflow.parameters.registry}}"
 
-          # LLM Patch (depends on vul build)
-          - name: patch
-            dependencies: [build-vul]
-            templateRef:
-              name: arvo-patch
-              template: patch-case
+          # LLM Patch + Fuzz (iterates over all models)
+          - name: model-pipeline
+            dependencies: [build-fix, build-vul]
+            template: per-model-pipeline
             arguments:
               parameters:
                 - name: case-id
                   value: "{{inputs.parameters.case-id}}"
                 - name: model
-                  value: "{{workflow.parameters.model}}"
-                - name: experiment-id
-                  value: "{{workflow.parameters.experiment-id}}"
-                - name: bucket
-                  value: "{{workflow.parameters.bucket}}"
-                - name: registry
-                  value: "{{workflow.parameters.registry}}"
-                - name: build-version
-                  value: "{{workflow.parameters.build-version}}"
-
-          # LLM Fuzz (depends on patch AND fix build)
-          - name: fuzz-llm
-            dependencies: [patch, build-fix]
-            templateRef:
-              name: arvo-fuzz
-              template: fuzz-case
-            arguments:
-              parameters:
-                - name: case-id
-                  value: "{{inputs.parameters.case-id}}"
-                - name: target
-                  value: "llm_patch"
-                - name: model
-                  value: "{{workflow.parameters.model}}"
+                  value: "{{item}}"
                 - name: experiment-id
                   value: "{{workflow.parameters.experiment-id}}"
                 - name: bucket
@@ -167,8 +144,9 @@ spec:
                   value: "{{workflow.parameters.build-version}}"
                 - name: fuzzing-duration
                   value: "{{workflow.parameters.fuzzing-duration}}"
+            withParam: "{{workflow.parameters.models}}"
 
-          # GT Fuzz (depends only on fix build - runs parallel with patch!)
+          # GT Fuzz (depends only on fix build - runs parallel with model-pipeline!)
           - name: fuzz-gt
             dependencies: [build-fix]
             when: "{{workflow.parameters.run-gt}} == true"
@@ -193,3 +171,59 @@ spec:
                   value: "{{workflow.parameters.build-version}}"
                 - name: fuzzing-duration
                   value: "{{workflow.parameters.fuzzing-duration}}"
+
+    # Per-model pipeline: patch -> fuzz-llm for a single model
+    - name: per-model-pipeline
+      inputs:
+        parameters:
+          - name: case-id
+          - name: model
+          - name: experiment-id
+          - name: bucket
+          - name: registry
+          - name: build-version
+          - name: fuzzing-duration
+      dag:
+        tasks:
+          - name: patch
+            templateRef:
+              name: arvo-patch
+              template: patch-case
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{inputs.parameters.case-id}}"
+                - name: model
+                  value: "{{inputs.parameters.model}}"
+                - name: experiment-id
+                  value: "{{inputs.parameters.experiment-id}}"
+                - name: bucket
+                  value: "{{inputs.parameters.bucket}}"
+                - name: registry
+                  value: "{{inputs.parameters.registry}}"
+                - name: build-version
+                  value: "{{inputs.parameters.build-version}}"
+
+          - name: fuzz-llm
+            dependencies: [patch]
+            templateRef:
+              name: arvo-fuzz
+              template: fuzz-case
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{inputs.parameters.case-id}}"
+                - name: target
+                  value: "llm_patch"
+                - name: model
+                  value: "{{inputs.parameters.model}}"
+                - name: experiment-id
+                  value: "{{inputs.parameters.experiment-id}}"
+                - name: bucket
+                  value: "{{inputs.parameters.bucket}}"
+                - name: registry
+                  value: "{{inputs.parameters.registry}}"
+                - name: build-version
+                  value: "{{inputs.parameters.build-version}}"
+                - name: fuzzing-duration
+                  value: "{{inputs.parameters.fuzzing-duration}}"

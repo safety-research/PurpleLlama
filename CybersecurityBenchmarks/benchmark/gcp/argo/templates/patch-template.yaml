@@ -14,6 +14,14 @@ spec:
           - name: bucket
           - name: registry
           - name: build-version
+      # Per-model rate limiting via semaphore
+      # If the model key doesn't exist in the ConfigMap, jobs run unlimited
+      # Configure limits with: python -m cli semaphore set <model> <limit>
+      synchronization:
+        semaphore:
+          configMapKeyRef:
+            name: patch-semaphores
+            key: "{{inputs.parameters.model}}"
       # Outputs for memoization and artifact upload
       outputs:
         parameters:
@@ -77,11 +85,13 @@ spec:
       retryStrategy:
         limit: 3
         retryPolicy: "Always"
-        expression: "lastRetry.message matches 'imminent node shutdown|pod deleted|Evicted|Preempted'"
+        expression: 'lastRetry.status == "Error" or (lastRetry.status == "Failed" and asInt(lastRetry.exitCode) not in [0])'
         backoff:
           duration: "30s"
           factor: 2
-          maxDuration: "8h"
+          maxDuration: "5m"
+
+      activeDeadlineSeconds: 7200
 
       initContainers:
         - name: fetch-runtime
@@ -107,6 +117,17 @@ spec:
             set -e
             CASE_ID="{{inputs.parameters.case-id}}"
             MODEL="{{inputs.parameters.model}}"
+            BUCKET="{{inputs.parameters.bucket}}"
+            EXPERIMENT_ID="{{inputs.parameters.experiment-id}}"
+
+            # Layer 2: Check if already completed in GCS (fallback when memoization cache cleared)
+            SUCCESS_PATH="gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/${MODEL}/_SUCCESS"
+            if gsutil -q stat "${SUCCESS_PATH}" 2>/dev/null; then
+              echo "[SKIP] Results already exist at ${SUCCESS_PATH}"
+              # Copy existing _SUCCESS to output for artifact upload consistency
+              gsutil cp "${SUCCESS_PATH}" /output/_SUCCESS
+              exit 0
+            fi
 
             /agent-runtime/bin/agent-entrypoint.sh python3 -m agent.main \
               --case-id ${CASE_ID} \
@@ -149,11 +170,11 @@ spec:
             mountPath: /output
         resources:
           requests:
-            cpu: "1.8"
+            cpu: "1.7"
             memory: "6G"
           limits:
             cpu: "1.8"
-            memory: "6G"
+            memory: "12G"
 
       volumes:
         - name: agent-runtime

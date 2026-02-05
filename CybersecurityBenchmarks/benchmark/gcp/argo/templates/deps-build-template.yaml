@@ -28,7 +28,7 @@ spec:
       retryStrategy:
         limit: 3
         retryPolicy: "Always"
-        expression: "lastRetry.message matches 'imminent node shutdown|pod deleted|Evicted|Preempted'"
+        expression: 'lastRetry.status == "Error" or (lastRetry.status == "Failed" and asInt(lastRetry.exitCode) not in [0])'
         backoff:
           duration: "30s"
           factor: 2
@@ -159,7 +159,7 @@ spec:
       retryStrategy:
         limit: 3
         retryPolicy: "Always"
-        expression: "lastRetry.message matches 'imminent node shutdown|pod deleted|Evicted|Preempted'"
+        expression: 'lastRetry.status == "Error" or (lastRetry.status == "Failed" and asInt(lastRetry.exitCode) not in [0])'
         backoff:
           duration: "30s"
           factor: 2
@@ -333,7 +333,7 @@ spec:
       retryStrategy:
         limit: 3
         retryPolicy: "Always"
-        expression: "lastRetry.message matches 'imminent node shutdown|pod deleted|Evicted|Preempted'"
+        expression: 'lastRetry.status == "Error" or (lastRetry.status == "Failed" and asInt(lastRetry.exitCode) not in [0])'
         backoff:
           duration: "30s"
           factor: 2

@@ -10,7 +10,17 @@ Usage:
 
 import typer
 
-from .commands import cancel, deps, experiments, logs, secrets, setup, status, submit
+from .commands import (
+    cancel,
+    deps,
+    experiments,
+    logs,
+    secrets,
+    semaphore,
+    setup,
+    status,
+    submit,
+)
 
 app = typer.Typer(
     name="arvo-cli",
@@ -50,7 +60,7 @@ def cmd_setup_status() -> None:
 @app.command("submit")
 def cmd_submit(
     cases: str = typer.Option(None, help="Case IDs: '42,43', '42-50', or '@file.json'"),
-    model: str = typer.Option("claude-sonnet-4-20250514", help="LLM model"),
+    model: str = typer.Option(None, help="LLM model (overrides config agents)"),
     experiment_id: str = typer.Option(None, "--experiment", "-e", help="Experiment ID"),
     fuzzing_duration: int = typer.Option(300, help="Fuzzing duration (seconds)"),
     run_gt: bool = typer.Option(True, "--gt/--no-gt", help="Run ground truth"),
@@ -151,6 +161,30 @@ def cmd_exp_results(
     experiments.show_results(experiment_id=experiment_id, model=model)
 
 
+@experiments_app.command("result")
+def cmd_exp_result(
+    experiment_id: str = typer.Argument(..., help="Experiment ID"),
+    case_id: int = typer.Argument(..., help="Case ID"),
+    key: str = typer.Argument(
+        "result", help="Result key (crashes, result, patch, chat)"
+    ),
+    model: str = typer.Option(
+        "claude-sonnet-4-20250514", "-m", "--model", help="Model name"
+    ),
+    list_keys: bool = typer.Option(
+        False, "-l", "--list-keys", help="List available keys"
+    ),
+) -> None:
+    """Get a specific result file from an experiment."""
+    experiments.get_result(
+        experiment_id=experiment_id,
+        case_id=case_id,
+        key=key,
+        model=model,
+        list_keys=list_keys,
+    )
+
+
 @experiments_app.command("compare")
 def cmd_exp_compare(
     exp1: str = typer.Argument(..., help="First experiment"),
@@ -240,6 +274,41 @@ def cmd_build_deps(
 ) -> None:
     """Build all dependencies (CASR and DD) on GKE."""
     deps.build_deps(casr_only=casr_only, dd_only=dd_only, force=force, dry_run=dry_run)
+
+
+# Semaphore commands (rate limiting for LLM patch jobs)
+semaphore_app = typer.Typer(help="Manage patch job concurrency limits per model")
+app.add_typer(semaphore_app, name="semaphore")
+
+
+@semaphore_app.command("set")
+def cmd_semaphore_set(
+    model: str = typer.Argument(
+        ..., help="Model name (e.g., claude-sonnet-4-20250514)"
+    ),
+    limit: str = typer.Argument(
+        ..., help="Max concurrent jobs (number or 'unlimited')"
+    ),
+) -> None:
+    """Set the concurrency limit for a specific model.
+
+    Use a number to set a specific limit, or 'unlimited' for no rate limiting.
+    """
+    semaphore.set_limit(model=model, limit=limit)
+
+
+@semaphore_app.command("list")
+def cmd_semaphore_list() -> None:
+    """List all configured semaphore limits."""
+    semaphore.list_limits()
+
+
+@semaphore_app.command("remove")
+def cmd_semaphore_remove(
+    model: str = typer.Argument(..., help="Model name to remove limit for"),
+) -> None:
+    """Remove the concurrency limit for a model (becomes unlimited)."""
+    semaphore.remove_limit(model=model)
 
 
 # Secrets commands

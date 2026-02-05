@@ -1,9 +1,5 @@
 {
   "cases": [12803],
   "agents": ["claude-sonnet-4-20250514", "gt"],
-  "fuzzing_duration": 60,
-  "max_concurrent_vms": 50,
-  "build_max_concurrent_vms": 1,
-  "eval_max_concurrent_vms": 1,
-  "gt_max_concurrent_vms": 1
+  "fuzzing_duration": 60
 }

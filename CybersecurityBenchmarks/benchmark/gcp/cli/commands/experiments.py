@@ -105,7 +105,23 @@ def show_results(
 
     for case_id in cases[:50]:  # Limit output
         # Check for model results
-        models_to_check = [model] if model else ["claude-sonnet-4-20250514", "gt"]
+        if model:
+            models_to_check = [model]
+        else:
+            # Auto-discover models from GCS for this case
+            models_result = subprocess.run(
+                ["gsutil", "ls", f"{base_path}/{case_id}/"],
+                capture_output=True,
+                text=True,
+            )
+            if models_result.returncode == 0:
+                models_to_check = [
+                    line.rstrip("/").split("/")[-1]
+                    for line in models_result.stdout.strip().split("\n")
+                    if line and not line.rstrip("/").split("/")[-1].startswith("_")
+                ]
+            else:
+                models_to_check = ["gt"]  # Fallback
 
         for m in models_to_check:
             result_path = f"{base_path}/{case_id}/{m}/result.json"
@@ -137,6 +153,76 @@ def show_results(
     typer.echo(
         f"Summary: {success_count} success, {fail_count} failed, {pending_count} pending"
     )
+
+
+# Registry of result keys -> filename
+RESULT_KEYS = {
+    "result": "result.json",
+    "crashes": "crashes.json",
+    "patch": "patch.txt",
+    "chat": "chat.md",
+    "metadata": "metadata.json",
+    "fuzzing_result": "fuzzing_result.json",
+}
+
+
+@app.command("result")
+def get_result(
+    experiment_id: Annotated[str, typer.Argument(help="Experiment ID")],
+    case_id: Annotated[int, typer.Argument(help="Case ID")],
+    key: Annotated[
+        str, typer.Argument(help="Result key (crashes, result, patch, chat, metadata)")
+    ] = "result",
+    model: Annotated[
+        str, typer.Option("--model", "-m", help="Model name")
+    ] = "claude-sonnet-4-20250514",
+    list_keys: Annotated[
+        bool, typer.Option("--list-keys", "-l", help="List available keys")
+    ] = False,
+) -> None:
+    """Get a specific result file from an experiment.
+
+    Examples:
+        experiments result default 12803 crashes --model claude-sonnet-4-20250514
+        experiments result default 12803 result
+        experiments result default 12803 patch -m gt
+    """
+    if list_keys:
+        typer.echo("Available result keys:")
+        for k, filename in RESULT_KEYS.items():
+            typer.echo(f"  {k:<15} -> {filename}")
+        return
+
+    config = GKEConfig.load()
+    if not config.is_configured():
+        typer.echo("Error: Not configured. Run: python -m cli setup")
+        raise typer.Exit(1)
+
+    # Resolve key to filename
+    filename = RESULT_KEYS.get(key, key)
+
+    gcs_path = f"gs://{config.bucket_name}/results/{experiment_id}/{case_id}/{model}/{filename}"
+
+    result = subprocess.run(
+        ["gsutil", "cat", gcs_path],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        typer.echo(f"Error: Could not fetch {gcs_path}")
+        typer.echo(f"  {result.stderr.strip()}")
+        raise typer.Exit(1)
+
+    # Pretty print JSON if applicable
+    if filename.endswith(".json"):
+        try:
+            data = json.loads(result.stdout)
+            typer.echo(json.dumps(data, indent=2))
+        except json.JSONDecodeError:
+            typer.echo(result.stdout)
+    else:
+        typer.echo(result.stdout)
 
 
 @app.command("compare")

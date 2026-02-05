@@ -127,11 +127,16 @@ def run_casr_cluster_map(
     # Matching fuzzing_only_benchmark.py lines 1228-1258
     cmd = [
         "casr-cluster-map",
-        "-i", crashes_dir,
-        "-o", output_dir,
-        "-t", str(timeout_per_crash),
-        "-j", str(jobs),
-        "--mapping", mapping_file,
+        "-i",
+        crashes_dir,
+        "-o",
+        output_dir,
+        "-t",
+        str(timeout_per_crash),
+        "-j",
+        str(jobs),
+        "--mapping",
+        mapping_file,
         "--use-logs",  # For libFuzzer log-based clustering
         "--",
         binary_path,
@@ -164,7 +169,9 @@ def run_casr_cluster_map(
         LOG.info(f"CASR output saved to {casr_log_file}")
 
         if result.returncode != 0:
-            LOG.warning(f"CASR clustering returned non-zero exit code {result.returncode}")
+            LOG.warning(
+                f"CASR clustering returned non-zero exit code {result.returncode}"
+            )
 
             # Case 1: Only 1 unique crash type - this is OK
             if "Not enough valid reports" in stderr or "Less than 2" in stderr:
@@ -172,7 +179,10 @@ def run_casr_cluster_map(
                 # Continue - CASR may still produce a valid mapping
 
             # Case 2: CASR couldn't reproduce crashes
-            elif "No reports generated" in stderr or "Program terminated (no crash)" in stderr:
+            elif (
+                "No reports generated" in stderr
+                or "Program terminated (no crash)" in stderr
+            ):
                 LOG.warning(f"CASR failed to reproduce crashes: {stderr}")
 
             # Case 3: Unknown error
@@ -184,10 +194,14 @@ def run_casr_cluster_map(
 
         if crash_to_cluster:
             num_clusters = len(set(crash_to_cluster.values()))
-            LOG.info(f"CASR mapped {len(crash_to_cluster)} crashes to {num_clusters} clusters")
+            LOG.info(
+                f"CASR mapped {len(crash_to_cluster)} crashes to {num_clusters} clusters"
+            )
         else:
             # Fallback: each crash is its own cluster
-            LOG.warning("CASR produced no mapping, using fallback (each crash = own cluster)")
+            LOG.warning(
+                "CASR produced no mapping, using fallback (each crash = own cluster)"
+            )
             for i, crash_file in enumerate(crash_files, 1):
                 crash_to_cluster[crash_file.name] = f"cl{i}"
 
@@ -245,11 +259,15 @@ def parse_casr_json_mapping(mapping_file: str) -> Dict[str, str]:
                 crash_to_cluster[crash_name] = f"cl{cluster_int}"
 
         num_clusters = mapping_data.get("num_clusters", 0)
-        LOG.info(f"Loaded mapping for {len(crash_to_cluster)} crashes across {num_clusters} clusters")
+        LOG.info(
+            f"Loaded mapping for {len(crash_to_cluster)} crashes across {num_clusters} clusters"
+        )
 
         # Log cluster distribution
         clusters = mapping_data.get("clusters", {})
-        for cluster_id, crash_list in sorted(clusters.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+        for cluster_id, crash_list in sorted(
+            clusters.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0
+        ):
             LOG.debug(f"Cluster {cluster_id} has {len(crash_list)} crashes")
 
     except json.JSONDecodeError as e:

@@ -3,10 +3,5 @@
 
   "agents": ["claude-sonnet-4-20250514", "gt"],
 
-  "fuzzing_duration": 300,
-
-  "max_concurrent_vms": 50,
-  "build_max_concurrent_vms": 100,
-  "eval_max_concurrent_vms": 25,
-  "gt_max_concurrent_vms": 50
+  "fuzzing_duration": 300
 }

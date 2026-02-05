@@ -17,6 +17,90 @@ from ..hashing import (
     get_deps_manifest_from_gcs,
 )
 from ..output import echo_error, echo_info, echo_success, echo_warning
+from . import semaphore
+
+
+def _check_semaphore_limits(models: list[str], dry_run: bool = False) -> bool:
+    """Check if all models have semaphore limits configured.
+
+    Args:
+        models: List of model names to check (excludes 'gt')
+        dry_run: If True, only show what would be done
+
+    Returns:
+        True if should continue, False if user aborted
+    """
+    # Filter out 'gt' as it doesn't need rate limiting
+    llm_models = [m for m in models if m != "gt"]
+
+    if not llm_models:
+        echo_info("No LLM models to check (only ground truth)")
+        return True
+
+    # Check which models are missing limits
+    models_with_limits: list[tuple[str, Optional[int]]] = []
+    models_without_limits = []
+
+    for model in llm_models:
+        is_configured, limit = semaphore.get_model_limit(model)
+        if is_configured:
+            models_with_limits.append((model, limit))
+        else:
+            models_without_limits.append(model)
+
+    # Show status for models with limits
+    for model, limit in models_with_limits:
+        if limit is None:
+            echo_success(f"Semaphore limit for '{model}': unlimited")
+        else:
+            echo_success(f"Semaphore limit for '{model}': {limit} concurrent jobs")
+
+    # If all models have limits, we're done
+    if not models_without_limits:
+        return True
+
+    # Show models without limits
+    typer.echo()
+    echo_warning(
+        f"No semaphore limits configured for {len(models_without_limits)} model(s):"
+    )
+    for model in models_without_limits:
+        typer.echo(f"  - {model}")
+    typer.echo()
+    typer.echo("Without limits, patch jobs will run without rate limiting.")
+    typer.echo()
+
+    if dry_run:
+        typer.echo("  [DRY RUN] Would prompt to set limits")
+        return True
+
+    # Ask user what to do
+    typer.echo("Options:")
+    typer.echo("  1. Set limits for all unconfigured models now")
+    typer.echo("  2. Continue without limits (unlimited concurrency)")
+    typer.echo("  3. Abort submission")
+    typer.echo()
+
+    choice = typer.prompt("Choose an option", type=int, default=1)
+
+    if choice == 1:
+        # Prompt for each model
+        default_limit = "20"
+        for model in models_without_limits:
+            limit_value = typer.prompt(
+                f"Enter max concurrent jobs for '{model}' (number or 'unlimited')",
+                type=str,
+                default=default_limit,
+            )
+            semaphore.set_limit(model, limit_value)
+            # Use the same limit as default for subsequent models
+            default_limit = limit_value
+        return True
+    elif choice == 2:
+        echo_info("Continuing without semaphore limits")
+        return True
+    else:
+        return False
 
 
 def _apply_argo_templates(dry_run: bool = False) -> bool:
@@ -175,8 +259,8 @@ def submit(
         typer.Option(help="Case IDs: '42,43,44', '42-50', or '@path/to/cases.json'"),
     ] = None,
     model: Annotated[
-        str, typer.Option(help="LLM model to use")
-    ] = "claude-sonnet-4-20250514",
+        Optional[str], typer.Option(help="LLM model to use (overrides config agents)")
+    ] = None,
     experiment_id: Annotated[
         Optional[str], typer.Option("--experiment", "-e", help="Experiment ID")
     ] = None,
@@ -221,6 +305,7 @@ def submit(
 
     # Load run config
     run_config = RunConfig()
+    agents_from_config: list[str] = []  # Track all agents/models from config
 
     if config_file:
         with open(config_file) as f:
@@ -232,6 +317,15 @@ def submit(
                 run_config.cases = data["cases"]
         if "model" in data:
             run_config.model = data["model"]
+        if "agents" in data:
+            # Config has multiple agents - track them for semaphore check
+            agents_from_config = data["agents"]
+            # Use first non-gt agent as the model if model not specified
+            if "model" not in data:
+                for agent in agents_from_config:
+                    if agent != "gt":
+                        run_config.model = agent
+                        break
         if "experiment_id" in data:
             run_config.experiment_id = data["experiment_id"]
         if "fuzzing_duration" in data:
@@ -244,8 +338,10 @@ def submit(
     # CLI overrides
     if cases:
         run_config.cases = parse_cases(cases)
-    if model:
+    if model is not None:
+        # Explicit --model flag overrides config agents
         run_config.model = model
+        agents_from_config = []
     if experiment_id:
         run_config.experiment_id = experiment_id
     if fuzzing_duration:
@@ -254,8 +350,19 @@ def submit(
     if build_version:
         run_config.build_version = build_version
 
+    # Build final list of models to check
+    # Priority: 1) CLI --model flag, 2) config agents, 3) default model
+    if agents_from_config:
+        models_to_check = agents_from_config
+    elif run_config.model:
+        models_to_check = [run_config.model]
+    else:
+        # No model specified anywhere - use default
+        run_config.model = "claude-sonnet-4-20250514"
+        models_to_check = [run_config.model]
+
     # Generate experiment ID if not provided
-    if not run_config.experiment_id or run_config.experiment_id == "default":
+    if not run_config.experiment_id:
         from datetime import datetime
 
         run_config.experiment_id = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -273,7 +380,12 @@ def submit(
     typer.echo(f"Owner:       {owner}")
     typer.echo(f"Experiment:  {run_config.experiment_id}")
     typer.echo(f"Cases:       {len(run_config.cases)} cases")
-    typer.echo(f"Model:       {run_config.model}")
+    if len(models_to_check) > 1:
+        typer.echo(f"Models:      {len(models_to_check)} agents")
+        for m in models_to_check:
+            typer.echo(f"             - {m}")
+    else:
+        typer.echo(f"Model:       {run_config.model}")
     typer.echo(f"Fuzz Time:   {run_config.fuzzing_duration}s")
     typer.echo(f"Run GT:      {run_config.run_gt}")
     typer.echo(f"Build Ver:   {run_config.build_version}")
@@ -300,6 +412,13 @@ def submit(
             typer.echo("Aborting submission.")
             raise typer.Exit(1)
         typer.echo()
+
+    # Check semaphore limits for all models
+    typer.echo("Checking semaphore limits...")
+    if not _check_semaphore_limits(models_to_check, dry_run=dry_run):
+        typer.echo("Aborting submission.")
+        raise typer.Exit(1)
+    typer.echo()
 
     # Upload agent runtime
     if upload_runtime and not dry_run:
@@ -333,8 +452,13 @@ def submit(
 
     # Build workflow parameters
     workflow_path = get_script_dir() / "argo" / "workflows" / "arvo-benchmark.yaml"
+
+    # Build list of LLM models (exclude 'gt' - it's handled by fuzz-gt)
+    llm_models = [m for m in models_to_check if m != "gt"]
+
     parameters = {
         "cases": json.dumps(run_config.cases),
+        "models": json.dumps(llm_models),
         "model": run_config.model,
         "experiment-id": run_config.experiment_id,
         "bucket": gke_config.bucket_name,

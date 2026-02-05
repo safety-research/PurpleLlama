@@ -8,7 +8,7 @@ spec:
   serviceAccountName: arvo-workflow-sa
 
   # Resource quota for parallel execution
-  parallelism: 100
+  parallelism: 500
 
   # Propagate labels to all pods (for GCP resource tracking)
   podMetadata:
@@ -183,6 +183,14 @@ spec:
           - name: registry
           - name: build-version
           - name: fuzzing-duration
+      # Memoize at DAG level to avoid Argo bug with nested memoized tasks
+      # See: https://github.com/argoproj/argo-workflows/issues/12132
+      memoize:
+        key: "model-pipeline-{{inputs.parameters.case-id}}-{{inputs.parameters.model}}-{{inputs.parameters.experiment-id}}"
+        cache:
+          configMap:
+            name: arvo-model-pipeline-cache
+        maxAge: "720h"
       dag:
         tasks:
           - name: patch

@@ -152,7 +152,7 @@ def setup(
                 "--num-nodes=0",
                 "--enable-autoscaling",
                 "--min-nodes=0",
-                "--max-nodes=50",
+                "--max-nodes=200",
                 "--node-taints=workload=build:NoSchedule",
                 f"--node-labels=owner={owner},workload-type=build",
             ],
@@ -182,7 +182,7 @@ def setup(
                 "--num-nodes=0",
                 "--enable-autoscaling",
                 "--min-nodes=0",
-                "--max-nodes=100",
+                "--max-nodes=200",
                 "--node-taints=workload=work:NoSchedule",
                 f"--node-labels=owner={owner},workload-type=work",
             ],
@@ -469,6 +469,24 @@ data:
             "label",
             "configmap",
             "arvo-fuzz-cache",
+            "-n",
+            "argo",
+            "workflows.argoproj.io/configmap-type=Cache",
+            "--overwrite",
+        ],
+        check=False,
+    )
+    # Create model-pipeline DAG memoization cache ConfigMap
+    # This caches entire per-model-pipeline DAGs to avoid Argo bug with nested memoized tasks
+    run_kubectl(
+        ["create", "configmap", "arvo-model-pipeline-cache", "-n", "argo"],
+        check=False,
+    )
+    run_kubectl(
+        [
+            "label",
+            "configmap",
+            "arvo-model-pipeline-cache",
             "-n",
             "argo",
             "workflows.argoproj.io/configmap-type=Cache",

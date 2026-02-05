@@ -8,6 +8,8 @@ Usage:
     python -m cli logs <workflow>    # View logs
 """
 
+from typing import Optional
+
 import typer
 
 from .commands import (
@@ -62,7 +64,7 @@ def cmd_submit(
     cases: str = typer.Option(None, help="Case IDs: '42,43', '42-50', or '@file.json'"),
     model: str = typer.Option(None, help="LLM model (overrides config agents)"),
     experiment_id: str = typer.Option(None, "--experiment", "-e", help="Experiment ID"),
-    fuzzing_duration: int = typer.Option(300, help="Fuzzing duration (seconds)"),
+    fuzzing_duration: Optional[int] = typer.Option(None, help="Fuzzing duration (seconds)"),
     run_gt: bool = typer.Option(True, "--gt/--no-gt", help="Run ground truth"),
     build_version: str = typer.Option("latest", help="Build version tag"),
     config_file: str = typer.Option(None, "--config", "-c", help="Config file"),

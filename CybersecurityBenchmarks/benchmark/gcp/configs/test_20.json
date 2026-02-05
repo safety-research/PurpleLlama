@@ -22,5 +22,5 @@
     35727
   ],  
   "agents": ["gt", "claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"],
-  "fuzzing_duration": 3600
+  "fuzzing_duration": 300
 }

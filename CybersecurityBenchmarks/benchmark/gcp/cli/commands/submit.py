@@ -265,8 +265,8 @@ def submit(
         Optional[str], typer.Option("--experiment", "-e", help="Experiment ID")
     ] = None,
     fuzzing_duration: Annotated[
-        int, typer.Option(help="Fuzzing duration in seconds")
-    ] = 300,
+        Optional[int], typer.Option(help="Fuzzing duration in seconds")
+    ] = None,
     run_gt: Annotated[
         bool, typer.Option("--gt/--no-gt", help="Run ground truth fuzzing")
     ] = True,
@@ -344,7 +344,7 @@ def submit(
         agents_from_config = []
     if experiment_id:
         run_config.experiment_id = experiment_id
-    if fuzzing_duration:
+    if fuzzing_duration is not None:
         run_config.fuzzing_duration = fuzzing_duration
     run_config.run_gt = run_gt
     if build_version:

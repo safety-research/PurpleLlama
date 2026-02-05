@@ -89,7 +89,7 @@ spec:
         backoff:
           duration: "30s"
           factor: 2
-          maxDuration: "5m"
+          cap: "5m"
 
       activeDeadlineSeconds: 7200
 

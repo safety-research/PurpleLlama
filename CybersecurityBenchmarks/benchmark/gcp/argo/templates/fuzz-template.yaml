@@ -42,12 +42,9 @@ spec:
             gcs:
               bucket: "{{inputs.parameters.bucket}}"
               key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/_SUCCESS"
-      memoize:
-        key: "fuzz-{{inputs.parameters.case-id}}-{{inputs.parameters.model}}-{{inputs.parameters.experiment-id}}"
-        cache:
-          configMap:
-            name: arvo-fuzz-cache
-        maxAge: "720h"
+      # NOTE: Memoization removed from fuzz-llm due to Argo bug with nested memoized tasks
+      # Caching is now handled at the DAG level (per-model-pipeline) in arvo-benchmark.yaml
+      # GCS _SUCCESS marker check below provides fallback deduplication
       tolerations:
         - key: "workload"
           operator: "Equal"

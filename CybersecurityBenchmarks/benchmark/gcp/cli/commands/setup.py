@@ -5,6 +5,7 @@ Setup command for GKE cluster and Argo Workflows.
 import json
 import subprocess
 import tempfile
+import time
 from typing import Annotated, Optional
 
 import typer
@@ -442,7 +443,7 @@ data:
         typer.echo(f"  Warning: Could not set lifecycle policy: {result.stderr}")
         typer.echo("  You may need to create the bucket first, then re-run setup.")
 
-    # Create memoization cache ConfigMaps with required label
+    # Create memoization cache ConfigMap for builds (only builds use memoization now)
     run_kubectl(
         ["create", "configmap", "arvo-build-cache", "-n", "argo"],
         check=False,
@@ -459,41 +460,62 @@ data:
         ],
         check=False,
     )
-    # Create fuzz memoization cache ConfigMap
-    run_kubectl(
-        ["create", "configmap", "arvo-fuzz-cache", "-n", "argo"],
-        check=False,
-    )
-    run_kubectl(
+
+    # Set up GCS token refresh infrastructure for HTTP-based completion checks
+    # This replaces Argo memoization with sub-second GCS API calls
+    typer.echo()
+    typer.echo("[11/12] Setting up GCS token refresh for completion checks...")
+    infra_dir = get_script_dir() / "argo" / "infra"
+    if infra_dir.exists():
+        result = run_kubectl(
+            ["apply", "-f", str(infra_dir), "-n", "argo"],
+            check=False,
+        )
+        if result.returncode == 0:
+            typer.echo("  Token refresh CronJob and RBAC installed.")
+        else:
+            typer.echo(f"  Warning: Could not apply infra: {result.stderr}")
+
+        # Seed initial token by triggering the CronJob immediately
+        typer.echo("  Seeding initial GCS auth token...")
+        run_kubectl(
+            ["create", "job", "--from=cronjob/gcs-token-refresh", "gcs-token-seed", "-n", "argo"],
+            check=False,
+        )
+        # Wait for the job to complete (needs to pull image first time)
+        typer.echo("  Waiting for token seed job (may take up to 60s on first run)...")
+        for _ in range(12):  # Wait up to 60 seconds
+            time.sleep(5)
+            result = run_kubectl(
+                ["get", "secret", "gcs-auth-token", "-n", "argo"],
+                check=False,
+            )
+            if result.returncode == 0:
+                typer.echo("  GCS auth token created successfully.")
+                break
+        else:
+            typer.echo("  Note: Token will be created when CronJob runs (within 30 min).")
+    else:
+        typer.echo(f"  Warning: Infra directory not found at {infra_dir}")
+
+    # Patch argo-cluster-role to add workflowtasksets/status permission (needed for HTTP templates)
+    typer.echo()
+    typer.echo("[12/12] Patching Argo RBAC for HTTP templates...")
+    result = run_kubectl(
         [
-            "label",
-            "configmap",
-            "arvo-fuzz-cache",
-            "-n",
-            "argo",
-            "workflows.argoproj.io/configmap-type=Cache",
-            "--overwrite",
+            "patch",
+            "clusterrole",
+            "argo-cluster-role",
+            "--type=json",
+            '-p=[{"op": "add", "path": "/rules/-", "value": {"apiGroups": ["argoproj.io"], "resources": ["workflowtasksets/status"], "verbs": ["get", "patch", "update"]}}]',
         ],
         check=False,
     )
-    # Create model-pipeline DAG memoization cache ConfigMap
-    # This caches entire per-model-pipeline DAGs to avoid Argo bug with nested memoized tasks
-    run_kubectl(
-        ["create", "configmap", "arvo-model-pipeline-cache", "-n", "argo"],
-        check=False,
-    )
-    run_kubectl(
-        [
-            "label",
-            "configmap",
-            "arvo-model-pipeline-cache",
-            "-n",
-            "argo",
-            "workflows.argoproj.io/configmap-type=Cache",
-            "--overwrite",
-        ],
-        check=False,
-    )
+    if result.returncode == 0:
+        typer.echo("  Argo cluster role patched.")
+    else:
+        # Might already have the permission, check if it's already there
+        typer.echo("  Argo cluster role already has required permissions (or patch failed).")
     typer.echo()
     typer.echo(f"Config saved to: {get_config_path()}")
     typer.echo()

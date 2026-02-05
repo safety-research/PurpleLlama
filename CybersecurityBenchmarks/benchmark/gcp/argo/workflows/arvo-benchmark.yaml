@@ -172,7 +172,27 @@ spec:
                 - name: fuzzing-duration
                   value: "{{workflow.parameters.fuzzing-duration}}"
 
+    # HTTP template for sub-second GCS completion checks (no container needed)
+    # Uses GCS JSON API to check if _SUCCESS marker exists
+    # Success (200) = file exists = skip task, Failure (404) = file missing = run task
+    - name: check-completion
+      inputs:
+        parameters:
+          - name: bucket
+          - name: path  # URL-encoded path to _SUCCESS marker
+      http:
+        url: "https://storage.googleapis.com/storage/v1/b/{{inputs.parameters.bucket}}/o/{{inputs.parameters.path}}"
+        method: GET
+        headers:
+          - name: Authorization
+            valueFrom:
+              secretKeyRef:
+                name: gcs-auth-token
+                key: token
+        successCondition: response.statusCode == 200
+
     # Per-model pipeline: patch -> fuzz-llm for a single model
+    # Uses HTTP checks to skip completed tasks (no Argo memoization - avoids nested DAG bugs)
     - name: per-model-pipeline
       inputs:
         parameters:
@@ -183,17 +203,25 @@ spec:
           - name: registry
           - name: build-version
           - name: fuzzing-duration
-      # Memoize at DAG level to avoid Argo bug with nested memoized tasks
-      # See: https://github.com/argoproj/argo-workflows/issues/12132
-      memoize:
-        key: "model-pipeline-{{inputs.parameters.case-id}}-{{inputs.parameters.model}}-{{inputs.parameters.experiment-id}}"
-        cache:
-          configMap:
-            name: arvo-model-pipeline-cache
-        maxAge: "720h"
       dag:
         tasks:
+          # Check if patch is already done (sub-second HTTP check)
+          # continueOn.failed allows DAG to proceed even when check returns 404
+          - name: check-patch-done
+            template: check-completion
+            continueOn:
+              failed: true
+            arguments:
+              parameters:
+                - name: bucket
+                  value: "{{inputs.parameters.bucket}}"
+                - name: path
+                  value: "results%2F{{inputs.parameters.experiment-id}}%2F{{inputs.parameters.case-id}}%2F{{inputs.parameters.model}}%2Fpatch%2F_SUCCESS"
+
+          # Run patch only if not already done (404 = not found = need to run)
           - name: patch
+            dependencies: [check-patch-done]
+            when: "{{tasks.check-patch-done.status}} == Failed"
             templateRef:
               name: arvo-patch
               template: patch-case
@@ -212,8 +240,24 @@ spec:
                 - name: build-version
                   value: "{{inputs.parameters.build-version}}"
 
+          # Check if fuzz is already done (runs after patch check and patch task)
+          # continueOn.failed allows DAG to proceed even when check returns 404
+          - name: check-fuzz-done
+            dependencies: [check-patch-done, patch]
+            template: check-completion
+            continueOn:
+              failed: true
+            arguments:
+              parameters:
+                - name: bucket
+                  value: "{{inputs.parameters.bucket}}"
+                - name: path
+                  value: "results%2F{{inputs.parameters.experiment-id}}%2F{{inputs.parameters.case-id}}%2F{{inputs.parameters.model}}%2F_SUCCESS"
+
+          # Run fuzz only if not already done
           - name: fuzz-llm
-            dependencies: [patch]
+            dependencies: [check-fuzz-done]
+            when: "{{tasks.check-fuzz-done.status}} == Failed"
             templateRef:
               name: arvo-fuzz
               template: fuzz-case

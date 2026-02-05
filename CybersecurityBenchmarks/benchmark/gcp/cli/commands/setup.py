@@ -227,7 +227,7 @@ def setup(
                 "-n",
                 "argo",
                 "-f",
-                "https://github.com/argoproj/argo-workflows/releases/download/v3.5.12/install.yaml",
+                "https://github.com/argoproj/argo-workflows/releases/download/v3.7.8/install.yaml",
             ],
             check=False,
         )

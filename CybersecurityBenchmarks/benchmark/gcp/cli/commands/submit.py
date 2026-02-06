@@ -290,39 +290,32 @@ def _sanitize_name(name: str) -> str:
 
 def _generate_workflow_yaml(
     base_workflow_path: Path,
-    cases: list[int | str],
     agent_specs: list[AgentSpec],
-    registry: str,
     run_gt: bool = True,
-    patch_use_spot: bool = True,
-    fuzz_use_spot: bool = True,
 ) -> str:
-    """Generate a completely flat workflow YAML with no withParam or nested DAGs.
+    """Generate workflow YAML with a case-pipeline template for withParam expansion.
 
-    This generates all tasks for all (case, agent_spec) combinations directly in
-    the main DAG, avoiding Argo bugs with dynamic task tracking and nested DAGs.
+    Instead of inlining O(cases x agents) tasks in a flat DAG, this generates a
+    single case-pipeline DAG template with O(agents) tasks. The main DAG uses
+    withParam to iterate over cases, invoking this template once per case.
+    Cases are passed at submit time via the cases-json workflow parameter.
 
-    Structure:
-    - build-casr, build-dd (dependency builds, conditional)
-    - chk-build-vul-{case}, build-vul-{case} for each case
-    - chk-build-fix-{case}, build-fix-{case} for each case
-    - For each (case, agent_spec):
-      - chk-patch-{case}-{agent-id}: check if patch done
-      - patch-{case}-{agent-id}: run patch if needed
-      - chk-fuzz-{case}-{agent-id}: check if fuzz done
-      - fuzz-{case}-{agent-id}: run fuzz if needed
-    - For each case (if run_gt):
-      - chk-gt-{case}: check if GT done
-      - fuzz-gt-{case}: run GT fuzz if needed
+    The case-pipeline template contains:
+    - chk-build-vul, build-vul: check/build vulnerable image
+    - chk-build-fix, build-fix: check/build fixed image
+    - For each agent_spec:
+      - chk-patch-{agent-id}: check if patch done
+      - patch-{agent-id}: run patch if needed
+      - chk-fuzz-{agent-id}: check if fuzz done
+      - fuzz-{agent-id}: run fuzz if needed
+    - If run_gt:
+      - chk-gt: check if GT done
+      - fuzz-gt: run GT fuzz if needed
 
     Args:
         base_workflow_path: Path to the base workflow YAML file
-        cases: List of case IDs
         agent_specs: List of AgentSpec objects
-        registry: Artifact Registry path (e.g. us-central1-docker.pkg.dev/project/repo)
         run_gt: Whether to include ground truth fuzzing tasks
-        patch_use_spot: Whether patch jobs should use spot instances
-        fuzz_use_spot: Whether fuzz jobs should use spot instances
 
     Returns:
         Generated workflow YAML as a string
@@ -330,339 +323,349 @@ def _generate_workflow_yaml(
     with open(base_workflow_path) as f:
         workflow = yaml.safe_load(f)
 
-    # Find benchmark-pipeline template
-    for template in workflow["spec"]["templates"]:
-        if template["name"] == "benchmark-pipeline":
-            tasks = template["dag"]["tasks"]
+    # Build the case-pipeline DAG template tasks
+    # All case-specific references use {{inputs.parameters.case-id}}
+    # All workflow-level references use {{workflow.parameters.*}}
+    case_tasks: list[dict] = []
 
-            # Parse registry for Docker v2 API URL construction
-            # registry = "us-central1-docker.pkg.dev/project/repo"
-            registry_host, registry_path = registry.split("/", 1)
+    # --- Build tasks ---
 
-            # Generate tasks for each case
-            for case in cases:
-                case_safe = _sanitize_name(case)
-
-                # Check if vulnerable image already exists (Docker v2 manifests API)
-                vul_check_url = f"https://{registry_host}/v2/{registry_path}/arvo-{case}-vul/manifests/{{{{workflow.parameters.build-version}}}}"
-                tasks.append(
+    # Check if vulnerable image already exists (Docker v2 manifests API)
+    case_tasks.append(
+        {
+            "name": "chk-build-vul",
+            "template": "check-image",
+            "continueOn": {"failed": True},
+            "arguments": {
+                "parameters": [
                     {
-                        "name": f"chk-build-vul-{case_safe}",
-                        "template": "check-image",
-                        "continueOn": {"failed": True},
-                        "arguments": {
-                            "parameters": [
-                                {
-                                    "name": "url",
-                                    "value": vul_check_url,
-                                },
-                            ]
-                        },
-                    }
-                )
+                        "name": "url",
+                        "value": "{{workflow.parameters.registry-api-prefix}}/arvo-{{inputs.parameters.case-id}}-vul/manifests/{{workflow.parameters.build-version}}",
+                    },
+                ]
+            },
+        }
+    )
 
-                # Build vulnerable image (only if check failed = image doesn't exist)
-                tasks.append(
+    # Build vulnerable image (only if check failed = image doesn't exist)
+    case_tasks.append(
+        {
+            "name": "build-vul",
+            "dependencies": ["chk-build-vul"],
+            "when": "{{tasks.chk-build-vul.status}} == Failed",
+            "templateRef": {
+                "name": "arvo-build",
+                "template": "build-vul",
+            },
+            "arguments": {
+                "parameters": [
                     {
-                        "name": f"build-vul-{case_safe}",
-                        "dependencies": [
-                            f"chk-build-vul-{case_safe}",
-                            "build-casr",
-                            "build-dd",
-                        ],
-                        "when": f"{{{{tasks.chk-build-vul-{case_safe}.status}}}} == Failed",
-                        "templateRef": {
-                            "name": "arvo-build",
-                            "template": "build-vul",
-                        },
-                        "arguments": {
-                            "parameters": [
-                                {"name": "case-id", "value": str(case)},
-                                {
-                                    "name": "build-version",
-                                    "value": "{{workflow.parameters.build-version}}",
-                                },
-                                {
-                                    "name": "bucket",
-                                    "value": "{{workflow.parameters.bucket}}",
-                                },
-                                {
-                                    "name": "registry",
-                                    "value": "{{workflow.parameters.registry}}",
-                                },
-                            ]
-                        },
-                    }
-                )
-
-                # Check if fixed image already exists (Docker v2 manifests API)
-                fix_check_url = f"https://{registry_host}/v2/{registry_path}/arvo-{case}-fix/manifests/{{{{workflow.parameters.build-version}}}}"
-                tasks.append(
+                        "name": "case-id",
+                        "value": "{{inputs.parameters.case-id}}",
+                    },
                     {
-                        "name": f"chk-build-fix-{case_safe}",
-                        "template": "check-image",
-                        "continueOn": {"failed": True},
-                        "arguments": {
-                            "parameters": [
-                                {
-                                    "name": "url",
-                                    "value": fix_check_url,
-                                },
-                            ]
-                        },
-                    }
-                )
-
-                # Build fixed image (only if check failed = image doesn't exist)
-                tasks.append(
+                        "name": "build-version",
+                        "value": "{{workflow.parameters.build-version}}",
+                    },
                     {
-                        "name": f"build-fix-{case_safe}",
-                        "dependencies": [
-                            f"chk-build-fix-{case_safe}",
-                            "build-casr",
-                            "build-dd",
-                        ],
-                        "when": f"{{{{tasks.chk-build-fix-{case_safe}.status}}}} == Failed",
-                        "templateRef": {
-                            "name": "arvo-build",
-                            "template": "build-fix",
+                        "name": "bucket",
+                        "value": "{{workflow.parameters.bucket}}",
+                    },
+                    {
+                        "name": "registry",
+                        "value": "{{workflow.parameters.registry}}",
+                    },
+                ]
+            },
+        }
+    )
+
+    # Check if fixed image already exists (Docker v2 manifests API)
+    case_tasks.append(
+        {
+            "name": "chk-build-fix",
+            "template": "check-image",
+            "continueOn": {"failed": True},
+            "arguments": {
+                "parameters": [
+                    {
+                        "name": "url",
+                        "value": "{{workflow.parameters.registry-api-prefix}}/arvo-{{inputs.parameters.case-id}}-fix/manifests/{{workflow.parameters.build-version}}",
+                    },
+                ]
+            },
+        }
+    )
+
+    # Build fixed image (only if check failed = image doesn't exist)
+    case_tasks.append(
+        {
+            "name": "build-fix",
+            "dependencies": ["chk-build-fix"],
+            "when": "{{tasks.chk-build-fix.status}} == Failed",
+            "templateRef": {
+                "name": "arvo-build",
+                "template": "build-fix",
+            },
+            "arguments": {
+                "parameters": [
+                    {
+                        "name": "case-id",
+                        "value": "{{inputs.parameters.case-id}}",
+                    },
+                    {
+                        "name": "build-version",
+                        "value": "{{workflow.parameters.build-version}}",
+                    },
+                    {
+                        "name": "bucket",
+                        "value": "{{workflow.parameters.bucket}}",
+                    },
+                    {
+                        "name": "registry",
+                        "value": "{{workflow.parameters.registry}}",
+                    },
+                ]
+            },
+        }
+    )
+
+    # --- Agent tasks (one set per agent spec, statically expanded) ---
+    for spec in agent_specs:
+        id_safe = _sanitize_name(spec.id)
+
+        # Check if patch is done
+        case_tasks.append(
+            {
+                "name": f"chk-patch-{id_safe}",
+                "dependencies": [
+                    "chk-build-vul",
+                    "build-vul",
+                    "chk-build-fix",
+                    "build-fix",
+                ],
+                "template": "check-completion",
+                "continueOn": {"failed": True},
+                "arguments": {
+                    "parameters": [
+                        {
+                            "name": "bucket",
+                            "value": "{{workflow.parameters.bucket}}",
                         },
-                        "arguments": {
-                            "parameters": [
-                                {"name": "case-id", "value": str(case)},
-                                {
-                                    "name": "build-version",
-                                    "value": "{{workflow.parameters.build-version}}",
-                                },
-                                {
-                                    "name": "bucket",
-                                    "value": "{{workflow.parameters.bucket}}",
-                                },
-                                {
-                                    "name": "registry",
-                                    "value": "{{workflow.parameters.registry}}",
-                                },
-                            ]
+                        {
+                            "name": "path",
+                            "value": f"results%2F{{{{workflow.parameters.experiment-id}}}}%2F{{{{inputs.parameters.case-id}}}}%2F{spec.id}%2Fpatch%2F_SUCCESS",
                         },
-                    }
-                )
+                    ]
+                },
+            }
+        )
 
-                # Generate tasks for each agent spec
-                for spec in agent_specs:
-                    id_safe = _sanitize_name(spec.id)
-                    suffix = f"{case_safe}-{id_safe}"
-
-                    # Check if patch is done
-                    tasks.append(
+        # Patch task
+        case_tasks.append(
+            {
+                "name": f"patch-{id_safe}",
+                "dependencies": [f"chk-patch-{id_safe}"],
+                "when": f"{{{{tasks.chk-patch-{id_safe}.status}}}} == Failed",
+                "templateRef": {
+                    "name": "arvo-patch",
+                    "template": "patch-case",
+                },
+                "arguments": {
+                    "parameters": [
                         {
-                            "name": f"chk-patch-{suffix}",
-                            "dependencies": [
-                                f"chk-build-vul-{case_safe}",
-                                f"build-vul-{case_safe}",
-                                f"chk-build-fix-{case_safe}",
-                                f"build-fix-{case_safe}",
-                            ],
-                            "template": "check-completion",
-                            "continueOn": {"failed": True},
-                            "arguments": {
-                                "parameters": [
-                                    {
-                                        "name": "bucket",
-                                        "value": "{{workflow.parameters.bucket}}",
-                                    },
-                                    {
-                                        "name": "path",
-                                        "value": f"results%2F{{{{workflow.parameters.experiment-id}}}}%2F{case}%2F{spec.id}%2Fpatch%2F_SUCCESS",
-                                    },
-                                ]
-                            },
-                        }
-                    )
-
-                    # Patch task
-                    tasks.append(
+                            "name": "case-id",
+                            "value": "{{inputs.parameters.case-id}}",
+                        },
+                        {"name": "model", "value": spec.model},
+                        {"name": "agent-id", "value": spec.id},
                         {
-                            "name": f"patch-{suffix}",
-                            "dependencies": [f"chk-patch-{suffix}"],
-                            "when": f"{{{{tasks.chk-patch-{suffix}.status}}}} == Failed",
-                            "templateRef": {
-                                "name": "arvo-patch",
-                                "template": "patch-case",
-                            },
-                            "arguments": {
-                                "parameters": [
-                                    {"name": "case-id", "value": str(case)},
-                                    {"name": "model", "value": spec.model},
-                                    {"name": "agent-id", "value": spec.id},
-                                    {
-                                        "name": "agent-config",
-                                        "value": spec.to_agent_config_json(),
-                                    },
-                                    {
-                                        "name": "experiment-id",
-                                        "value": "{{workflow.parameters.experiment-id}}",
-                                    },
-                                    {
-                                        "name": "bucket",
-                                        "value": "{{workflow.parameters.bucket}}",
-                                    },
-                                    {
-                                        "name": "registry",
-                                        "value": "{{workflow.parameters.registry}}",
-                                    },
-                                    {
-                                        "name": "build-version",
-                                        "value": "{{workflow.parameters.build-version}}",
-                                    },
-                                    {
-                                        "name": "use-spot",
-                                        "value": str(patch_use_spot).lower(),
-                                    },
-                                ]
-                            },
-                        }
-                    )
-
-                    # Check if fuzz is done
-                    tasks.append(
+                            "name": "agent-config",
+                            "value": spec.to_agent_config_json(),
+                        },
                         {
-                            "name": f"chk-fuzz-{suffix}",
-                            "dependencies": [f"chk-patch-{suffix}", f"patch-{suffix}"],
-                            "template": "check-completion",
-                            "continueOn": {"failed": True},
-                            "arguments": {
-                                "parameters": [
-                                    {
-                                        "name": "bucket",
-                                        "value": "{{workflow.parameters.bucket}}",
-                                    },
-                                    {
-                                        "name": "path",
-                                        "value": f"results%2F{{{{workflow.parameters.experiment-id}}}}%2F{case}%2F{spec.id}%2F_SUCCESS",
-                                    },
-                                ]
-                            },
-                        }
-                    )
-
-                    # Fuzz task
-                    tasks.append(
+                            "name": "experiment-id",
+                            "value": "{{workflow.parameters.experiment-id}}",
+                        },
                         {
-                            "name": f"fuzz-{suffix}",
-                            "dependencies": [f"chk-fuzz-{suffix}"],
-                            "when": f"{{{{tasks.chk-fuzz-{suffix}.status}}}} == Failed",
-                            "templateRef": {
-                                "name": "arvo-fuzz",
-                                "template": "fuzz-case",
-                            },
-                            "arguments": {
-                                "parameters": [
-                                    {"name": "case-id", "value": str(case)},
-                                    {"name": "target", "value": "llm_patch"},
-                                    {"name": "model", "value": spec.model},
-                                    {"name": "agent-id", "value": spec.id},
-                                    {
-                                        "name": "experiment-id",
-                                        "value": "{{workflow.parameters.experiment-id}}",
-                                    },
-                                    {
-                                        "name": "bucket",
-                                        "value": "{{workflow.parameters.bucket}}",
-                                    },
-                                    {
-                                        "name": "registry",
-                                        "value": "{{workflow.parameters.registry}}",
-                                    },
-                                    {
-                                        "name": "build-version",
-                                        "value": "{{workflow.parameters.build-version}}",
-                                    },
-                                    {
-                                        "name": "fuzzing-duration",
-                                        "value": "{{workflow.parameters.fuzzing-duration}}",
-                                    },
-                                    {
-                                        "name": "use-spot",
-                                        "value": str(fuzz_use_spot).lower(),
-                                    },
-                                ]
-                            },
-                        }
-                    )
-
-                # GT fuzzing tasks (if enabled)
-                if run_gt:
-                    # Check if GT is done
-                    tasks.append(
+                            "name": "bucket",
+                            "value": "{{workflow.parameters.bucket}}",
+                        },
                         {
-                            "name": f"chk-gt-{case_safe}",
-                            "dependencies": [
-                                f"chk-build-fix-{case_safe}",
-                                f"build-fix-{case_safe}",
-                            ],
-                            "template": "check-completion",
-                            "continueOn": {"failed": True},
-                            "arguments": {
-                                "parameters": [
-                                    {
-                                        "name": "bucket",
-                                        "value": "{{workflow.parameters.bucket}}",
-                                    },
-                                    {
-                                        "name": "path",
-                                        "value": f"results%2F{{{{workflow.parameters.experiment-id}}}}%2F{case}%2Fgt%2F_SUCCESS",
-                                    },
-                                ]
-                            },
-                        }
-                    )
-
-                    # GT fuzz task
-                    tasks.append(
+                            "name": "registry",
+                            "value": "{{workflow.parameters.registry}}",
+                        },
                         {
-                            "name": f"fuzz-gt-{case_safe}",
-                            "dependencies": [f"chk-gt-{case_safe}"],
-                            "when": f"{{{{tasks.chk-gt-{case_safe}.status}}}} == Failed",
-                            "templateRef": {
-                                "name": "arvo-fuzz",
-                                "template": "fuzz-case",
-                            },
-                            "arguments": {
-                                "parameters": [
-                                    {"name": "case-id", "value": str(case)},
-                                    {"name": "target", "value": "ground_truth"},
-                                    {"name": "model", "value": "gt"},
-                                    {"name": "agent-id", "value": "gt"},
-                                    {
-                                        "name": "experiment-id",
-                                        "value": "{{workflow.parameters.experiment-id}}",
-                                    },
-                                    {
-                                        "name": "bucket",
-                                        "value": "{{workflow.parameters.bucket}}",
-                                    },
-                                    {
-                                        "name": "registry",
-                                        "value": "{{workflow.parameters.registry}}",
-                                    },
-                                    {
-                                        "name": "build-version",
-                                        "value": "{{workflow.parameters.build-version}}",
-                                    },
-                                    {
-                                        "name": "fuzzing-duration",
-                                        "value": "{{workflow.parameters.fuzzing-duration}}",
-                                    },
-                                    {
-                                        "name": "use-spot",
-                                        "value": str(fuzz_use_spot).lower(),
-                                    },
-                                ]
-                            },
-                        }
-                    )
+                            "name": "build-version",
+                            "value": "{{workflow.parameters.build-version}}",
+                        },
+                        {
+                            "name": "use-spot",
+                            "value": "{{workflow.parameters.patch-use-spot}}",
+                        },
+                    ]
+                },
+            }
+        )
 
-            break
+        # Check if fuzz is done
+        case_tasks.append(
+            {
+                "name": f"chk-fuzz-{id_safe}",
+                "dependencies": [f"chk-patch-{id_safe}", f"patch-{id_safe}"],
+                "template": "check-completion",
+                "continueOn": {"failed": True},
+                "arguments": {
+                    "parameters": [
+                        {
+                            "name": "bucket",
+                            "value": "{{workflow.parameters.bucket}}",
+                        },
+                        {
+                            "name": "path",
+                            "value": f"results%2F{{{{workflow.parameters.experiment-id}}}}%2F{{{{inputs.parameters.case-id}}}}%2F{spec.id}%2F_SUCCESS",
+                        },
+                    ]
+                },
+            }
+        )
+
+        # Fuzz task
+        case_tasks.append(
+            {
+                "name": f"fuzz-{id_safe}",
+                "dependencies": [f"chk-fuzz-{id_safe}"],
+                "when": f"{{{{tasks.chk-fuzz-{id_safe}.status}}}} == Failed",
+                "templateRef": {
+                    "name": "arvo-fuzz",
+                    "template": "fuzz-case",
+                },
+                "arguments": {
+                    "parameters": [
+                        {
+                            "name": "case-id",
+                            "value": "{{inputs.parameters.case-id}}",
+                        },
+                        {"name": "target", "value": "llm_patch"},
+                        {"name": "model", "value": spec.model},
+                        {"name": "agent-id", "value": spec.id},
+                        {
+                            "name": "experiment-id",
+                            "value": "{{workflow.parameters.experiment-id}}",
+                        },
+                        {
+                            "name": "bucket",
+                            "value": "{{workflow.parameters.bucket}}",
+                        },
+                        {
+                            "name": "registry",
+                            "value": "{{workflow.parameters.registry}}",
+                        },
+                        {
+                            "name": "build-version",
+                            "value": "{{workflow.parameters.build-version}}",
+                        },
+                        {
+                            "name": "fuzzing-duration",
+                            "value": "{{workflow.parameters.fuzzing-duration}}",
+                        },
+                        {
+                            "name": "use-spot",
+                            "value": "{{workflow.parameters.fuzz-use-spot}}",
+                        },
+                    ]
+                },
+            }
+        )
+
+    # --- GT fuzzing tasks (if enabled) ---
+    if run_gt:
+        # Check if GT is done
+        case_tasks.append(
+            {
+                "name": "chk-gt",
+                "dependencies": [
+                    "chk-build-fix",
+                    "build-fix",
+                ],
+                "template": "check-completion",
+                "continueOn": {"failed": True},
+                "arguments": {
+                    "parameters": [
+                        {
+                            "name": "bucket",
+                            "value": "{{workflow.parameters.bucket}}",
+                        },
+                        {
+                            "name": "path",
+                            "value": "results%2F{{workflow.parameters.experiment-id}}%2F{{inputs.parameters.case-id}}%2Fgt%2F_SUCCESS",
+                        },
+                    ]
+                },
+            }
+        )
+
+        # GT fuzz task
+        case_tasks.append(
+            {
+                "name": "fuzz-gt",
+                "dependencies": ["chk-gt"],
+                "when": "{{tasks.chk-gt.status}} == Failed",
+                "templateRef": {
+                    "name": "arvo-fuzz",
+                    "template": "fuzz-case",
+                },
+                "arguments": {
+                    "parameters": [
+                        {
+                            "name": "case-id",
+                            "value": "{{inputs.parameters.case-id}}",
+                        },
+                        {"name": "target", "value": "ground_truth"},
+                        {"name": "model", "value": "gt"},
+                        {"name": "agent-id", "value": "gt"},
+                        {
+                            "name": "experiment-id",
+                            "value": "{{workflow.parameters.experiment-id}}",
+                        },
+                        {
+                            "name": "bucket",
+                            "value": "{{workflow.parameters.bucket}}",
+                        },
+                        {
+                            "name": "registry",
+                            "value": "{{workflow.parameters.registry}}",
+                        },
+                        {
+                            "name": "build-version",
+                            "value": "{{workflow.parameters.build-version}}",
+                        },
+                        {
+                            "name": "fuzzing-duration",
+                            "value": "{{workflow.parameters.fuzzing-duration}}",
+                        },
+                        {
+                            "name": "use-spot",
+                            "value": "{{workflow.parameters.fuzz-use-spot}}",
+                        },
+                    ]
+                },
+            }
+        )
+
+    # Add case-pipeline template to workflow
+    case_pipeline_template = {
+        "name": "case-pipeline",
+        "inputs": {
+            "parameters": [
+                {"name": "case-id"},
+            ]
+        },
+        "dag": {
+            "tasks": case_tasks,
+        },
+    }
+    workflow["spec"]["templates"].append(case_pipeline_template)
 
     return yaml.dump(workflow, default_flow_style=False, sort_keys=False)
 
@@ -872,37 +875,41 @@ def submit(
             typer.echo("  Warning: Runtime tarball not found.")
         typer.echo()
 
-    # Generate fully-flat workflow YAML with all tasks inlined
-    # This avoids all withParam and nested DAGs which cause Argo completion bugs
+    # Generate workflow YAML with case-pipeline template (withParam over cases)
+    # Agent tasks are statically expanded in the template; cases are passed via parameter
     base_workflow_path = get_script_dir() / "argo" / "workflows" / "arvo-benchmark.yaml"
-    typer.echo("Generating flat workflow (no withParam, no nested DAGs)...")
+    tasks_per_case = 4 + len(run_config.agents) * 4  # build checks + agent tasks
+    if run_config.run_gt:
+        tasks_per_case += 2  # GT tasks
+    total_tasks = len(run_config.cases) * tasks_per_case
+    typer.echo("Generating workflow (withParam over cases)...")
     typer.echo(f"  Cases: {len(run_config.cases)}")
     typer.echo(f"  Agents: {len(run_config.agents)}")
-    total_tasks = len(run_config.cases) * (
-        4 + len(run_config.agents) * 4
-    )  # build checks + builds + agent tasks
-    if run_config.run_gt:
-        total_tasks += len(run_config.cases) * 2  # GT tasks per case
-    typer.echo(f"  Total tasks: {total_tasks}")
+    typer.echo(f"  Tasks per case: {tasks_per_case}")
+    typer.echo(f"  Total tasks (runtime): {total_tasks}")
     workflow_yaml = _generate_workflow_yaml(
         base_workflow_path,
-        run_config.cases,
         run_config.agents,
-        registry=gke_config.artifact_registry,
         run_gt=run_config.run_gt,
-        patch_use_spot=run_config.patch_use_spot,
-        fuzz_use_spot=run_config.fuzz_use_spot,
     )
     typer.echo()
 
-    # Build workflow parameters (agent-specific values are inlined per-task)
+    # Compute derived parameter values
+    registry_host, registry_path = gke_config.artifact_registry.split("/", 1)
+    registry_api_prefix = f"https://{registry_host}/v2/{registry_path}"
+    cases_json = json.dumps([str(c) for c in run_config.cases])
+
+    # Build workflow parameters
     parameters = {
         "experiment-id": run_config.experiment_id,
         "bucket": gke_config.bucket_name,
         "registry": gke_config.artifact_registry,
+        "registry-api-prefix": registry_api_prefix,
         "build-version": run_config.build_version,
         "fuzzing-duration": str(run_config.fuzzing_duration),
-        "run-gt": str(run_config.run_gt).lower(),
+        "cases-json": cases_json,
+        "patch-use-spot": str(run_config.patch_use_spot).lower(),
+        "fuzz-use-spot": str(run_config.fuzz_use_spot).lower(),
         "build-casr": str(build_casr).lower(),
         "build-dd": str(build_dd).lower(),
     }
@@ -917,17 +924,22 @@ def submit(
     if dry_run:
         typer.echo("Dry run - would submit workflow with:")
         for key, value in parameters.items():
-            typer.echo(f"  {key}: {value}")
+            if key == "cases-json":
+                typer.echo(f"  {key}: [{len(run_config.cases)} cases]")
+            else:
+                typer.echo(f"  {key}: {value}")
         typer.echo()
-        typer.echo("Generated task structure (per case):")
-        typer.echo("  - chk-build-vul-{case} -> build-vul-{case}")
-        typer.echo("  - chk-build-fix-{case} -> build-fix-{case}")
+        typer.echo("Workflow structure:")
+        typer.echo("  Main DAG: build-casr, build-dd -> process-cases (withParam)")
+        typer.echo(f"  case-pipeline template ({tasks_per_case} tasks per case):")
+        typer.echo("    - chk-build-vul -> build-vul")
+        typer.echo("    - chk-build-fix -> build-fix")
         for spec in run_config.agents:
             id_safe = _sanitize_name(spec.id)
-            typer.echo(f"  - chk-patch-{{case}}-{id_safe} -> patch-{{case}}-{id_safe}")
-            typer.echo(f"  - chk-fuzz-{{case}}-{id_safe} -> fuzz-{{case}}-{id_safe}")
+            typer.echo(f"    - chk-patch-{id_safe} -> patch-{id_safe}")
+            typer.echo(f"    - chk-fuzz-{id_safe} -> fuzz-{id_safe}")
         if run_config.run_gt:
-            typer.echo("  - chk-gt-{case} -> fuzz-gt-{case}")
+            typer.echo("    - chk-gt -> fuzz-gt")
         if build_casr or build_dd:
             typer.echo()
             echo_info("Dependency builds included in workflow:")

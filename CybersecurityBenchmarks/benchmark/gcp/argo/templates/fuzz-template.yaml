@@ -10,8 +10,8 @@ spec:
         parameters:
           - name: case-id
           - name: target # "ground_truth" or "llm_patch"
-          - name: model      # LLM model name (metadata)
-          - name: agent-id   # Unique agent identifier (for GCS paths)
+          - name: model # LLM model name (metadata)
+          - name: agent-id # Unique agent identifier (for GCS paths)
           - name: experiment-id
           - name: bucket
           - name: registry

@@ -137,7 +137,7 @@ def setup(
 
         # Create batch-build pool for build jobs (8-16 vCPU)
         typer.echo("[3/6] Creating Spot node pools...")
-        typer.echo("  Creating batch-build pool (e2-standard-16 for builds)...")
+        typer.echo("  Creating batch-build pool (n4-standard-16 for builds)...")
         result = subprocess.run(
             [
                 "gcloud",
@@ -148,7 +148,7 @@ def setup(
                 f"--cluster={config.cluster_name}",
                 f"--project={config.project_id}",
                 f"--zone={config.zone}",
-                "--machine-type=e2-standard-16",
+                "--machine-type=n4-standard-16",
                 "--spot",
                 "--num-nodes=0",
                 "--enable-autoscaling",

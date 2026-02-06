@@ -116,9 +116,7 @@ def parse_agent_specs(raw_agents: list) -> tuple[list[AgentSpec], bool]:
             continue
 
         if not isinstance(entry, dict):
-            raise ValueError(
-                f"Invalid agent spec: {entry!r}. Expected a dict or 'gt'."
-            )
+            raise ValueError(f"Invalid agent spec: {entry!r}. Expected a dict or 'gt'.")
 
         # Validate required fields
         if "agent" not in entry:
@@ -133,9 +131,7 @@ def parse_agent_specs(raw_agents: list) -> tuple[list[AgentSpec], bool]:
         agent_id = entry.get("id", f"{agent_type}-{model}")
 
         # Collect extra params (everything except id, agent, model)
-        params = {
-            k: v for k, v in entry.items() if k not in ("id", "agent", "model")
-        }
+        params = {k: v for k, v in entry.items() if k not in ("id", "agent", "model")}
 
         # Check for duplicate IDs
         if agent_id in seen_ids:

@@ -188,12 +188,12 @@ def parse_agent_config(args: argparse.Namespace) -> dict:
         agent_id = config.get("id")
 
         # All other fields become kwargs for the agent constructor
-        kwargs = {
-            k: v for k, v in config.items() if k not in ("id", "agent", "model")
-        }
+        kwargs = {k: v for k, v in config.items() if k not in ("id", "agent", "model")}
 
-        LOG.info(f"Agent config from JSON: agent={agent_name}, model={model}, "
-                 f"id={agent_id}, params={kwargs}")
+        LOG.info(
+            f"Agent config from JSON: agent={agent_name}, model={model}, "
+            f"id={agent_id}, params={kwargs}"
+        )
         return {
             "agent_name": agent_name,
             "model": model,

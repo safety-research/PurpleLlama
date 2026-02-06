@@ -174,7 +174,12 @@ def get_result(
         str, typer.Argument(help="Result key (crashes, result, patch, chat, metadata)")
     ] = "result",
     agent_id: Annotated[
-        str, typer.Option("--agent-id", "-a", help="Agent ID (e.g., autopatchbench-claude-sonnet-4-20250514)")
+        str,
+        typer.Option(
+            "--agent-id",
+            "-a",
+            help="Agent ID (e.g., autopatchbench-claude-sonnet-4-20250514)",
+        ),
     ] = "",
     list_keys: Annotated[
         bool, typer.Option("--list-keys", "-l", help="List available keys")

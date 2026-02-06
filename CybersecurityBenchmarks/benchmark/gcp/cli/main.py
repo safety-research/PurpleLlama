@@ -181,7 +181,9 @@ def cmd_exp_result(
         "result", help="Result key (crashes, result, patch, chat)"
     ),
     agent_id: str = typer.Option(
-        "", "-a", "--agent-id",
+        "",
+        "-a",
+        "--agent-id",
         help="Agent ID (e.g., autopatchbench-claude-sonnet-4-20250514)",
     ),
     list_keys: bool = typer.Option(

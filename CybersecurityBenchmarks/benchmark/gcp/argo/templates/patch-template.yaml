@@ -9,9 +9,9 @@ spec:
       inputs:
         parameters:
           - name: case-id
-          - name: model          # LLM model name (for semaphore rate limiting)
-          - name: agent-id       # Unique agent identifier (for GCS paths, task naming)
-          - name: agent-config   # JSON blob passed to agent runtime
+          - name: model # LLM model name (for semaphore rate limiting)
+          - name: agent-id # Unique agent identifier (for GCS paths, task naming)
+          - name: agent-config # JSON blob passed to agent runtime
           - name: experiment-id
           - name: bucket
           - name: registry
@@ -91,7 +91,7 @@ spec:
           factor: 2
           cap: "5m"
 
-      activeDeadlineSeconds: 7200
+      activeDeadlineSeconds: 18000
 
       initContainers:
         - name: fetch-runtime

@@ -71,6 +71,74 @@ def get_all_crash_files(crash_dir: str) -> List[Path]:
     return crash_files
 
 
+def _pseudo_cluster_for_filename(filename: str) -> str:
+    """
+    Return a pseudo-cluster ID based on the crash filename prefix.
+
+    Crashes that CASR cannot analyze (OOM, timeout, leak) or that we
+    otherwise cannot identify are grouped into a single pseudo-cluster
+    per crash type rather than being treated as individual unique crashes.
+
+    Args:
+        filename: Crash filename (e.g., "oom-abc123", "crash-def456")
+
+    Returns:
+        Pseudo-cluster ID (e.g., "pseudo-oom", "pseudo-unknown")
+    """
+    for prefix in ["oom", "timeout", "leak"]:
+        if filename.startswith(f"{prefix}-"):
+            return f"pseudo-{prefix}"
+    return "pseudo-unknown"
+
+
+def _pseudo_cluster_for_crash_type(crash_type: str) -> str:
+    """
+    Return a pseudo-cluster ID based on the crash type string.
+
+    Like _pseudo_cluster_for_filename but operates on the crash_type
+    field from CrashInfo (e.g., "oom", "timeout", "leak", "crash").
+
+    Args:
+        crash_type: Crash type string (e.g., "oom", "timeout", "leak")
+
+    Returns:
+        Pseudo-cluster ID (e.g., "pseudo-oom", "pseudo-unknown")
+    """
+    if crash_type in ("oom", "timeout", "leak"):
+        return f"pseudo-{crash_type}"
+    return "pseudo-unknown"
+
+
+def _assign_pseudo_clusters(crash_files: List[Path]) -> Dict[str, str]:
+    """
+    Assign all crash files to pseudo-clusters based on their type.
+
+    Used as a fallback when CASR is unavailable, fails, or produces
+    no mapping. Groups all crashes of the same type into a single
+    pseudo-cluster instead of treating each as unique.
+
+    Args:
+        crash_files: List of crash file paths
+
+    Returns:
+        Dict mapping crash filename to pseudo-cluster ID
+    """
+    crash_to_cluster: Dict[str, str] = {}
+    for crash_file in crash_files:
+        crash_to_cluster[crash_file.name] = _pseudo_cluster_for_filename(
+            crash_file.name
+        )
+
+    # Log the pseudo-cluster distribution
+    cluster_counts: Dict[str, int] = {}
+    for cluster_id in crash_to_cluster.values():
+        cluster_counts[cluster_id] = cluster_counts.get(cluster_id, 0) + 1
+    for cluster_id, count in sorted(cluster_counts.items()):
+        LOG.info(f"  Pseudo-cluster {cluster_id}: {count} crashes")
+
+    return crash_to_cluster
+
+
 def run_casr_cluster_map(
     crashes_dir: str,
     output_dir: str,
@@ -113,11 +181,10 @@ def run_casr_cluster_map(
     )
 
     if not is_casr_available():
-        LOG.warning("casr-cluster-map not available, skipping clustering")
-        # Return each crash as its own cluster
-        for i, crash_file in enumerate(crash_files, 1):
-            crash_to_cluster[crash_file.name] = f"cl{i}"
-        return crash_to_cluster
+        LOG.warning(
+            "casr-cluster-map not available, assigning pseudo-clusters by crash type"
+        )
+        return _assign_pseudo_clusters(crash_files)
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -220,25 +287,27 @@ def run_casr_cluster_map(
             LOG.info(
                 f"CASR mapped {len(crash_to_cluster)} crashes to {num_clusters} clusters"
             )
-        else:
-            # Fallback: each crash is its own cluster
-            LOG.warning(
-                "CASR produced no mapping, using fallback (each crash = own cluster)"
-            )
-            for i, crash_file in enumerate(crash_files, 1):
-                crash_to_cluster[crash_file.name] = f"cl{i}"
 
     except subprocess.TimeoutExpired:
-        LOG.warning("CASR clustering timed out after 300s")
-        # Fallback
-        for i, crash_file in enumerate(crash_files, 1):
-            crash_to_cluster[crash_file.name] = f"cl{i}"
+        LOG.warning("CASR clustering timed out after 600s")
 
     except Exception as e:
         LOG.warning(f"CASR clustering error: {e}")
-        # Fallback
-        for i, crash_file in enumerate(crash_files, 1):
-            crash_to_cluster[crash_file.name] = f"cl{i}"
+
+    # For any crash files NOT mapped by CASR (e.g. OOMs, timeouts, leaks,
+    # or crashes CASR failed to analyze), assign pseudo-clusters by type.
+    # This ensures OOMs etc. are grouped together as one "unique" crash
+    # rather than each being treated as a separate unique crash.
+    unmapped = [f for f in crash_files if f.name not in crash_to_cluster]
+    if unmapped:
+        LOG.info(
+            f"Assigning pseudo-clusters for {len(unmapped)} unmapped crashes "
+            f"(out of {len(crash_files)} total)"
+        )
+        for crash_file in unmapped:
+            crash_to_cluster[crash_file.name] = _pseudo_cluster_for_filename(
+                crash_file.name
+            )
 
     return crash_to_cluster
 
@@ -374,8 +443,9 @@ def deduplicate_timeline(
         if cluster_id:
             crash.cluster_id = cluster_id
         else:
-            # Fallback: use crash_id as cluster_id
-            crash.cluster_id = crash.crash_id
+            # Fallback: assign pseudo-cluster by crash type rather than
+            # treating each crash as unique (which inflates unique counts)
+            crash.cluster_id = _pseudo_cluster_for_crash_type(crash.crash_type)
 
     return timeline
 

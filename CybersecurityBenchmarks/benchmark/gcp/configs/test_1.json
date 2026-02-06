@@ -1,8 +1,8 @@
 {
-  "cases": [12803],
+  "cases": [3408],
   "agents": [
     "gt",
-    {"agent": "autopatchbench", "model": "claude-sonnet-4-20250514"}
+    {"agent": "autopatchbench", "model": "claude-opus-4-5-20251101"}
   ],
   "fuzzing_duration": 60
 }

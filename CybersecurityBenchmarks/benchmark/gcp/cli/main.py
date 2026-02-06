@@ -167,10 +167,10 @@ def cmd_exp_list(
 @experiments_app.command("results")
 def cmd_exp_results(
     experiment_id: str = typer.Argument(..., help="Experiment ID"),
-    model: str = typer.Option(None, "-m", "--model", help="Filter by model"),
+    agent_id: str = typer.Option(None, "-a", "--agent-id", help="Filter by agent ID"),
 ) -> None:
     """Show experiment results."""
-    experiments.show_results(experiment_id=experiment_id, model=model)
+    experiments.show_results(experiment_id=experiment_id, agent_id=agent_id)
 
 
 @experiments_app.command("result")
@@ -180,8 +180,9 @@ def cmd_exp_result(
     key: str = typer.Argument(
         "result", help="Result key (crashes, result, patch, chat)"
     ),
-    model: str = typer.Option(
-        "claude-sonnet-4-20250514", "-m", "--model", help="Model name"
+    agent_id: str = typer.Option(
+        "", "-a", "--agent-id",
+        help="Agent ID (e.g., autopatchbench-claude-sonnet-4-20250514)",
     ),
     list_keys: bool = typer.Option(
         False, "-l", "--list-keys", help="List available keys"
@@ -192,7 +193,7 @@ def cmd_exp_result(
         experiment_id=experiment_id,
         case_id=case_id,
         key=key,
-        model=model,
+        agent_id=agent_id,
         list_keys=list_keys,
     )
 
@@ -381,14 +382,19 @@ def cmd_debug_vm_launch(
     job_type: str = typer.Option(
         "fuzz", "--type", "-t", help="Job type: fuzz or patch"
     ),
-    model: str = typer.Option(
+    agent_id: str = typer.Option(
         "gt",
-        "--model",
-        "-m",
-        help="Model name, or 'gt' for ground truth",
+        "--agent-id",
+        "-a",
+        help="Agent ID (e.g., autopatchbench-claude-sonnet-4-20250514), or 'gt' for ground truth",
+    ),
+    target: str = typer.Option(
+        "ground_truth",
+        "--target",
+        help="Fuzz target: ground_truth or llm_patch",
     ),
     experiment_id: Optional[str] = typer.Option(
-        None, "--experiment", "-e", help="Experiment ID (required when model is not 'gt')"
+        None, "--experiment", "-e", help="Experiment ID"
     ),
     build_version: str = typer.Option(
         "latest", "--build-version", help="Build version tag"
@@ -398,7 +404,8 @@ def cmd_debug_vm_launch(
     debug_vm.launch(
         case_id=case_id,
         job_type=job_type,
-        model=model,
+        agent_id=agent_id,
+        target=target,
         experiment_id=experiment_id,
         build_version=build_version,
     )

@@ -59,8 +59,8 @@ def list_experiments(
 @app.command("results")
 def show_results(
     experiment_id: Annotated[str, typer.Argument(help="Experiment ID")],
-    model: Annotated[
-        Optional[str], typer.Option("--model", "-m", help="Filter by model")
+    agent_id: Annotated[
+        Optional[str], typer.Option("--agent-id", "-a", help="Filter by agent ID")
     ] = None,
 ) -> None:
     """Show results for an experiment."""
@@ -100,31 +100,31 @@ def show_results(
     fail_count = 0
     pending_count = 0
 
-    typer.echo(f"{'CASE':<10} {'MODEL':<30} {'CRASH_FIXED':<15} {'STATUS'}")
-    typer.echo("-" * 70)
+    typer.echo(f"{'CASE':<10} {'AGENT':<40} {'CRASH_FIXED':<15} {'STATUS'}")
+    typer.echo("-" * 80)
 
     for case_id in cases[:50]:  # Limit output
-        # Check for model results
-        if model:
-            models_to_check = [model]
+        # Check for agent results
+        if agent_id:
+            agents_to_check = [agent_id]
         else:
-            # Auto-discover models from GCS for this case
-            models_result = subprocess.run(
+            # Auto-discover agents from GCS for this case
+            agents_result = subprocess.run(
                 ["gsutil", "ls", f"{base_path}/{case_id}/"],
                 capture_output=True,
                 text=True,
             )
-            if models_result.returncode == 0:
-                models_to_check = [
+            if agents_result.returncode == 0:
+                agents_to_check = [
                     line.rstrip("/").split("/")[-1]
-                    for line in models_result.stdout.strip().split("\n")
+                    for line in agents_result.stdout.strip().split("\n")
                     if line and not line.rstrip("/").split("/")[-1].startswith("_")
                 ]
             else:
-                models_to_check = ["gt"]  # Fallback
+                agents_to_check = ["gt"]  # Fallback
 
-        for m in models_to_check:
-            result_path = f"{base_path}/{case_id}/{m}/result.json"
+        for a in agents_to_check:
+            result_path = f"{base_path}/{case_id}/{a}/result.json"
             result = subprocess.run(
                 ["gsutil", "cat", result_path],
                 capture_output=True,
@@ -140,9 +140,9 @@ def show_results(
                         success_count += 1
                     else:
                         fail_count += 1
-                    typer.echo(f"{case_id:<10} {m:<30} {str(crash_fixed):<15} {status}")
+                    typer.echo(f"{case_id:<10} {a:<40} {str(crash_fixed):<15} {status}")
                 except json.JSONDecodeError:
-                    typer.echo(f"{case_id:<10} {m:<30} {'?':<15} ERROR")
+                    typer.echo(f"{case_id:<10} {a:<40} {'?':<15} ERROR")
             else:
                 pending_count += 1
 
@@ -159,7 +159,7 @@ def show_results(
 RESULT_KEYS = {
     "result": "result.json",
     "crashes": "crashes.json",
-    "patch": "patch.txt",
+    "patch": "patch.patch",
     "chat": "chat.md",
     "metadata": "metadata.json",
     "fuzzing_result": "fuzzing_result.json",
@@ -173,9 +173,9 @@ def get_result(
     key: Annotated[
         str, typer.Argument(help="Result key (crashes, result, patch, chat, metadata)")
     ] = "result",
-    model: Annotated[
-        str, typer.Option("--model", "-m", help="Model name")
-    ] = "claude-sonnet-4-20250514",
+    agent_id: Annotated[
+        str, typer.Option("--agent-id", "-a", help="Agent ID (e.g., autopatchbench-claude-sonnet-4-20250514)")
+    ] = "",
     list_keys: Annotated[
         bool, typer.Option("--list-keys", "-l", help="List available keys")
     ] = False,
@@ -183,15 +183,20 @@ def get_result(
     """Get a specific result file from an experiment.
 
     Examples:
-        experiments result default 12803 crashes --model claude-sonnet-4-20250514
+        experiments result default 12803 crashes --agent-id autopatchbench-claude-sonnet-4-20250514
         experiments result default 12803 result
-        experiments result default 12803 patch -m gt
+        experiments result default 12803 patch -a gt
     """
     if list_keys:
         typer.echo("Available result keys:")
         for k, filename in RESULT_KEYS.items():
             typer.echo(f"  {k:<15} -> {filename}")
         return
+
+    if not agent_id:
+        typer.echo("Error: --agent-id is required. Specify the agent identifier.")
+        typer.echo("Example: --agent-id autopatchbench-claude-sonnet-4-20250514")
+        raise typer.Exit(1)
 
     config = GKEConfig.load()
     if not config.is_configured():
@@ -201,7 +206,7 @@ def get_result(
     # Resolve key to filename
     filename = RESULT_KEYS.get(key, key)
 
-    gcs_path = f"gs://{config.bucket_name}/results/{experiment_id}/{case_id}/{model}/{filename}"
+    gcs_path = f"gs://{config.bucket_name}/results/{experiment_id}/{case_id}/{agent_id}/{filename}"
 
     result = subprocess.run(
         ["gsutil", "cat", gcs_path],

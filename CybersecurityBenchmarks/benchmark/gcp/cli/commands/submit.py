@@ -13,9 +13,17 @@ import typer
 import yaml
 
 from ..argo import get_current_user, submit_workflow
-from ..config import GKEConfig, RunConfig, get_script_dir, parse_cases
+from ..config import (
+    AgentSpec,
+    GKEConfig,
+    RunConfig,
+    get_script_dir,
+    parse_agent_specs,
+    parse_cases,
+)
 from ..hashing import (
     AUTOPATCH_BUILD_DIR,
+    check_runtime_needs_rebuild,
     compute_deps_source_hash,
     get_deps_manifest_from_gcs,
 )
@@ -23,20 +31,25 @@ from ..output import echo_error, echo_info, echo_success, echo_warning
 from . import semaphore
 
 
-def _check_semaphore_limits(models: list[str], dry_run: bool = False) -> bool:
-    """Check if all models have semaphore limits configured.
+def _check_semaphore_limits(
+    agent_specs: list[AgentSpec], dry_run: bool = False
+) -> bool:
+    """Check if all LLM models have semaphore limits configured.
+
+    Semaphores are keyed by raw model name (rate limiting is about API call
+    volume). Multiple agent specs sharing the same model share the semaphore.
 
     Args:
-        models: List of model names to check (excludes 'gt')
+        agent_specs: List of agent specs to check
         dry_run: If True, only show what would be done
 
     Returns:
         True if should continue, False if user aborted
     """
-    # Filter out 'gt' as it doesn't need rate limiting
-    llm_models = [m for m in models if m != "gt"]
+    # Extract unique model names from agent specs
+    unique_models = sorted(set(spec.model for spec in agent_specs))
 
-    if not llm_models:
+    if not unique_models:
         echo_info("No LLM models to check (only ground truth)")
         return True
 
@@ -44,7 +57,7 @@ def _check_semaphore_limits(models: list[str], dry_run: bool = False) -> bool:
     models_with_limits: list[tuple[str, Optional[int]]] = []
     models_without_limits = []
 
-    for model in llm_models:
+    for model in unique_models:
         is_configured, limit = semaphore.get_model_limit(model)
         if is_configured:
             models_with_limits.append((model, limit))
@@ -260,7 +273,7 @@ def _sanitize_name(name: str) -> str:
     """Convert a name to valid Kubernetes/Argo task name component.
 
     Args:
-        name: Name to sanitize (e.g., 'claude-sonnet-4-5-20250929' or '12803')
+        name: Name to sanitize (e.g., 'autopatchbench-claude-sonnet-4-20250514')
 
     Returns:
         Sanitized name valid for K8s (lowercase, alphanumeric and hyphens only)
@@ -272,30 +285,32 @@ def _sanitize_name(name: str) -> str:
     # Remove leading/trailing hyphens
     safe = safe.strip("-")
     # Truncate to reasonable length
-    return safe[:40]
+    return safe[:63]
 
 
 def _generate_workflow_yaml(
     base_workflow_path: Path,
     cases: list[int | str],
-    models: list[str],
+    agent_specs: list[AgentSpec],
+    registry: str,
     run_gt: bool = True,
     patch_use_spot: bool = True,
     fuzz_use_spot: bool = True,
 ) -> str:
     """Generate a completely flat workflow YAML with no withParam or nested DAGs.
 
-    This generates all tasks for all (case, model) combinations directly in the
-    main DAG, avoiding Argo bugs with dynamic task tracking and nested DAGs.
+    This generates all tasks for all (case, agent_spec) combinations directly in
+    the main DAG, avoiding Argo bugs with dynamic task tracking and nested DAGs.
 
     Structure:
     - build-casr, build-dd (dependency builds, conditional)
-    - build-vul-{case}, build-fix-{case} for each case
-    - For each (case, model):
-      - chk-patch-{case}-{model}: check if patch done
-      - patch-{case}-{model}: run patch if needed
-      - chk-fuzz-{case}-{model}: check if fuzz done
-      - fuzz-{case}-{model}: run fuzz if needed
+    - chk-build-vul-{case}, build-vul-{case} for each case
+    - chk-build-fix-{case}, build-fix-{case} for each case
+    - For each (case, agent_spec):
+      - chk-patch-{case}-{agent-id}: check if patch done
+      - patch-{case}-{agent-id}: run patch if needed
+      - chk-fuzz-{case}-{agent-id}: check if fuzz done
+      - fuzz-{case}-{agent-id}: run fuzz if needed
     - For each case (if run_gt):
       - chk-gt-{case}: check if GT done
       - fuzz-gt-{case}: run GT fuzz if needed
@@ -303,7 +318,8 @@ def _generate_workflow_yaml(
     Args:
         base_workflow_path: Path to the base workflow YAML file
         cases: List of case IDs
-        models: List of model names
+        agent_specs: List of AgentSpec objects
+        registry: Artifact Registry path (e.g. us-central1-docker.pkg.dev/project/repo)
         run_gt: Whether to include ground truth fuzzing tasks
         patch_use_spot: Whether patch jobs should use spot instances
         fuzz_use_spot: Whether fuzz jobs should use spot instances
@@ -319,15 +335,42 @@ def _generate_workflow_yaml(
         if template["name"] == "benchmark-pipeline":
             tasks = template["dag"]["tasks"]
 
+            # Parse registry for Docker v2 API URL construction
+            # registry = "us-central1-docker.pkg.dev/project/repo"
+            registry_host, registry_path = registry.split("/", 1)
+
             # Generate tasks for each case
             for case in cases:
                 case_safe = _sanitize_name(case)
 
-                # Build vulnerable image
+                # Check if vulnerable image already exists (Docker v2 manifests API)
+                vul_check_url = f"https://{registry_host}/v2/{registry_path}/arvo-{case}-vul/manifests/{{{{workflow.parameters.build-version}}}}"
+                tasks.append(
+                    {
+                        "name": f"chk-build-vul-{case_safe}",
+                        "template": "check-image",
+                        "continueOn": {"failed": True},
+                        "arguments": {
+                            "parameters": [
+                                {
+                                    "name": "url",
+                                    "value": vul_check_url,
+                                },
+                            ]
+                        },
+                    }
+                )
+
+                # Build vulnerable image (only if check failed = image doesn't exist)
                 tasks.append(
                     {
                         "name": f"build-vul-{case_safe}",
-                        "dependencies": ["build-casr", "build-dd"],
+                        "dependencies": [
+                            f"chk-build-vul-{case_safe}",
+                            "build-casr",
+                            "build-dd",
+                        ],
+                        "when": f"{{{{tasks.chk-build-vul-{case_safe}.status}}}} == Failed",
                         "templateRef": {
                             "name": "arvo-build",
                             "template": "build-vul",
@@ -352,11 +395,34 @@ def _generate_workflow_yaml(
                     }
                 )
 
-                # Build fixed image
+                # Check if fixed image already exists (Docker v2 manifests API)
+                fix_check_url = f"https://{registry_host}/v2/{registry_path}/arvo-{case}-fix/manifests/{{{{workflow.parameters.build-version}}}}"
+                tasks.append(
+                    {
+                        "name": f"chk-build-fix-{case_safe}",
+                        "template": "check-image",
+                        "continueOn": {"failed": True},
+                        "arguments": {
+                            "parameters": [
+                                {
+                                    "name": "url",
+                                    "value": fix_check_url,
+                                },
+                            ]
+                        },
+                    }
+                )
+
+                # Build fixed image (only if check failed = image doesn't exist)
                 tasks.append(
                     {
                         "name": f"build-fix-{case_safe}",
-                        "dependencies": ["build-casr", "build-dd"],
+                        "dependencies": [
+                            f"chk-build-fix-{case_safe}",
+                            "build-casr",
+                            "build-dd",
+                        ],
+                        "when": f"{{{{tasks.chk-build-fix-{case_safe}.status}}}} == Failed",
                         "templateRef": {
                             "name": "arvo-build",
                             "template": "build-fix",
@@ -381,17 +447,19 @@ def _generate_workflow_yaml(
                     }
                 )
 
-                # Generate tasks for each model
-                for model in models:
-                    model_safe = _sanitize_name(model)
-                    suffix = f"{case_safe}-{model_safe}"
+                # Generate tasks for each agent spec
+                for spec in agent_specs:
+                    id_safe = _sanitize_name(spec.id)
+                    suffix = f"{case_safe}-{id_safe}"
 
                     # Check if patch is done
                     tasks.append(
                         {
                             "name": f"chk-patch-{suffix}",
                             "dependencies": [
+                                f"chk-build-vul-{case_safe}",
                                 f"build-vul-{case_safe}",
+                                f"chk-build-fix-{case_safe}",
                                 f"build-fix-{case_safe}",
                             ],
                             "template": "check-completion",
@@ -404,7 +472,7 @@ def _generate_workflow_yaml(
                                     },
                                     {
                                         "name": "path",
-                                        "value": f"results%2F{{{{workflow.parameters.experiment-id}}}}%2F{case}%2F{model}%2Fpatch%2F_SUCCESS",
+                                        "value": f"results%2F{{{{workflow.parameters.experiment-id}}}}%2F{case}%2F{spec.id}%2Fpatch%2F_SUCCESS",
                                     },
                                 ]
                             },
@@ -424,7 +492,12 @@ def _generate_workflow_yaml(
                             "arguments": {
                                 "parameters": [
                                     {"name": "case-id", "value": str(case)},
-                                    {"name": "model", "value": model},
+                                    {"name": "model", "value": spec.model},
+                                    {"name": "agent-id", "value": spec.id},
+                                    {
+                                        "name": "agent-config",
+                                        "value": spec.to_agent_config_json(),
+                                    },
                                     {
                                         "name": "experiment-id",
                                         "value": "{{workflow.parameters.experiment-id}}",
@@ -465,7 +538,7 @@ def _generate_workflow_yaml(
                                     },
                                     {
                                         "name": "path",
-                                        "value": f"results%2F{{{{workflow.parameters.experiment-id}}}}%2F{case}%2F{model}%2F_SUCCESS",
+                                        "value": f"results%2F{{{{workflow.parameters.experiment-id}}}}%2F{case}%2F{spec.id}%2F_SUCCESS",
                                     },
                                 ]
                             },
@@ -486,7 +559,8 @@ def _generate_workflow_yaml(
                                 "parameters": [
                                     {"name": "case-id", "value": str(case)},
                                     {"name": "target", "value": "llm_patch"},
-                                    {"name": "model", "value": model},
+                                    {"name": "model", "value": spec.model},
+                                    {"name": "agent-id", "value": spec.id},
                                     {
                                         "name": "experiment-id",
                                         "value": "{{workflow.parameters.experiment-id}}",
@@ -522,7 +596,10 @@ def _generate_workflow_yaml(
                     tasks.append(
                         {
                             "name": f"chk-gt-{case_safe}",
-                            "dependencies": [f"build-fix-{case_safe}"],
+                            "dependencies": [
+                                f"chk-build-fix-{case_safe}",
+                                f"build-fix-{case_safe}",
+                            ],
                             "template": "check-completion",
                             "continueOn": {"failed": True},
                             "arguments": {
@@ -555,6 +632,7 @@ def _generate_workflow_yaml(
                                     {"name": "case-id", "value": str(case)},
                                     {"name": "target", "value": "ground_truth"},
                                     {"name": "model", "value": "gt"},
+                                    {"name": "agent-id", "value": "gt"},
                                     {
                                         "name": "experiment-id",
                                         "value": "{{workflow.parameters.experiment-id}}",
@@ -595,7 +673,10 @@ def submit(
         typer.Option(help="Case IDs: '42,43,44', '42-50', or '@path/to/cases.json'"),
     ] = None,
     model: Annotated[
-        Optional[str], typer.Option(help="LLM model to use (overrides config agents)")
+        Optional[str],
+        typer.Option(
+            help="LLM model to use as autopatchbench agent (convenience shorthand)"
+        ),
     ] = None,
     experiment_id: Annotated[
         Optional[str], typer.Option("--experiment", "-e", help="Experiment ID")
@@ -641,7 +722,6 @@ def submit(
 
     # Load run config
     run_config = RunConfig()
-    agents_from_config: list[str] = []  # Track all agents/models from config
 
     if config_file:
         with open(config_file) as f:
@@ -651,17 +731,16 @@ def submit(
                 run_config.cases = parse_cases(data["cases"])
             else:
                 run_config.cases = data["cases"]
-        if "model" in data:
-            run_config.model = data["model"]
         if "agents" in data:
-            # Config has multiple agents - track them for semaphore check
-            agents_from_config = data["agents"]
-            # Use first non-gt agent as the model if model not specified
-            if "model" not in data:
-                for agent in agents_from_config:
-                    if agent != "gt":
-                        run_config.model = agent
-                        break
+            # Parse structured agent specs
+            try:
+                run_config.agents, config_run_gt = parse_agent_specs(data["agents"])
+                # Only override run_gt from config if "gt" was explicitly in agents list
+                if config_run_gt:
+                    run_config.run_gt = True
+            except ValueError as e:
+                echo_error(f"Invalid agent spec in config: {e}")
+                raise typer.Exit(1)
         if "experiment_id" in data:
             run_config.experiment_id = data["experiment_id"]
         if "fuzzing_duration" in data:
@@ -679,9 +758,14 @@ def submit(
     if cases:
         run_config.cases = parse_cases(cases)
     if model is not None:
-        # Explicit --model flag overrides config agents
-        run_config.model = model
-        agents_from_config = []
+        # Convenience: --model flag creates a single autopatchbench agent spec
+        run_config.agents = [
+            AgentSpec(
+                id=f"autopatchbench-{model}",
+                agent_type="autopatchbench",
+                model=model,
+            )
+        ]
     if experiment_id:
         run_config.experiment_id = experiment_id
     if fuzzing_duration is not None:
@@ -690,19 +774,15 @@ def submit(
     if build_version:
         run_config.build_version = build_version
 
-    # Build final list of models to check
-    # Priority: 1) CLI --model flag, 2) config agents, 3) default model
-    if agents_from_config:
-        models_to_check = agents_from_config
-    elif run_config.model:
-        models_to_check = [run_config.model]
-    else:
-        # No model specified anywhere - use default
-        run_config.model = "claude-sonnet-4-20250514"
-        models_to_check = [run_config.model]
+    # Validate: must have at least one agent spec
+    if not run_config.agents:
+        echo_error(
+            "No agents specified. Use --config with structured agents or --model."
+        )
+        raise typer.Exit(1)
 
     # Generate experiment ID if not provided
-    if not run_config.experiment_id:
+    if not run_config.experiment_id or run_config.experiment_id == "default":
         from datetime import datetime
 
         run_config.experiment_id = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -720,12 +800,9 @@ def submit(
     typer.echo(f"Owner:       {owner}")
     typer.echo(f"Experiment:  {run_config.experiment_id}")
     typer.echo(f"Cases:       {len(run_config.cases)} cases")
-    if len(models_to_check) > 1:
-        typer.echo(f"Models:      {len(models_to_check)} agents")
-        for m in models_to_check:
-            typer.echo(f"             - {m}")
-    else:
-        typer.echo(f"Model:       {run_config.model}")
+    typer.echo(f"Agents:      {len(run_config.agents)} agent(s)")
+    for spec in run_config.agents:
+        typer.echo(f"             - {spec.id} ({spec.agent_type}, {spec.model})")
     typer.echo(f"Fuzz Time:   {run_config.fuzzing_duration}s")
     typer.echo(f"Run GT:      {run_config.run_gt}")
     typer.echo(f"Build Ver:   {run_config.build_version}")
@@ -753,25 +830,30 @@ def submit(
             raise typer.Exit(1)
         typer.echo()
 
-    # Check semaphore limits for all models
+    # Check semaphore limits (per-model, not per-agent-id)
     typer.echo("Checking semaphore limits...")
-    if not _check_semaphore_limits(models_to_check, dry_run=dry_run):
+    if not _check_semaphore_limits(run_config.agents, dry_run=dry_run):
         typer.echo("Aborting submission.")
         raise typer.Exit(1)
     typer.echo()
 
-    # Upload agent runtime
+    # Upload agent runtime (rebuild if source changed)
     if upload_runtime and not dry_run:
-        typer.echo("Uploading agent runtime...")
+        typer.echo("Checking agent runtime...")
         runtime_dir = get_script_dir() / "portable-runtime" / "output"
         runtime_tar = runtime_dir / "agent-runtime.tar.gz"
 
-        if not runtime_tar.exists():
-            typer.echo("  Building runtime...")
+        needs_rebuild, reason = check_runtime_needs_rebuild()
+        if needs_rebuild:
+            typer.echo(f"  Rebuilding runtime ({reason})...")
             build_script = get_script_dir() / "portable-runtime" / "build.sh"
             subprocess.run(["bash", str(build_script)], check=True)
+        else:
+            typer.echo(f"  Runtime up to date.")
 
         if runtime_tar.exists():
+            if needs_rebuild:
+                typer.echo("  Uploading runtime...")
             result = subprocess.run(
                 [
                     "gsutil",
@@ -790,34 +872,31 @@ def submit(
             typer.echo("  Warning: Runtime tarball not found.")
         typer.echo()
 
-    # Build list of LLM models (exclude 'gt' - it's handled by fuzz-gt)
-    llm_models = [m for m in models_to_check if m != "gt"]
-
     # Generate fully-flat workflow YAML with all tasks inlined
     # This avoids all withParam and nested DAGs which cause Argo completion bugs
     base_workflow_path = get_script_dir() / "argo" / "workflows" / "arvo-benchmark.yaml"
     typer.echo("Generating flat workflow (no withParam, no nested DAGs)...")
     typer.echo(f"  Cases: {len(run_config.cases)}")
-    typer.echo(f"  Models: {len(llm_models)}")
+    typer.echo(f"  Agents: {len(run_config.agents)}")
     total_tasks = len(run_config.cases) * (
-        2 + len(llm_models) * 4
-    )  # builds + model tasks
+        4 + len(run_config.agents) * 4
+    )  # build checks + builds + agent tasks
     if run_config.run_gt:
         total_tasks += len(run_config.cases) * 2  # GT tasks per case
     typer.echo(f"  Total tasks: {total_tasks}")
     workflow_yaml = _generate_workflow_yaml(
         base_workflow_path,
         run_config.cases,
-        llm_models,
+        run_config.agents,
+        registry=gke_config.artifact_registry,
         run_gt=run_config.run_gt,
         patch_use_spot=run_config.patch_use_spot,
         fuzz_use_spot=run_config.fuzz_use_spot,
     )
     typer.echo()
 
-    # Build workflow parameters (cases/models no longer needed - all tasks are inlined)
+    # Build workflow parameters (agent-specific values are inlined per-task)
     parameters = {
-        "model": run_config.model,  # Kept for backwards compat with templates
         "experiment-id": run_config.experiment_id,
         "bucket": gke_config.bucket_name,
         "registry": gke_config.artifact_registry,
@@ -841,15 +920,12 @@ def submit(
             typer.echo(f"  {key}: {value}")
         typer.echo()
         typer.echo("Generated task structure (per case):")
-        typer.echo("  - build-vul-{case}, build-fix-{case}")
-        for model in llm_models:
-            model_safe = _sanitize_name(model)
-            typer.echo(
-                f"  - chk-patch-{{case}}-{model_safe} -> patch-{{case}}-{model_safe}"
-            )
-            typer.echo(
-                f"  - chk-fuzz-{{case}}-{model_safe} -> fuzz-{{case}}-{model_safe}"
-            )
+        typer.echo("  - chk-build-vul-{case} -> build-vul-{case}")
+        typer.echo("  - chk-build-fix-{case} -> build-fix-{case}")
+        for spec in run_config.agents:
+            id_safe = _sanitize_name(spec.id)
+            typer.echo(f"  - chk-patch-{{case}}-{id_safe} -> patch-{{case}}-{id_safe}")
+            typer.echo(f"  - chk-fuzz-{{case}}-{id_safe} -> fuzz-{{case}}-{id_safe}")
         if run_config.run_gt:
             typer.echo("  - chk-gt-{case} -> fuzz-gt-{case}")
         if build_casr or build_dd:

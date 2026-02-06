@@ -10,7 +10,8 @@ spec:
         parameters:
           - name: case-id
           - name: target # "ground_truth" or "llm_patch"
-          - name: model
+          - name: model      # LLM model name (metadata)
+          - name: agent-id   # Unique agent identifier (for GCS paths)
           - name: experiment-id
           - name: bucket
           - name: registry
@@ -27,7 +28,7 @@ spec:
               none: {}
             gcs:
               bucket: "{{inputs.parameters.bucket}}"
-              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/fuzzing_result.json"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/fuzzing_result.json"
           - name: crashes
             path: /output/crashes.json
             optional: true
@@ -35,7 +36,7 @@ spec:
               none: {}
             gcs:
               bucket: "{{inputs.parameters.bucket}}"
-              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/crashes.json"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/crashes.json"
           - name: success-marker
             path: /output/_SUCCESS
             optional: true
@@ -43,7 +44,7 @@ spec:
               none: {}
             gcs:
               bucket: "{{inputs.parameters.bucket}}"
-              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.model}}/_SUCCESS"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/_SUCCESS"
       # NOTE: Memoization removed from fuzz-llm due to Argo bug with nested memoized tasks
       # Caching is now handled at the DAG level (per-model-pipeline) in arvo-benchmark.yaml
       # GCS _SUCCESS marker check below provides fallback deduplication
@@ -53,7 +54,7 @@ spec:
           value: "work"
           effect: "NoSchedule"
       nodeSelector:
-        cloud.google.com/gke-spot: "{{inputs.parameters.use-spot}}"
+        spot: "{{inputs.parameters.use-spot}}"
         workload-type: work
       serviceAccountName: arvo-workflow-sa
       retryStrategy:
@@ -95,10 +96,10 @@ spec:
                 BUCKET="{{inputs.parameters.bucket}}"
                 EXPERIMENT_ID="{{inputs.parameters.experiment-id}}"
                 CASE_ID="{{inputs.parameters.case-id}}"
-                MODEL="{{inputs.parameters.model}}"
+                AGENT_ID="{{inputs.parameters.agent-id}}"
                 
-                # Download rebuilt binary from patch results
-                gsutil cp gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/${MODEL}/rebuilt_binary /binary/rebuilt_binary || {
+                # Download rebuilt binary from patch results (uses agent-id in path)
+                gsutil cp gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/${AGENT_ID}/rebuilt_binary /binary/rebuilt_binary || {
                   echo "Warning: Could not download rebuilt binary"
                   exit 0
                 }
@@ -117,12 +118,12 @@ spec:
             set -e
             TARGET="{{inputs.parameters.target}}"
             CASE_ID="{{inputs.parameters.case-id}}"
-            MODEL="{{inputs.parameters.model}}"
+            AGENT_ID="{{inputs.parameters.agent-id}}"
             BUCKET="{{inputs.parameters.bucket}}"
             EXPERIMENT_ID="{{inputs.parameters.experiment-id}}"
 
             # Layer 2: Check if already completed in GCS (fallback when memoization cache cleared)
-            SUCCESS_PATH="gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/${MODEL}/_SUCCESS"
+            SUCCESS_PATH="gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/${AGENT_ID}/_SUCCESS"
             if gsutil -q stat "${SUCCESS_PATH}" 2>/dev/null; then
               echo "[SKIP] Results already exist at ${SUCCESS_PATH}"
               # Copy existing _SUCCESS to output for artifact upload consistency
@@ -130,10 +131,10 @@ spec:
               exit 0
             fi
 
-            # Build command
+            # Build command (--model passes agent-id for result tracking)
             CMD="/agent-runtime/bin/agent-entrypoint.sh python3 -m evaluation.main \
               --case-id ${CASE_ID} \
-              --model ${MODEL} \
+              --model ${AGENT_ID} \
               --target ${TARGET} \
               --duration {{inputs.parameters.fuzzing-duration}} \
               --output-dir /output \
@@ -155,7 +156,7 @@ spec:
               "pod": "{{pod.name}}",
               "case_id": "${CASE_ID}",
               "target": "${TARGET}",
-              "model": "${MODEL}"
+              "agent_id": "${AGENT_ID}"
             }
             EOF
         env:

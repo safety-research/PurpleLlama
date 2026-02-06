@@ -45,7 +45,8 @@ def _generate_pod_name(owner: str, case_id: int, job_type: str) -> str:
 def _build_fuzz_pod_spec(
     name: str,
     case_id: int,
-    model: str,
+    agent_id: str,
+    target: str,
     experiment_id: str,
     bucket: str,
     registry: str,
@@ -58,14 +59,11 @@ def _build_fuzz_pod_spec(
     resources as the production fuzz template, but runs ``sleep infinity``
     instead of the actual fuzzing command.
 
-    When *model* is ``"gt"`` the pod fuzzes the ground-truth binary already
-    baked into the container image.  Any other model value is treated as an
+    When *agent_id* is ``"gt"`` the pod fuzzes the ground-truth binary already
+    baked into the container image.  Any other agent_id value is treated as an
     LLM patch -- the init container downloads the rebuilt binary from
-    ``gs://{bucket}/results/{experiment-id}/{case-id}/{model}/rebuilt_binary``.
+    ``gs://{bucket}/results/{experiment-id}/{case-id}/{agent-id}/rebuilt_binary``.
     """
-    # Derive target from model: "gt" -> ground_truth, anything else -> llm_patch
-    target = "ground_truth" if model == "gt" else "llm_patch"
-
     fetch_runtime_script = (
         "set -e\n"
         f"gsutil cp gs://{bucket}/agent-runtime/agent-runtime.tar.gz /tmp/\n"
@@ -75,15 +73,15 @@ def _build_fuzz_pod_spec(
 
     fetch_binary_script = (
         "set -e\n"
-        f'MODEL="{model}"\n'
-        'if [ "${MODEL}" != "gt" ]; then\n'
+        f'AGENT_ID="{agent_id}"\n'
+        'if [ "${AGENT_ID}" != "gt" ]; then\n'
         f'  BUCKET="{bucket}"\n'
         f'  EXPERIMENT_ID="{experiment_id}"\n'
         f'  CASE_ID="{case_id}"\n'
         "\n"
-        "  # Download rebuilt binary from patch results\n"
-        '  echo "Downloading rebuilt binary for model ${MODEL} from experiment ${EXPERIMENT_ID}..."\n'
-        '  gsutil cp "gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/${MODEL}/rebuilt_binary" '
+        "  # Download rebuilt binary from patch results (uses agent-id in path)\n"
+        '  echo "Downloading rebuilt binary for agent ${AGENT_ID} from experiment ${EXPERIMENT_ID}..."\n'
+        '  gsutil cp "gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/${AGENT_ID}/rebuilt_binary" '
         "/binary/rebuilt_binary || {\n"
         '    echo "Warning: Could not download rebuilt binary"\n'
         "    exit 0\n"
@@ -91,7 +89,7 @@ def _build_fuzz_pod_spec(
         "  chmod +x /binary/rebuilt_binary\n"
         '  echo "Binary ready at /binary/rebuilt_binary"\n'
         "else\n"
-        '  echo "Model is gt -- using ground-truth binary from container image"\n'
+        '  echo "Agent is gt -- using ground-truth binary from container image"\n'
         "fi\n"
     )
 
@@ -152,7 +150,7 @@ def _build_fuzz_pod_spec(
                     "env": [
                         {"name": "PYTHONPATH", "value": "/agent-runtime"},
                         {"name": "CASE_ID", "value": str(case_id)},
-                        {"name": "MODEL", "value": model},
+                        {"name": "AGENT_ID", "value": agent_id},
                         {"name": "TARGET", "value": target},
                         {"name": "BUCKET", "value": bucket},
                         {"name": "EXPERIMENT_ID", "value": experiment_id},
@@ -188,7 +186,7 @@ def _build_fuzz_pod_spec(
 def _build_patch_pod_spec(
     name: str,
     case_id: int,
-    model: str,
+    agent_id: str,
     experiment_id: str,
     bucket: str,
     registry: str,
@@ -251,7 +249,7 @@ def _build_patch_pod_spec(
                     "env": [
                         {"name": "PYTHONPATH", "value": "/agent-runtime"},
                         {"name": "CASE_ID", "value": str(case_id)},
-                        {"name": "MODEL", "value": model},
+                        {"name": "AGENT_ID", "value": agent_id},
                         {"name": "BUCKET", "value": bucket},
                         {"name": "EXPERIMENT_ID", "value": experiment_id},
                         {
@@ -375,20 +373,27 @@ def launch(
         str,
         typer.Option("--type", "-t", help="Job type: fuzz or patch"),
     ] = "fuzz",
-    model: Annotated[
+    agent_id: Annotated[
         str,
         typer.Option(
-            "--model",
-            "-m",
-            help="Model name, or 'gt' for ground truth (uses binary from image)",
+            "--agent-id",
+            "-a",
+            help="Agent ID (e.g., autopatchbench-claude-sonnet-4-20250514), or 'gt' for ground truth",
         ),
     ] = "gt",
+    target: Annotated[
+        str,
+        typer.Option(
+            "--target",
+            help="Fuzz target: ground_truth or llm_patch",
+        ),
+    ] = "ground_truth",
     experiment_id: Annotated[
         Optional[str],
         typer.Option(
             "--experiment",
             "-e",
-            help="Experiment ID (required when model is not 'gt')",
+            help="Experiment ID (required when agent-id is not 'gt')",
         ),
     ] = None,
     build_version: Annotated[
@@ -401,26 +406,26 @@ def launch(
     The pod runs ``sleep infinity`` instead of the actual task, allowing you
     to exec in and debug interactively on a non-SPOT (on-demand) node.
 
-    Use ``--model gt`` (the default) to fuzz the ground-truth binary baked
-    into the container image.  Use any other model name (e.g.
-    ``claude-sonnet-4-20250514``) to download and fuzz that model's rebuilt
-    binary from a previous experiment (requires ``--experiment``).
+    Use ``--agent-id gt`` (the default) to fuzz the ground-truth binary baked
+    into the container image.  Use any other agent-id (e.g.
+    ``autopatchbench-claude-sonnet-4-20250514``) to download and fuzz that
+    agent's rebuilt binary from a previous experiment (requires ``--experiment``).
 
     Examples::
 
         python -m cli debug-vm launch 12803 --type fuzz
-        python -m cli debug-vm launch 12803 --type fuzz -m claude-sonnet-4-20250514 -e 20260205-120000
-        python -m cli debug-vm launch 12803 --type patch -m claude-sonnet-4-20250514
+        python -m cli debug-vm launch 12803 --type fuzz -a autopatchbench-claude-sonnet-4-20250514 -e 20260205-120000
+        python -m cli debug-vm launch 12803 --type patch
     """
     # Validate job type
     if job_type not in ("fuzz", "patch"):
         echo_error("Job type must be 'fuzz' or 'patch'")
         raise typer.Exit(1)
 
-    # If model is not gt, experiment_id is required for fuzz (to find the binary)
-    if model != "gt" and job_type == "fuzz" and not experiment_id:
+    # If agent_id is not gt, experiment_id is required for fuzz (to find the binary)
+    if agent_id != "gt" and job_type == "fuzz" and not experiment_id:
         echo_error(
-            "Experiment ID is required when model is not 'gt'.\n"
+            "Experiment ID is required when agent-id is not 'gt'.\n"
             "  Use --experiment / -e to specify which experiment's rebuilt binary to download."
         )
         raise typer.Exit(1)
@@ -437,7 +442,6 @@ def launch(
     if not experiment_id:
         experiment_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    target = "ground_truth" if model == "gt" else "llm_patch"
     pod_name = _generate_pod_name(owner, case_id, job_type)
 
     typer.echo("=" * 60)
@@ -447,9 +451,10 @@ def launch(
     typer.echo(f"Pod Name:       {pod_name}")
     typer.echo(f"Case ID:        {case_id}")
     typer.echo(f"Job Type:       {job_type}")
-    typer.echo(f"Model:          {model}")
-    typer.echo(f"Target:         {target}")
-    if model != "gt":
+    typer.echo(f"Agent ID:       {agent_id}")
+    if job_type == "fuzz":
+        typer.echo(f"Target:         {target}")
+    if agent_id != "gt":
         typer.echo(f"Experiment:     {experiment_id}")
     typer.echo(f"Build Version:  {build_version}")
     typer.echo(f"Owner:          {owner}")
@@ -460,7 +465,8 @@ def launch(
         pod_spec = _build_fuzz_pod_spec(
             name=pod_name,
             case_id=case_id,
-            model=model,
+            agent_id=agent_id,
+            target=target,
             experiment_id=experiment_id,
             bucket=config.bucket_name,
             registry=config.artifact_registry,
@@ -471,7 +477,7 @@ def launch(
         pod_spec = _build_patch_pod_spec(
             name=pod_name,
             case_id=case_id,
-            model=model,
+            agent_id=agent_id,
             experiment_id=experiment_id,
             bucket=config.bucket_name,
             registry=config.artifact_registry,

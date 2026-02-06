@@ -20,7 +20,14 @@
     34480,
     35675,
     35727
-  ],  
-  "agents": ["gt", "claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"],
-  "fuzzing_duration": 1800
+  ],
+  "agents": [
+    "gt",
+    {"agent": "autopatchbench", "model": "claude-opus-4-5-20251101"},
+    {"agent": "autopatchbench", "model": "claude-sonnet-4-5-20250929"},
+    {"agent": "autopatchbench", "model": "claude-haiku-4-5-20251001"}
+  ],
+  "fuzzing_duration": 1800,
+  "fuzz_use_spot": true,
+  "patch_use_spot": false
 }

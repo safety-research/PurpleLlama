@@ -12,17 +12,9 @@ spec:
           - name: build-version
           - name: bucket
           - name: registry
-      # Outputs required for memoization to work correctly (Argo < 3.5 requirement)
-      outputs:
-        parameters:
-          - name: image
-            value: "{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{inputs.parameters.build-version}}"
-      memoize:
-        key: "build-vul-{{inputs.parameters.case-id}}-{{inputs.parameters.build-version}}"
-        cache:
-          configMap:
-            name: arvo-build-cache
-        maxAge: "720h"
+      # NOTE: Memoization removed - image existence is checked via HTTP check-image
+      # template in the DAG (Docker v2 manifests API) to avoid memoized retry nodes
+      # creating empty children arrays that break assessDAGPhase BFS traversal.
       tolerations:
         - key: "workload"
           operator: "Equal"
@@ -101,17 +93,9 @@ spec:
           - name: build-version
           - name: bucket
           - name: registry
-      # Outputs required for memoization to work correctly (Argo < 3.5 requirement)
-      outputs:
-        parameters:
-          - name: image
-            value: "{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{inputs.parameters.build-version}}"
-      memoize:
-        key: "build-fix-{{inputs.parameters.case-id}}-{{inputs.parameters.build-version}}"
-        cache:
-          configMap:
-            name: arvo-build-cache
-        maxAge: "720h"
+      # NOTE: Memoization removed - image existence is checked via HTTP check-image
+      # template in the DAG (Docker v2 manifests API) to avoid memoized retry nodes
+      # creating empty children arrays that break assessDAGPhase BFS traversal.
       tolerations:
         - key: "workload"
           operator: "Equal"

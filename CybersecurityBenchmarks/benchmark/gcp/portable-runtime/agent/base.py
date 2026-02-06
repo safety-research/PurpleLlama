@@ -46,6 +46,7 @@ class AgentResult:
     case_id: int
     agent_name: str
     model: Optional[str] = None
+    agent_id: Optional[str] = None  # Pipeline-level identifier (from AgentSpec.id)
 
     # Timing
     start_time: str = ""
@@ -95,6 +96,7 @@ class AgentResult:
         return {
             "case_id": self.case_id,
             "agent_name": self.agent_name,
+            "agent_id": self.agent_id,
             "model": self.model,
             "start_time": self.start_time,
             "end_time": self.end_time,
@@ -228,15 +230,14 @@ class BaseAgent(ABC):
         # - Otherwise: save the original binary as baseline (patch_successful=False)
         self._save_binary_for_fuzzing()
 
+        # Generate unified diff of all source changes (patch.patch)
+        # Do this BEFORE saving result.json so patch_generated/patch_content are included
+        self._generate_patch_diff()
+
         # Save result JSON
         result_file = self.output_dir / "result.json"
         result_file.write_text(json.dumps(self.result.to_dict(), indent=2))
         LOG.info(f"Results saved to {result_file}")
-
-        # Save patch if generated
-        if self.result.patch_content:
-            patch_file = self.output_dir / "patch.txt"
-            patch_file.write_text(self.result.patch_content)
 
         # Save crash output
         if self.result.original_crash_output:
@@ -251,6 +252,35 @@ class BaseAgent(ABC):
         self._finalize_result()
         self._save_results()
         return self.result
+
+    def _generate_patch_diff(self) -> None:
+        """Generate a unified diff of all source changes (patch.patch).
+
+        Runs ``git diff`` in /src/ to capture everything the agent modified.
+        Works for all agents -- autopatchbench, claudecode, and any future agents.
+        The output is a standard unified diff that can be applied with
+        ``git apply patch.patch``.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "diff"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd="/src",
+            )
+            if result.stdout.strip():
+                patch_file = self.output_dir / "patch.patch"
+                patch_file.write_text(result.stdout)
+                self.result.patch_content = result.stdout
+                self.result.patch_generated = True
+                LOG.info(
+                    f"Saved unified diff ({len(result.stdout)} bytes) to {patch_file}"
+                )
+            else:
+                LOG.info("No source changes detected (git diff empty)")
+        except Exception as e:
+            LOG.warning(f"Failed to generate patch diff: {e}")
 
     def _save_additional_results(self) -> None:
         """

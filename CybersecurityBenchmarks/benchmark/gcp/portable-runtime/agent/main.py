@@ -17,12 +17,17 @@ The agent is responsible for:
 Fuzzing/evaluation is handled separately by the evaluation pipeline.
 
 Usage:
+    # Preferred: JSON config (via env var or CLI arg)
+    AGENT_CONFIG='{"agent":"autopatchbench","model":"claude-sonnet-4-20250514"}' \\
+        python3 -m agent.main --case-id 42
+
+    # Fallback: individual flags (for manual testing)
     python3 -m agent.main --case-id 42 --agent autopatchbench --model claude-sonnet-4-20250514
-    python3 -m agent.main --case-id 42 --agent autopatchbench --dry-run
 """
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -71,6 +76,7 @@ def create_agent(
     model: str,
     dry_run: bool = False,
     max_retries: int = 10,
+    agent_id: str | None = None,
     **kwargs,
 ) -> BaseAgent:
     """
@@ -83,6 +89,7 @@ def create_agent(
         model: LLM model to use
         dry_run: Skip LLM calls if True
         max_retries: Maximum retry attempts
+        agent_id: Pipeline-level identifier (from AgentSpec.id)
         **kwargs: Additional agent-specific arguments
 
     Returns:
@@ -99,7 +106,7 @@ def create_agent(
 
     agent_class = agents[agent_name]
 
-    return agent_class(
+    agent = agent_class(
         case_id=case_id,
         output_dir=output_dir,
         model=model,
@@ -107,6 +114,12 @@ def create_agent(
         max_retries=max_retries,
         **kwargs,
     )
+
+    # Set agent_id on the result for traceability
+    if agent_id:
+        agent.result.agent_id = agent_id
+
+    return agent
 
 
 async def run_agent(
@@ -116,6 +129,7 @@ async def run_agent(
     model: str,
     dry_run: bool = False,
     max_retries: int = 10,
+    agent_id: str | None = None,
     **kwargs,
 ) -> AgentResult:
     """
@@ -128,6 +142,7 @@ async def run_agent(
         model: LLM model to use
         dry_run: Skip LLM calls if True
         max_retries: Maximum retry attempts
+        agent_id: Pipeline-level identifier (from AgentSpec.id)
         **kwargs: Additional agent-specific arguments
 
     Returns:
@@ -140,10 +155,62 @@ async def run_agent(
         model=model,
         dry_run=dry_run,
         max_retries=max_retries,
+        agent_id=agent_id,
         **kwargs,
     )
 
     return await agent.run()
+
+
+def parse_agent_config(args: argparse.Namespace) -> dict:
+    """Parse agent configuration from JSON config or individual CLI flags.
+
+    Priority: --agent-config flag > AGENT_CONFIG env var > individual flags.
+
+    Returns:
+        Dict with keys: agent_name, model, agent_id, kwargs
+    """
+    agent_config_json = args.agent_config or os.environ.get("AGENT_CONFIG")
+
+    if agent_config_json:
+        try:
+            config = json.loads(agent_config_json)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in agent config: {e}") from e
+
+        if "agent" not in config:
+            raise ValueError("Agent config missing required 'agent' field")
+        if "model" not in config:
+            raise ValueError("Agent config missing required 'model' field")
+
+        agent_name = config["agent"]
+        model = config["model"]
+        agent_id = config.get("id")
+
+        # All other fields become kwargs for the agent constructor
+        kwargs = {
+            k: v for k, v in config.items() if k not in ("id", "agent", "model")
+        }
+
+        LOG.info(f"Agent config from JSON: agent={agent_name}, model={model}, "
+                 f"id={agent_id}, params={kwargs}")
+        return {
+            "agent_name": agent_name,
+            "model": model,
+            "agent_id": agent_id,
+            "kwargs": kwargs,
+        }
+    else:
+        # Fallback to individual CLI flags
+        return {
+            "agent_name": args.agent,
+            "model": args.model,
+            "agent_id": None,
+            "kwargs": {
+                "max_iterations": args.max_iterations,
+                "stack_ctx_depth": args.stack_depth,
+            },
+        }
 
 
 def print_summary(result: AgentResult) -> None:
@@ -153,6 +220,8 @@ def print_summary(result: AgentResult) -> None:
     print("=" * 60)
     print(f"Case ID:        {result.case_id}")
     print(f"Agent:          {result.agent_name}")
+    if result.agent_id:
+        print(f"Agent ID:       {result.agent_id}")
     print(f"Model:          {result.model}")
     print(f"Duration:       {result.duration_seconds:.1f}s")
     print(f"Status:         {result.status.value}")
@@ -174,23 +243,12 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    # Infrastructure flags (always CLI args)
     parser.add_argument(
         "--case-id",
         type=int,
         required=True,
         help="ARVO case ID",
-    )
-    parser.add_argument(
-        "--agent",
-        type=str,
-        default="autopatchbench",
-        help="Agent to run (default: autopatchbench)",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="claude-sonnet-4-20250514",
-        help="Anthropic model to use (default: claude-sonnet-4-20250514)",
     )
     parser.add_argument(
         "--output-dir",
@@ -202,6 +260,39 @@ def main() -> int:
         "--dry-run",
         action="store_true",
         help="Run without making LLM calls",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose logging",
+    )
+    parser.add_argument(
+        "--list-agents",
+        action="store_true",
+        help="List available agents and exit",
+    )
+
+    # Agent config: JSON blob (preferred) or individual flags (fallback)
+    parser.add_argument(
+        "--agent-config",
+        type=str,
+        default=None,
+        help="JSON agent config string (or set AGENT_CONFIG env var). "
+        'Example: \'{"agent":"autopatchbench","model":"claude-sonnet-4-20250514"}\'',
+    )
+    # Individual flags as fallback for manual testing
+    parser.add_argument(
+        "--agent",
+        type=str,
+        default="autopatchbench",
+        help="Agent to run (fallback if --agent-config not set)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="claude-sonnet-4-20250514",
+        help="Anthropic model to use (fallback if --agent-config not set)",
     )
     parser.add_argument(
         "--max-retries",
@@ -221,17 +312,6 @@ def main() -> int:
         default=5,
         help="Number of stack frames to include (default: 5)",
     )
-    parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Enable verbose logging",
-    )
-    parser.add_argument(
-        "--list-agents",
-        action="store_true",
-        help="List available agents and exit",
-    )
 
     args = parser.parse_args()
 
@@ -248,6 +328,18 @@ def main() -> int:
             )
         return 0
 
+    # Parse agent config (JSON or individual flags)
+    try:
+        agent_cfg = parse_agent_config(args)
+    except ValueError as e:
+        LOG.error(str(e))
+        return 1
+
+    agent_name = agent_cfg["agent_name"]
+    model = agent_cfg["model"]
+    agent_id = agent_cfg["agent_id"]
+    agent_kwargs = agent_cfg["kwargs"]
+
     # Check for API key (unless dry run)
     if not args.dry_run and not os.environ.get("ANTHROPIC_API_KEY"):
         LOG.error("ANTHROPIC_API_KEY environment variable not set")
@@ -258,19 +350,19 @@ def main() -> int:
     output_dir = Path(args.output_dir)
 
     # Run agent
-    LOG.info(f"Running {args.agent} agent for case {args.case_id}")
+    LOG.info(f"Running {agent_name} agent for case {args.case_id}")
 
     try:
         result = asyncio.run(
             run_agent(
-                agent_name=args.agent,
+                agent_name=agent_name,
                 case_id=args.case_id,
                 output_dir=output_dir,
-                model=args.model,
+                model=model,
                 dry_run=args.dry_run,
                 max_retries=args.max_retries,
-                max_iterations=args.max_iterations,
-                stack_ctx_depth=args.stack_depth,
+                agent_id=agent_id,
+                **agent_kwargs,
             )
         )
     except ValueError as e:

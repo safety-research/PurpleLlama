@@ -20,8 +20,6 @@ spec:
 
   arguments:
     parameters:
-      - name: model
-        value: "claude-sonnet-4-20250514"
       - name: experiment-id
         value: "default"
       - name: bucket
@@ -72,10 +70,12 @@ spec:
                 - name: force-rebuild
                   value: "true"
 
-          # PLACEHOLDER: Case and model tasks are dynamically inserted here by the CLI
-          # The CLI generates: build-vul-{case}, build-fix-{case}, check-patch-done-{case}-{model},
-          # patch-{case}-{model}, check-fuzz-done-{case}-{model}, fuzz-llm-{case}-{model},
-          # check-gt-done-{case}, fuzz-gt-{case}
+          # PLACEHOLDER: Case and agent tasks are dynamically inserted here by the CLI
+          # The CLI generates: chk-build-vul-{case}, build-vul-{case},
+          # chk-build-fix-{case}, build-fix-{case},
+          # chk-patch-{case}-{agent-id}, patch-{case}-{agent-id},
+          # chk-fuzz-{case}-{agent-id}, fuzz-{case}-{agent-id},
+          # chk-gt-{case}, fuzz-gt-{case}
 
     # HTTP template for sub-second GCS completion checks (no container needed)
     # Uses GCS JSON API to check if _SUCCESS marker exists
@@ -94,4 +94,24 @@ spec:
               secretKeyRef:
                 name: gcs-auth-token
                 key: token
+        successCondition: response.statusCode == 200
+
+    # HTTP template for sub-second Artifact Registry image existence checks
+    # Uses Docker v2 manifests API to check if a container image:tag exists
+    # Success (200) = image exists = skip build, Failure (404) = missing = run build
+    - name: check-image
+      inputs:
+        parameters:
+          - name: url # Full Docker v2 manifests URL
+      http:
+        url: "{{inputs.parameters.url}}"
+        method: GET
+        headers:
+          - name: Authorization
+            valueFrom:
+              secretKeyRef:
+                name: gcs-auth-token
+                key: token
+          - name: Accept
+            value: "application/vnd.docker.distribution.manifest.v2+json"
         successCondition: response.statusCode == 200

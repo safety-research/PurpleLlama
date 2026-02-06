@@ -4,14 +4,14 @@ metadata:
   name: gcs-token-refresh
   namespace: argo
 spec:
-  schedule: "*/30 * * * *"  # Every 30 minutes
+  schedule: "*/30 * * * *" # Every 30 minutes
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
       template:
         spec:
-          serviceAccountName: arvo-workflow-sa  # Uses workload identity
+          serviceAccountName: arvo-workflow-sa # Uses workload identity
           containers:
             - name: refresh
               image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
@@ -21,17 +21,17 @@ spec:
                   set -e
                   echo "Fetching GCS access token..."
                   TOKEN=$(gcloud auth print-access-token)
-                  
+
                   echo "Updating gcs-auth-token secret via Kubernetes API..."
                   # Get service account token for K8s API auth
                   K8S_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
                   K8S_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
                   K8S_NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
                   K8S_API="https://kubernetes.default.svc"
-                  
+
                   # Base64 encode the token value
                   TOKEN_B64=$(echo -n "Bearer $TOKEN" | base64 | tr -d '\n')
-                  
+
                   # Create/update secret via K8s API
                   SECRET_JSON=$(cat <<EOF
                   {
@@ -47,7 +47,7 @@ spec:
                   }
                   EOF
                   )
-                  
+
                   # Try to create, if exists then patch
                   HTTP_CODE=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
                     --cacert $K8S_CA \
@@ -56,7 +56,7 @@ spec:
                     -X POST \
                     -d "$SECRET_JSON" \
                     "$K8S_API/api/v1/namespaces/${K8S_NS}/secrets")
-                  
+
                   if [ "$HTTP_CODE" = "201" ]; then
                     echo "Secret created successfully"
                   elif [ "$HTTP_CODE" = "409" ]; then
@@ -80,7 +80,7 @@ spec:
                     cat /tmp/response.txt
                     exit 1
                   fi
-                  
+
                   echo "Token refreshed successfully"
           restartPolicy: OnFailure
 ---
@@ -97,7 +97,7 @@ rules:
     verbs: ["get", "create", "update", "patch"]
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create"]  # Needed for initial creation
+    verbs: ["create"] # Needed for initial creation
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

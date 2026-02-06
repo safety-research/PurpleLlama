@@ -14,6 +14,8 @@ spec:
           - name: bucket
           - name: registry
           - name: build-version
+          - name: use-spot
+            value: "true"
       # Per-model rate limiting via semaphore
       # If the model key doesn't exist in the ConfigMap, jobs run unlimited
       # Configure limits with: python -m cli semaphore set <model> <limit>
@@ -75,7 +77,7 @@ spec:
           value: "work"
           effect: "NoSchedule"
       nodeSelector:
-        cloud.google.com/gke-spot: "true"
+        cloud.google.com/gke-spot: "{{inputs.parameters.use-spot}}"
         workload-type: work
       serviceAccountName: arvo-workflow-sa
       retryStrategy:

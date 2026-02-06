@@ -16,6 +16,8 @@ spec:
           - name: registry
           - name: build-version
           - name: fuzzing-duration
+          - name: use-spot
+            value: "true"
       outputs:
         artifacts:
           - name: fuzzing-result
@@ -51,7 +53,7 @@ spec:
           value: "work"
           effect: "NoSchedule"
       nodeSelector:
-        cloud.google.com/gke-spot: "true"
+        cloud.google.com/gke-spot: "{{inputs.parameters.use-spot}}"
         workload-type: work
       serviceAccountName: arvo-workflow-sa
       retryStrategy:

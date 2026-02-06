@@ -275,9 +275,187 @@ def resolve_workflow_name(name: str, namespace: str = "argo") -> str:
     return resolved
 
 
-def watch_workflow(name: str, namespace: str = "argo") -> None:
-    """Watch a workflow in real-time."""
-    subprocess.run(["argo", "watch", name, "-n", namespace])
+def watch_workflow(
+    name: str,
+    namespace: str = "argo",
+    hide_done: bool = False,
+) -> None:
+    """Watch a workflow in real-time.
+
+    Args:
+        name: Workflow name
+        namespace: Kubernetes namespace
+        hide_done: If True, hide Succeeded and Skipped tasks (show only active/pending/failed)
+    """
+    if not hide_done:
+        # Use standard argo watch
+        subprocess.run(["argo", "watch", name, "-n", namespace])
+        return
+
+    # Custom watch with filtering
+    import sys
+    import time
+
+    # Status symbols and colors
+    SYMBOLS = {
+        "Pending": "\033[33m◷\033[0m",  # Yellow clock
+        "Running": "\033[36m●\033[0m",  # Cyan circle
+        "Succeeded": "\033[32m✔\033[0m",  # Green check
+        "Failed": "\033[31m✖\033[0m",  # Red X
+        "Error": "\033[31m✖\033[0m",  # Red X
+        "Skipped": "\033[90m○\033[0m",  # Gray circle
+        "Omitted": "\033[90m○\033[0m",  # Gray circle
+    }
+
+    # Phases to show when hide_done is True (only truly in-progress tasks)
+    # Note: "Failed" is excluded because condition checks (chk-*) that evaluate
+    # to false are marked as Failed, but they're not really errors
+    ACTIVE_PHASES = {"Pending", "Running"}
+
+    try:
+        while True:
+            # Get workflow status as JSON
+            result = run_argo(
+                ["get", name, "-n", namespace, "-o", "json"],
+                check=False,
+            )
+            if result.returncode != 0:
+                typer.echo(f"Error getting workflow: {result.stderr}")
+                raise typer.Exit(1)
+
+            try:
+                data = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                typer.echo("Error parsing workflow data")
+                raise typer.Exit(1)
+
+            status = data.get("status", {})
+            phase = status.get("phase", "Unknown")
+            progress = status.get("progress", "")
+            nodes = status.get("nodes", {})
+
+            # Clear screen and move cursor to top
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+
+            # Header
+            typer.echo(f"Workflow: {name}")
+            typer.echo(f"Phase: {phase}  Progress: {progress}")
+            typer.echo(f"Mode: Hiding completed/skipped tasks (--hide-done)")
+            typer.echo("-" * 60)
+
+            # Count by phase
+            phase_counts: dict[str, int] = {}
+            active_nodes = []
+
+            for node_id, node in nodes.items():
+                node_phase = node.get("phase", "Unknown")
+                node_type = node.get("type", "")
+                display_name = node.get("displayName", node.get("name", node_id))
+
+                # Count all phases
+                phase_counts[node_phase] = phase_counts.get(node_phase, 0) + 1
+
+                # Skip DAG/Steps container nodes (only show actual tasks)
+                if node_type in ("DAG", "Steps", "StepGroup"):
+                    continue
+
+                # Collect active nodes
+                if node_phase in ACTIVE_PHASES:
+                    active_nodes.append((display_name, node_phase, node))
+
+            # Show summary line
+            summary_parts = []
+            for p in ["Running", "Pending", "Succeeded", "Failed", "Skipped"]:
+                if p in phase_counts:
+                    summary_parts.append(f"{p}: {phase_counts[p]}")
+            typer.echo(" | ".join(summary_parts))
+            typer.echo()
+
+            # Show active nodes
+            if active_nodes:
+                typer.echo(f"Active tasks ({len(active_nodes)}):")
+                for display_name, node_phase, node in sorted(
+                    active_nodes, key=lambda x: x[0]
+                ):
+                    symbol = SYMBOLS.get(node_phase, "?")
+                    started = (
+                        node.get("startedAt", "")[:19] if node.get("startedAt") else ""
+                    )
+                    typer.echo(f"  {symbol} {display_name:<50} {started}")
+            else:
+                typer.echo("No active tasks.")
+
+            typer.echo()
+            typer.echo("Press Ctrl+C to exit")
+
+            # Check if workflow is done
+            if phase in ("Succeeded", "Failed", "Error"):
+                typer.echo()
+                typer.echo(f"Workflow {phase.lower()}.")
+                break
+
+            time.sleep(2)
+
+    except KeyboardInterrupt:
+        typer.echo("\nStopped watching.")
+
+
+def _fetch_gcs_archived_logs(
+    name: str,
+    bucket: str,
+    grep: Optional[str] = None,
+) -> bool:
+    """Fetch workflow logs from GCS archive. Returns True if logs were found."""
+    typer.echo(f"Fetching archived logs from GCS for {name}...")
+
+    # List all log files for this workflow under argo-logs/
+    gcs_result = subprocess.run(
+        ["gsutil", "ls", "-r", f"gs://{bucket}/argo-logs/"],
+        capture_output=True,
+        text=True,
+    )
+    if gcs_result.returncode != 0 or not gcs_result.stdout.strip():
+        return False
+
+    # Filter to lines matching this workflow name
+    log_files = [
+        line
+        for line in gcs_result.stdout.strip().split("\n")
+        if name in line and not line.endswith("/") and not line.endswith(":")
+    ]
+
+    if not log_files:
+        return False
+
+    typer.echo(f"Found {len(log_files)} archived log file(s) in GCS.\n")
+
+    for log_file in sorted(log_files):
+        # Extract pod name from path: .../workflow-name/pod-name
+        pod_name = log_file.rsplit("/", 1)[-1] if "/" in log_file else log_file
+        typer.echo(f"--- {pod_name} ---")
+
+        cat_result = subprocess.run(
+            ["gsutil", "cat", log_file],
+            capture_output=True,
+            text=True,
+        )
+        if cat_result.returncode != 0:
+            typer.echo(f"  (failed to read: {cat_result.stderr.strip()})")
+            continue
+
+        output = cat_result.stdout
+        if grep:
+            output = "\n".join(
+                line for line in output.split("\n") if grep in line
+            )
+
+        if output.strip():
+            print(output)
+        else:
+            typer.echo("  (empty or no matching lines)")
+
+    return True
 
 
 def get_workflow_logs(
@@ -286,14 +464,82 @@ def get_workflow_logs(
     follow: bool = False,
     grep: Optional[str] = None,
 ) -> None:
-    """Stream workflow logs."""
-    args = ["logs", name, "-n", namespace]
+    """Stream workflow logs.
+
+    Tries the Argo API first (live pod logs). If that returns empty
+    (pods already cleaned up), falls back to GCS-archived logs.
+    """
+    import sys as _s
+
+    # Follow mode: stream directly, no fallback possible
     if follow:
-        args.append("--follow")
+        args = ["logs", name, "-n", namespace, "--follow"]
+        if grep:
+            args.extend(["--grep", grep])
+        subprocess.run(["argo"] + args)
+        return
+
+    # Non-follow mode: capture output so we can fall back to GCS if empty
+    args = ["logs", name, "-n", namespace]
     if grep:
         args.extend(["--grep", grep])
 
-    subprocess.run(["argo"] + args)
+    result = subprocess.run(["argo"] + args, capture_output=True, text=True)
+
+    if result.stdout.strip():
+        # Argo returned logs from live pods — print and return
+        print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=_s.stderr)
+        return
+
+    # argo logs returned empty — fall back to GCS archived logs
+    typer.echo("No live pod logs available from Argo (pods may have been cleaned up).")
+
+    from .config import GKEConfig
+
+    config = GKEConfig.load()
+    if not config.bucket_name:
+        typer.echo("Error: No bucket configured. Run: python -m cli setup")
+        return
+
+    # Check if archiveLogs is configured in the cluster
+    cm = subprocess.run(
+        [
+            "kubectl", "get", "configmap", "workflow-controller-configmap",
+            "-n", "argo", "-o", "jsonpath={.data.artifactRepository}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    artifact_repo_config = cm.stdout.strip() if cm.returncode == 0 else ""
+
+    if "archiveLogs" not in artifact_repo_config:
+        typer.echo()
+        typer.echo(
+            "Warning: archiveLogs is NOT configured in the workflow-controller-configmap."
+        )
+        typer.echo(
+            "Logs are not being archived to GCS. Re-run setup to fix:"
+        )
+        typer.echo("  python -m cli setup --skip-cluster")
+        typer.echo()
+
+    found = _fetch_gcs_archived_logs(name, config.bucket_name, grep=grep)
+
+    if not found:
+        typer.echo(f"No archived logs found in GCS for workflow '{name}'.")
+        typer.echo(
+            f"Checked: gs://{config.bucket_name}/argo-logs/.../{name}/..."
+        )
+        if "archiveLogs" not in artifact_repo_config:
+            typer.echo()
+            typer.echo(
+                "This is expected — archiveLogs is not configured."
+            )
+            typer.echo(
+                "Fix with: python -m cli setup --skip-cluster"
+            )
 
 
 def cancel_workflow(name: str, namespace: str = "argo") -> bool:

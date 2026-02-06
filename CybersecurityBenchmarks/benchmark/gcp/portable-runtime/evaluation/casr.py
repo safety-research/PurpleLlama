@@ -123,8 +123,27 @@ def run_casr_cluster_map(
     os.makedirs(output_dir, exist_ok=True)
     mapping_file = os.path.join(output_dir, "crash_mapping.json")
 
+    # Verify log files exist -- our modified libFuzzer always produces them
+    # in fork mode. If they're missing, something is wrong upstream.
+    logs_dir = os.path.join(crashes_dir, "logs")
+    has_logs = os.path.isdir(logs_dir) and any(
+        f.endswith(".log") for f in os.listdir(logs_dir)
+    )
+
+    if not has_logs:
+        LOG.warning(
+            f"No crash log files found in {logs_dir}. "
+            "The modified libFuzzer should always produce per-crash logs in fork mode. "
+            "Check that crash files were copied correctly."
+        )
+        # Still proceed with --use-logs so casr-cluster-map gives a clear
+        # error rather than silently doing expensive binary re-runs that
+        # are unreliable in these containers (glibc mismatch, etc.)
+
     # Build casr-cluster-map command
-    # Matching fuzzing_only_benchmark.py lines 1228-1258
+    # Always use --use-logs for libFuzzer: our modified fork-mode libFuzzer
+    # writes per-crash logs, and binary re-run mode is unreliable in ARVO
+    # containers (old glibc, ASAN mismatch, etc.)
     cmd = [
         "casr-cluster-map",
         "-i",
@@ -137,20 +156,24 @@ def run_casr_cluster_map(
         str(jobs),
         "--mapping",
         mapping_file,
-        "--use-logs",  # For libFuzzer log-based clustering
+        "--use-logs",
         "--",
         binary_path,
-        "@@",  # Placeholder for crash input file
+        "@@",
     ]
 
     LOG.info(f"Running CASR clustering: {' '.join(cmd)}")
+
+    # Log-based mode is fast (parses existing log files, no binary re-runs)
+    # 10 minutes is plenty even for thousands of crashes
+    total_timeout = 600
 
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=300,  # 5 minutes total timeout
+            timeout=total_timeout,
         )
 
         stdout = result.stdout or ""
@@ -325,7 +348,14 @@ def deduplicate_timeline(
             shutil.copy2(crash.corpus_file, dest)
 
             # Also copy log file if it exists (for --use-logs)
-            log_file = crash.corpus_file + ".log"
+            # The modified libFuzzer in fork mode writes per-crash logs to
+            # {crash_dir}/logs/{crash_name}.log (a logs/ subdirectory),
+            # NOT next to the crash file as {crash_file}.log
+            crash_dir = os.path.dirname(crash.corpus_file)
+            log_file = os.path.join(crash_dir, "logs", crash.crash_id + ".log")
+            if not os.path.exists(log_file):
+                # Fallback: check next to the crash file (non-fork mode)
+                log_file = crash.corpus_file + ".log"
             if os.path.exists(log_file):
                 logs_dir = crash_files_dir / "logs"
                 logs_dir.mkdir(exist_ok=True)

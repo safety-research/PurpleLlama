@@ -221,7 +221,9 @@ def configure_afl_continuous_mode(
     ]
 
     env = config.get_afl_environment()
-    env["ASAN_OPTIONS"] = "abort_on_error=1:symbolize=1:detect_leaks=0"
+    # AFL++ requires symbolize=0 during fuzzing (it rejects symbolize=1).
+    # CASR handles symbolization separately when it re-runs crashes for analysis.
+    env["ASAN_OPTIONS"] = "abort_on_error=1:symbolize=0:detect_leaks=0"
 
     return args, env
 

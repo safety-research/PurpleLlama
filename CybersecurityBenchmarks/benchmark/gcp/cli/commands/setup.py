@@ -167,7 +167,7 @@ def setup(
                 typer.echo(f"    Error: {result.stderr}")
 
         # Create batch-work pool for 2-vCPU fuzz/patch jobs
-        typer.echo("  Creating batch-work pool (e2-standard-4 for fuzz/patch)...")
+        typer.echo("  Creating batch-work pool (n4-standard-4 for fuzz/patch)...")
         result = subprocess.run(
             [
                 "gcloud",
@@ -178,7 +178,9 @@ def setup(
                 f"--cluster={config.cluster_name}",
                 f"--project={config.project_id}",
                 f"--zone={config.zone}",
-                "--machine-type=e2-standard-4",
+                "--machine-type=n4-standard-4",
+                "--disk-type=hyperdisk-balanced",
+                "--disk-size=100",
                 "--spot",
                 "--num-nodes=0",
                 "--enable-autoscaling",
@@ -193,6 +195,68 @@ def setup(
         if result.returncode != 0:
             if "already exists" in result.stderr:
                 typer.echo("    batch-work pool already exists.")
+            else:
+                typer.echo(f"    Error: {result.stderr}")
+
+        # Create batch-work-nonspot pool for critical non-spot workloads
+        typer.echo("  Creating batch-work-nonspot pool (n4-standard-4, non-spot for critical jobs)...")
+        result = subprocess.run(
+            [
+                "gcloud",
+                "container",
+                "node-pools",
+                "create",
+                "batch-work-nonspot",
+                f"--cluster={config.cluster_name}",
+                f"--project={config.project_id}",
+                f"--zone={config.zone}",
+                "--machine-type=n4-standard-4",
+                "--disk-type=hyperdisk-balanced",
+                "--disk-size=100",
+                "--num-nodes=0",
+                "--enable-autoscaling",
+                "--min-nodes=0",
+                "--max-nodes=200",
+                "--node-taints=workload=work:NoSchedule",
+                f"--node-labels=owner={owner},workload-type=work,spot=false",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            if "already exists" in result.stderr:
+                typer.echo("    batch-work-nonspot pool already exists.")
+            else:
+                typer.echo(f"    Error: {result.stderr}")
+
+        # Create debug-work pool for on-demand debug VMs (non-SPOT)
+        typer.echo("  Creating debug-work pool (n4-standard-4, on-demand for debugging)...")
+        result = subprocess.run(
+            [
+                "gcloud",
+                "container",
+                "node-pools",
+                "create",
+                "debug-work",
+                f"--cluster={config.cluster_name}",
+                f"--project={config.project_id}",
+                f"--zone={config.zone}",
+                "--machine-type=n4-standard-4",
+                "--disk-type=hyperdisk-balanced",
+                "--disk-size=100",
+                "--num-nodes=0",
+                "--enable-autoscaling",
+                "--min-nodes=0",
+                "--max-nodes=5",
+                "--node-taints=workload=debug:NoSchedule",
+                f"--node-labels=owner={owner},workload-type=debug",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            if "already exists" in result.stderr:
+                typer.echo("    debug-work pool already exists.")
             else:
                 typer.echo(f"    Error: {result.stderr}")
 
@@ -516,6 +580,24 @@ data:
     else:
         # Might already have the permission, check if it's already there
         typer.echo("  Argo cluster role already has required permissions (or patch failed).")
+
+    # Patch arvo-workflow-role to add workflowtaskresults permission (needed for emissary executor)
+    result = run_kubectl(
+        [
+            "patch",
+            "role",
+            "arvo-workflow-role",
+            "-n",
+            "argo",
+            "--type=json",
+            '-p=[{"op": "add", "path": "/rules/-", "value": {"apiGroups": ["argoproj.io"], "resources": ["workflowtaskresults"], "verbs": ["create", "patch"]}}]',
+        ],
+        check=False,
+    )
+    if result.returncode == 0:
+        typer.echo("  Workflow role patched for task results.")
+    else:
+        typer.echo("  Workflow role already has workflowtaskresults permission (or patch failed).")
     typer.echo()
     typer.echo(f"Config saved to: {get_config_path()}")
     typer.echo()

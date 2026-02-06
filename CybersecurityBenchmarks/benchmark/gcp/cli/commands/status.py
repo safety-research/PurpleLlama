@@ -34,6 +34,14 @@ def status(
     limit: Annotated[
         int, typer.Option("--limit", "-n", help="Max workflows to show")
     ] = 20,
+    hide_done: Annotated[
+        bool,
+        typer.Option(
+            "--hide-done",
+            "--active-only",
+            help="Hide completed/skipped tasks (watch mode)",
+        ),
+    ] = False,
 ) -> None:
     """Show workflow status.
 
@@ -43,6 +51,7 @@ def status(
         python -m cli status --owner camyang    # Filter by owner
         python -m cli status --running --mine   # Your running workflows
         python -m cli status arvo-benchmark-xyz # Specific workflow status
+        python -m cli status <wf> -w --hide-done  # Watch, hiding completed tasks
     """
     if workflow_name:
         # Resolve special patterns like "latest" or "last-2"
@@ -50,7 +59,7 @@ def status(
 
         # Show specific workflow
         if watch:
-            watch_workflow(workflow_name)
+            watch_workflow(workflow_name, hide_done=hide_done)
             return
 
         wf_status = get_workflow_status(workflow_name)

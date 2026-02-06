@@ -55,6 +55,8 @@ class RunConfig:
     fuzzing_duration: int = 300
     run_gt: bool = True
     build_version: str = "latest"
+    patch_use_spot: bool = True
+    fuzz_use_spot: bool = True
 
 
 def get_config_path() -> Path:

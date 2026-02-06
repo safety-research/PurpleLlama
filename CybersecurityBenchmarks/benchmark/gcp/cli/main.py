@@ -14,6 +14,7 @@ import typer
 
 from .commands import (
     cancel,
+    debug_vm,
     deps,
     experiments,
     logs,
@@ -64,7 +65,9 @@ def cmd_submit(
     cases: str = typer.Option(None, help="Case IDs: '42,43', '42-50', or '@file.json'"),
     model: str = typer.Option(None, help="LLM model (overrides config agents)"),
     experiment_id: str = typer.Option(None, "--experiment", "-e", help="Experiment ID"),
-    fuzzing_duration: Optional[int] = typer.Option(None, help="Fuzzing duration (seconds)"),
+    fuzzing_duration: Optional[int] = typer.Option(
+        None, help="Fuzzing duration (seconds)"
+    ),
     run_gt: bool = typer.Option(True, "--gt/--no-gt", help="Run ground truth"),
     build_version: str = typer.Option("latest", help="Build version tag"),
     config_file: str = typer.Option(None, "--config", "-c", help="Config file"),
@@ -104,6 +107,12 @@ def cmd_status(
     watch: bool = typer.Option(False, "-w", "--watch", help="Watch in real-time"),
     running: bool = typer.Option(False, "--running", help="Show only running"),
     limit: int = typer.Option(20, "-n", "--limit", help="Max workflows"),
+    hide_done: bool = typer.Option(
+        False,
+        "--hide-done",
+        "--active-only",
+        help="Hide completed/skipped tasks (watch mode)",
+    ),
 ) -> None:
     """Show workflow status."""
     status.status(
@@ -111,6 +120,7 @@ def cmd_status(
         watch=watch,
         running=running,
         limit=limit,
+        hide_done=hide_done,
     )
 
 
@@ -358,6 +368,62 @@ def cmd_secrets_show(
 ) -> None:
     """Show secret details."""
     secrets.show_secret(secret_name=secret_name, namespace=namespace, decode=decode)
+
+
+# Debug VM commands (interactive debugging on non-SPOT nodes)
+debug_vm_app = typer.Typer(help="Debug VM management for interactive debugging")
+app.add_typer(debug_vm_app, name="debug-vm")
+
+
+@debug_vm_app.command("launch")
+def cmd_debug_vm_launch(
+    case_id: int = typer.Argument(..., help="ARVO case ID to debug"),
+    job_type: str = typer.Option(
+        "fuzz", "--type", "-t", help="Job type: fuzz or patch"
+    ),
+    model: str = typer.Option(
+        "gt",
+        "--model",
+        "-m",
+        help="Model name, or 'gt' for ground truth",
+    ),
+    experiment_id: Optional[str] = typer.Option(
+        None, "--experiment", "-e", help="Experiment ID (required when model is not 'gt')"
+    ),
+    build_version: str = typer.Option(
+        "latest", "--build-version", help="Build version tag"
+    ),
+) -> None:
+    """Launch a debug pod with fuzz/patch environment."""
+    debug_vm.launch(
+        case_id=case_id,
+        job_type=job_type,
+        model=model,
+        experiment_id=experiment_id,
+        build_version=build_version,
+    )
+
+
+@debug_vm_app.command("ssh")
+def cmd_debug_vm_ssh(
+    pod_name: str = typer.Argument(..., help="Debug pod name"),
+) -> None:
+    """SSH into a debug pod."""
+    debug_vm.ssh(pod_name=pod_name)
+
+
+@debug_vm_app.command("delete")
+def cmd_debug_vm_delete(
+    pod_name: str = typer.Argument(..., help="Debug pod name"),
+) -> None:
+    """Delete a debug pod."""
+    debug_vm.delete(pod_name=pod_name)
+
+
+@debug_vm_app.command("list")
+def cmd_debug_vm_list() -> None:
+    """List all debug pods."""
+    debug_vm.list_pods()
 
 
 # Sync templates command

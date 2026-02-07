@@ -9,6 +9,7 @@ and debug interactively.
 
 import json
 import os
+import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -18,7 +19,8 @@ import typer
 import yaml
 
 from ..argo import get_current_user, run_kubectl
-from ..config import GKEConfig
+from ..config import GKEConfig, get_script_dir
+from ..hashing import check_runtime_needs_rebuild
 from ..output import echo_error, echo_info, echo_success, echo_warning
 
 
@@ -458,6 +460,44 @@ def launch(
         typer.echo(f"Experiment:     {experiment_id}")
     typer.echo(f"Build Version:  {build_version}")
     typer.echo(f"Owner:          {owner}")
+    typer.echo()
+
+    # Check if agent runtime needs rebuild/upload
+    echo_info("Checking agent runtime...")
+    needs_rebuild, reason = check_runtime_needs_rebuild()
+    if needs_rebuild:
+        echo_warning(f"Runtime needs rebuild ({reason})")
+        build_script = get_script_dir() / "portable-runtime" / "build.sh"
+        echo_info("Rebuilding runtime...")
+        result = subprocess.run(
+            ["bash", str(build_script)], capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            echo_error(f"Runtime build failed: {result.stderr}")
+            raise typer.Exit(1)
+        echo_success("Runtime rebuilt")
+
+        runtime_tar = get_script_dir() / "portable-runtime" / "output" / "agent-runtime.tar.gz"
+        if runtime_tar.exists():
+            echo_info("Uploading runtime to GCS...")
+            result = subprocess.run(
+                [
+                    "gsutil",
+                    "cp",
+                    str(runtime_tar),
+                    f"gs://{config.bucket_name}/agent-runtime/",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                echo_success("Runtime uploaded")
+            else:
+                echo_warning(f"Upload failed: {result.stderr}")
+        else:
+            echo_warning("Runtime tarball not found after build")
+    else:
+        echo_success("Runtime up to date")
     typer.echo()
 
     # Build pod spec

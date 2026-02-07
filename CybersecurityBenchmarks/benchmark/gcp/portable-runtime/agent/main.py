@@ -66,6 +66,14 @@ def get_available_agents() -> Dict[str, Type[BaseAgent]]:
         except ImportError as e:
             LOG.warning(f"Failed to import autopatchbench agent: {e}")
 
+        # Claude Code AgentSDK-based agent (single binary)
+        try:
+            from .claudecode import ClaudeCodeAgent
+
+            AGENT_REGISTRY["claudecode"] = ClaudeCodeAgent
+        except ImportError as e:
+            LOG.warning(f"Failed to import claudecode agent: {e}")
+
     return AGENT_REGISTRY
 
 

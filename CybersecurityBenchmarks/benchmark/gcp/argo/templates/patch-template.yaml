@@ -55,6 +55,14 @@ spec:
             gcs:
               bucket: "{{inputs.parameters.bucket}}"
               key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/chat.md"
+          - name: conversation
+            path: /output/conversation.json
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/conversation.json"
           - name: rebuilt-binary
             path: /output/rebuilt_binary
             optional: true

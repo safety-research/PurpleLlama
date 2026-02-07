@@ -4,17 +4,17 @@
 # This script sets up the environment for running the portable agent runtime
 # inside ARVO containers (or any glibc 2.17+ system).
 #
-# The Python and Node.js binaries are from python-build-standalone and
-# unofficial-builds respectively, which are compiled against old glibc (2.17).
-# They should work natively on old systems without bundled glibc.
+# The Python binaries are from python-build-standalone, compiled against old
+# glibc (2.17). The Claude Code CLI is a Bun-compiled single binary with
+# zero external dependencies.
 #
 # Usage:
 #   /agent-runtime/bin/agent-entrypoint.sh python3 script.py
-#   /agent-runtime/bin/agent-entrypoint.sh node script.js
-#   /agent-runtime/bin/agent-entrypoint.sh  # Runs default agent
+#   /agent-runtime/bin/agent-entrypoint.sh  # Shows usage
 #
 # Environment variables:
 #   ANTHROPIC_API_KEY  - Required for LLM calls
+#   AGENT_CONFIG       - JSON agent configuration (set by Argo template)
 #   AGENT_RUNTIME_DEBUG=1 - Enable debug output
 #   AGENT_RUNTIME_DIR  - Override runtime directory (default: auto-detect)
 
@@ -45,16 +45,17 @@ fi
 # Environment Configuration
 # =============================================================================
 
-# 1. PATH - prepend runtime binaries
-export PATH="${RUNTIME_DIR}/bin:${RUNTIME_DIR}/python/bin:${RUNTIME_DIR}/node/bin:${PATH}"
+# 1. PATH - prepend runtime binaries (includes Claude Code CLI)
+export PATH="${RUNTIME_DIR}/bin:${RUNTIME_DIR}/python/bin:${PATH}"
 
 # 2. Python environment
 export PYTHONHOME="${RUNTIME_DIR}/python"
 # Include both agent/ and evaluation/ modules, plus the parent directory for imports
 export PYTHONPATH="${RUNTIME_DIR}/python/lib/python3.11:${RUNTIME_DIR}/python/lib/python3.11/site-packages:${RUNTIME_DIR}"
 
-# 3. Node.js environment
-export NODE_PATH="${RUNTIME_DIR}/node/lib/node_modules"
+# 3. Claude Code CLI path for claude-agent-sdk
+# The SDK uses this to find the bundled single-binary CLI instead of looking for node/npm
+export CLAUDE_CODE_CLI_PATH="${RUNTIME_DIR}/bin/claude"
 
 # 4. SSL certificates - use system certs if available
 # This is important for HTTPS connections to Anthropic API
@@ -82,16 +83,22 @@ if [ "${AGENT_RUNTIME_DEBUG:-0}" = "1" ]; then
     echo "[agent-runtime] Runtime directory: ${RUNTIME_DIR}"
     echo "[agent-runtime] PATH: ${PATH}"
     echo "[agent-runtime] PYTHONHOME: ${PYTHONHOME}"
+    echo "[agent-runtime] CLAUDE_CODE_CLI_PATH: ${CLAUDE_CODE_CLI_PATH}"
     echo "[agent-runtime] SSL_CERT_FILE: ${SSL_CERT_FILE:-not set}"
+    echo "[agent-runtime] AGENT_CONFIG: ${AGENT_CONFIG:-(not set)}"
     echo "[agent-runtime] Container glibc: $(ldd --version 2>&1 | head -1 || echo 'unknown')"
 
     # Test Python
     echo -n "[agent-runtime] Python: "
     "${RUNTIME_DIR}/python/bin/python3.11" --version 2>&1 || echo "FAILED"
 
-    # Test Node.js
-    echo -n "[agent-runtime] Node.js: "
-    "${RUNTIME_DIR}/node/bin/node" --version 2>&1 || echo "FAILED"
+    # Test Claude Code CLI
+    echo -n "[agent-runtime] Claude CLI: "
+    if [ -f "${RUNTIME_DIR}/bin/claude" ]; then
+        echo "present ($(du -sh "${RUNTIME_DIR}/bin/claude" | cut -f1))"
+    else
+        echo "NOT FOUND"
+    fi
 
     echo "[agent-runtime] ======================================"
 fi
@@ -107,18 +114,18 @@ if [ $# -eq 0 ]; then
     echo "Usage: $0 <command> [args...]"
     echo ""
     echo "Examples:"
-    echo "  # Run patching agent"
-    echo "  $0 python3 -m agent.main --case-id 42 --agent autopatchbench --model claude-sonnet-4-20250514"
+    echo "  # Run patching agent (production: uses AGENT_CONFIG env var)"
+    echo "  $0 python3 -m agent.main --case-id 42"
+    echo ""
+    echo "  # Run patching agent (manual: individual flags)"
+    echo "  $0 python3 -m agent.main --case-id 42 --agent claudecode --model claude-sonnet-4-20250514"
     echo ""
     echo "  # Run fuzzing evaluation"
     echo "  $0 python3 -m evaluation.main --case-id 42 --duration 300"
     echo ""
-    echo "  # Run Python script"
-    echo "  $0 python3 script.py"
-    echo ""
-    echo "Available modules:"
-    echo "  agent      - Patching agents (autopatchbench)"
-    echo "  evaluation - Fuzzing and crash analysis"
+    echo "Available agents:"
+    echo "  autopatchbench - Baseline stack-trace-guided patcher"
+    echo "  claudecode     - Claude Code AgentSDK-based patcher"
     exit 1
 else
     # Determine what to run based on first argument
@@ -128,12 +135,6 @@ else
     case "${CMD}" in
         python|python3|python3.11)
             exec "${RUNTIME_DIR}/python/bin/python3.11" "$@"
-            ;;
-        node|nodejs)
-            exec "${RUNTIME_DIR}/node/bin/node" "$@"
-            ;;
-        npm)
-            exec "${RUNTIME_DIR}/node/bin/npm" "$@"
             ;;
         *)
             # Try to run as-is (might be a script in PATH)

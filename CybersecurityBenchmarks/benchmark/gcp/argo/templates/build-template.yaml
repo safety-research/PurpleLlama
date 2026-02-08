@@ -207,7 +207,6 @@ spec:
               gsutil cp -r gs://${BUCKET}/build-assets/libfuzzer-modern/ /workspace/ || true
               gsutil cp gs://${BUCKET}/build-assets/differential-debugging-deps-16.04.deb /workspace/ || true
               gsutil cp gs://${BUCKET}/build-assets/differential-debugging-deps-20.04.deb /workspace/ || true
-              gsutil cp gs://${BUCKET}/build-assets/casr_cluster.py /workspace/ || true
               gsutil cp -r gs://${BUCKET}/build-assets/microsnapshots/ /workspace/ || true
 
               # Generate Dockerfile from template

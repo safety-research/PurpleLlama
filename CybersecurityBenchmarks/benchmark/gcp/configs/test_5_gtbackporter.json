@@ -1,0 +1,9 @@
+{
+  "cases": [12803, 10445, 11429, 1236, 1273],
+  "agents": [
+    {"agent": "gtbackporter", "model": "claude-opus-4-5-20251101", "max_turns": 50}
+  ],
+  "fuzzing_duration": 1800,
+  "fuzz_use_spot": true,
+  "patch_use_spot": true
+}

@@ -133,11 +133,6 @@ def compute_build_version(build_dir: Path) -> tuple[str, dict]:
     for deb_file in sorted(build_dir.glob("differential-debugging-deps-*.deb")):
         asset_hashes[deb_file.name] = compute_file_hash(deb_file)
 
-    # Hash casr_cluster.py
-    casr_cluster_py = build_dir / "casr_cluster.py"
-    if casr_cluster_py.exists():
-        asset_hashes["casr_cluster.py"] = compute_file_hash(casr_cluster_py)
-
     # Compute combined hash from all asset hashes
     combined = hashlib.sha256()
     for key in sorted(asset_hashes.keys()):
@@ -186,10 +181,10 @@ def compute_image_build_version(build_dir: Path) -> tuple[str, dict]:
     if dd_hash:
         input_hashes["dd-source"] = dd_hash
 
-    # Hash casr_cluster.py
-    casr_cluster_py = build_dir / "casr_cluster.py"
-    if casr_cluster_py.exists():
-        input_hashes["casr_cluster.py"] = compute_file_hash(casr_cluster_py)
+    # Hash microsnapshots directory
+    microsnapshots_dir = build_dir / "microsnapshots"
+    if microsnapshots_dir.exists():
+        input_hashes["microsnapshots"] = compute_directory_hash(microsnapshots_dir)
 
     # Hash glibc deb (rarely changes, but include for correctness)
     glibc_deb = build_dir / "libc6_2.35-0ubuntu3_amd64.deb"
@@ -204,6 +199,62 @@ def compute_image_build_version(build_dir: Path) -> tuple[str, dict]:
 
     version_hash = combined.hexdigest()[:8]
     return version_hash, input_hashes
+
+
+def compute_local_build_assets_hashes(build_dir: Path) -> dict[str, str]:
+    """Compute hashes of all local build assets that get uploaded to GCS.
+
+    These are the files consumed by build-template.yaml's init containers.
+
+    Returns:
+        Dict of asset_name -> hash
+    """
+    hashes: dict[str, str] = {}
+
+    # Dockerfile templates
+    for name in [
+        "dockerfile_vul_template",
+        "dockerfile_fix_template",
+        "dockerfile_fuzzing_template",
+    ]:
+        path = build_dir / name
+        if path.exists():
+            hashes[name] = compute_file_hash(path)
+
+    # libfuzzer-modern directory
+    libfuzzer_dir = build_dir / "libfuzzer-modern"
+    if libfuzzer_dir.exists():
+        hashes["libfuzzer-modern"] = compute_directory_hash(libfuzzer_dir)
+
+    # microsnapshots directory
+    microsnapshots_dir = build_dir / "microsnapshots"
+    if microsnapshots_dir.exists():
+        hashes["microsnapshots"] = compute_directory_hash(microsnapshots_dir)
+
+    # glibc deb
+    glibc_deb = build_dir / "libc6_2.35-0ubuntu3_amd64.deb"
+    if glibc_deb.exists():
+        hashes["libc6_2.35-0ubuntu3_amd64.deb"] = compute_file_hash(glibc_deb)
+
+    return hashes
+
+
+def get_build_assets_manifest_from_gcs(bucket: str) -> dict:
+    """Get build assets manifest from GCS.
+
+    Returns:
+        Dict of asset_name -> hash (as last uploaded), or empty dict.
+    """
+    result = run_gsutil(
+        ["cat", f"gs://{bucket}/build-assets/build-assets-manifest.json"],
+        check=False,
+    )
+    if result.returncode == 0:
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            pass
+    return {}
 
 
 def get_build_version_from_gcs(bucket: str) -> Optional[str]:

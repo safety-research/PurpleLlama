@@ -26,7 +26,10 @@ from ..hashing import (
     check_runtime_needs_rebuild,
     compute_deps_source_hash,
     compute_image_build_version,
+    compute_local_build_assets_hashes,
+    get_build_assets_manifest_from_gcs,
     get_deps_manifest_from_gcs,
+    run_gsutil,
 )
 from ..output import echo_error, echo_info, echo_success, echo_warning
 from . import semaphore
@@ -845,6 +848,17 @@ def submit(
         if not should_continue:
             typer.echo("Aborting submission.")
             raise typer.Exit(1)
+
+        # Auto-upload deps sources to GCS when deps will be rebuilt
+        # The build-casr/build-dd workflow tasks download source from GCS,
+        # so we must sync local source before the workflow runs.
+        if (build_casr or build_dd) and not dry_run:
+            from . import deps
+
+            echo_info("Syncing deps sources to GCS (needed for build)...")
+            deps.upload_deps_sources(quiet=True)
+            echo_success("Deps sources synced")
+
         typer.echo()
 
     # Check semaphore limits (per-model, not per-agent-id)
@@ -887,6 +901,56 @@ def submit(
                 typer.echo(f"  Warning: {result.stderr}")
         else:
             typer.echo("  Warning: Runtime tarball not found.")
+        typer.echo()
+
+    # Sync build assets to GCS (hash-gated: only upload changed files)
+    if not dry_run:
+        typer.echo("Checking build assets...")
+        local_hashes = compute_local_build_assets_hashes(AUTOPATCH_BUILD_DIR)
+        gcs_manifest = get_build_assets_manifest_from_gcs(gke_config.bucket_name)
+        changed = {
+            name: h
+            for name, h in local_hashes.items()
+            if gcs_manifest.get(name) != h
+        }
+        if changed:
+            echo_info(f"Syncing {len(changed)} changed build asset(s) to GCS...")
+            bucket_url = f"gs://{gke_config.bucket_name}/build-assets"
+            for name in changed:
+                local_path = AUTOPATCH_BUILD_DIR / name
+                if local_path.is_dir():
+                    subprocess.run(
+                        ["gsutil", "-m", "-q", "rsync", "-r",
+                         str(local_path), f"{bucket_url}/{name}/"],
+                        capture_output=True, text=True,
+                    )
+                else:
+                    subprocess.run(
+                        ["gsutil", "-q", "cp",
+                         str(local_path), f"{bucket_url}/"],
+                        capture_output=True, text=True,
+                    )
+                typer.echo(f"  {name}: uploaded")
+            # Update manifest in GCS
+            import json as _json
+            from datetime import datetime as _dt
+            manifest_data = dict(local_hashes)
+            manifest_data["uploaded_at"] = _dt.utcnow().isoformat() + "Z"
+            import tempfile as _tf
+            with _tf.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False
+            ) as tmp:
+                _json.dump(manifest_data, tmp, indent=2)
+                tmp_path = tmp.name
+            subprocess.run(
+                ["gsutil", "-q", "cp", tmp_path,
+                 f"{bucket_url}/build-assets-manifest.json"],
+                capture_output=True, text=True,
+            )
+            Path(tmp_path).unlink(missing_ok=True)
+            echo_success("Build assets synced")
+        else:
+            echo_success("Build assets up to date")
         typer.echo()
 
     # Upload patch files for gtbackporter agents

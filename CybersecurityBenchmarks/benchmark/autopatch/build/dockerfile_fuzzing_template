@@ -63,12 +63,6 @@ RUN mkdir -p /usr/local/casr && \
 # Verify CASR installation
 RUN casr-san --version && echo "CASR installed successfully with glibc 2.35 via RPATH"
 
-# Copy custom CASR clustering script that preserves all crashes
-COPY ./casr_cluster.py /usr/local/bin/casr_cluster.py
-RUN chmod +x /usr/local/bin/casr_cluster.py && \
-    PATH=/usr/local/python37/bin:$PATH python3 /usr/local/bin/casr_cluster.py --help > /dev/null && \
-    echo "CASR clustering script installed and verified"
-
 # Configure LLDB
 RUN echo "settings set target.disable-aslr false" > ~/.lldbinit && \
     echo "settings set target.inherit-env true" >> ~/.lldbinit && \

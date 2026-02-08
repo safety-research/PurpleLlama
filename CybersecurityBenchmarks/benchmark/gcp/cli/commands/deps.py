@@ -222,15 +222,6 @@ def upload_build_assets(
         if not quiet:
             echo_success("microsnapshots uploaded")
 
-    # Upload casr_cluster.py
-    casr_cluster_py = build_dir / "casr_cluster.py"
-    if casr_cluster_py.exists():
-        if not quiet:
-            echo_info("Uploading casr_cluster.py...")
-        _run_gsutil(["cp", str(casr_cluster_py), f"gs://{bucket}/build-assets/"])
-        if not quiet:
-            echo_success("casr_cluster.py uploaded")
-
     if not quiet:
         typer.echo()
         echo_success("Build assets uploaded!")

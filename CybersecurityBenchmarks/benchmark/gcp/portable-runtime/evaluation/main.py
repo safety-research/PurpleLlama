@@ -287,32 +287,38 @@ def main() -> int:
         return 1
 
     # Regression analysis: compare LLM crashes against vul binary
+    # Wrapped in try/except so fuzzing results are always saved even if
+    # regression fails (e.g. casr-compare not on PATH). The error is still
+    # propagated via result.error -> exit code 1.
     if (
         target == FuzzingTarget.LLM_PATCH
         and args.original_binary_path
         and result.timeline
         and result.timeline.crashes
     ):
-        from .casr_regression import analyze_regressions
+        try:
+            from .casr_regression import analyze_regressions
 
-        LOG.info("Running regression analysis...")
-        regression = analyze_regressions(
-            timeline=result.timeline,
-            llm_binary_path=args.binary_path,
-            vul_binary_path=args.original_binary_path,
-            output_dir=output_dir,
-        )
-        if regression:
-            # Save regression analysis alongside other results
-            regression_file = output_dir / "regression_analysis.json"
-            regression_file.write_text(json.dumps(regression.to_dict(), indent=2))
-            LOG.info(f"Regression analysis saved to {regression_file}")
+            LOG.info("Running regression analysis...")
+            regression = analyze_regressions(
+                timeline=result.timeline,
+                llm_binary_path=args.binary_path,
+                vul_binary_path=args.original_binary_path,
+                output_dir=output_dir,
+            )
+            if regression:
+                regression_file = output_dir / "regression_analysis.json"
+                regression_file.write_text(json.dumps(regression.to_dict(), indent=2))
+                LOG.info(f"Regression analysis saved to {regression_file}")
+        except Exception as e:
+            LOG.exception(f"Regression analysis failed: {e}")
+            result.error = f"regression_failed: {e}"
 
     # Print summary
     print_summary(result)
 
     # Return 0 on success - crashes found is a valid result, not an error
-    # Only return 1 if there was an actual error during fuzzing
+    # Only return 1 if there was an actual error during fuzzing or regression
     return 1 if result.error else 0
 
 

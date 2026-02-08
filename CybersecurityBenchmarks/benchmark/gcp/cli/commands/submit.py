@@ -694,8 +694,8 @@ def submit(
         Optional[int], typer.Option(help="Fuzzing duration in seconds")
     ] = None,
     run_gt: Annotated[
-        bool, typer.Option("--gt/--no-gt", help="Run ground truth fuzzing")
-    ] = True,
+        Optional[bool], typer.Option("--gt/--no-gt", help="Run ground truth fuzzing")
+    ] = None,
     build_version: Annotated[str, typer.Option(help="Build version tag ('auto' = content hash)")] = "auto",
     config_file: Annotated[
         Optional[Path], typer.Option("--config", "-c", help="Config file (JSON)")
@@ -779,7 +779,8 @@ def submit(
         run_config.experiment_id = experiment_id
     if fuzzing_duration is not None:
         run_config.fuzzing_duration = fuzzing_duration
-    run_config.run_gt = run_gt
+    if run_gt is not None:
+        run_config.run_gt = run_gt
     if build_version:
         run_config.build_version = build_version
 

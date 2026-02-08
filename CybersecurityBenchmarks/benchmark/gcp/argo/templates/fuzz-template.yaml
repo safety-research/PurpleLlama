@@ -37,6 +37,14 @@ spec:
             gcs:
               bucket: "{{inputs.parameters.bucket}}"
               key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/crashes.json"
+          - name: regression-analysis
+            path: /output/regression_analysis.json
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/regression_analysis.json"
           - name: success-marker
             path: /output/_SUCCESS
             optional: true

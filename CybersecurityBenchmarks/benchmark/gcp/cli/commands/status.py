@@ -41,7 +41,7 @@ def status(
         typer.Option(
             "--hide-done",
             "--active-only",
-            help="Hide completed/skipped tasks (watch mode)",
+            help="Hide completed/skipped tasks (implies watch mode)",
         ),
     ] = False,
     brief: Annotated[
@@ -62,11 +62,16 @@ def status(
         python -m cli status --running --mine   # Your running workflows
         python -m cli status arvo-benchmark-xyz # Specific workflow (full node tree)
         python -m cli status arvo-benchmark-xyz -b  # Brief summary only
-        python -m cli status <wf> -w --hide-done  # Watch, hiding completed tasks
+        python -m cli status <wf> -w --active-only # Watch, hiding completed tasks
+        python -m cli status <wf> --active-only    # Same (implies -w)
     """
     if workflow_name:
         # Resolve special patterns like "latest" or "last-2"
         workflow_name = resolve_workflow_name(workflow_name)
+
+        # --active-only implies watch mode
+        if hide_done and not watch:
+            watch = True
 
         # Show specific workflow
         if watch:

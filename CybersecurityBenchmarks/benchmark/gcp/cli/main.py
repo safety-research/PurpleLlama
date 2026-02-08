@@ -113,7 +113,7 @@ def cmd_status(
         False,
         "--hide-done",
         "--active-only",
-        help="Hide completed/skipped tasks (watch mode)",
+        help="Hide completed/skipped tasks (implies watch mode)",
     ),
     brief: bool = typer.Option(
         False, "-b", "--brief", help="Brief summary only"

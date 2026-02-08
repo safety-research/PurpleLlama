@@ -391,6 +391,25 @@ metadata:
   name: workflow-controller-configmap
   namespace: argo
 data:
+  persistence: |
+    connectionPool:
+      maxIdleConns: 100
+      maxOpenConns: 0
+      connMaxLifetime: 0s
+    nodeStatusOffLoad: true
+    archive: true
+    archiveTTL: 7d
+    postgresql:
+      host: postgres.argo.svc.cluster.local
+      port: 5432
+      database: argo
+      tableName: argo_workflows
+      userNameSecret:
+        name: argo-postgres-config
+        key: username
+      passwordSecret:
+        name: argo-postgres-config
+        key: password
   artifactRepository: |
     archiveLogs: true
     gcs:
@@ -413,18 +432,7 @@ data:
             typer.echo(
                 f"  Logs will be archived to: gs://{config.bucket_name}/argo-logs/"
             )
-            # Restart workflow controller to pick up new config
-            run_kubectl(
-                [
-                    "rollout",
-                    "restart",
-                    "deployment",
-                    "workflow-controller",
-                    "-n",
-                    "argo",
-                ],
-                check=False,
-            )
+            # Note: workflow-controller will be restarted after PostgreSQL is ready (step 13/13)
         else:
             typer.echo(f"  Warning: Could not configure log archiving: {result.stderr}")
 
@@ -611,7 +619,7 @@ data:
 
     # Patch argo-cluster-role to add workflowtasksets/status permission (needed for HTTP templates)
     typer.echo()
-    typer.echo("[12/12] Patching Argo RBAC for HTTP templates...")
+    typer.echo("[12/13] Patching Argo RBAC for HTTP templates...")
     result = run_kubectl(
         [
             "patch",
@@ -649,6 +657,61 @@ data:
         typer.echo(
             "  Workflow role already has workflowtaskresults permission (or patch failed)."
         )
+
+    # Set up PostgreSQL for node status offloading
+    if not skip_argo:
+        typer.echo()
+        typer.echo("[13/13] Setting up PostgreSQL for workflow offloading...")
+        infra_dir = get_script_dir() / "argo" / "infra"
+        postgres_yaml = infra_dir / "postgres.yaml"
+        if postgres_yaml.exists():
+            result = run_kubectl(
+                ["apply", "-f", str(postgres_yaml)],
+                check=False,
+            )
+            if result.returncode == 0:
+                typer.echo("  PostgreSQL resources created.")
+
+                # Wait for PostgreSQL to be ready
+                typer.echo("  Waiting for PostgreSQL to be ready (up to 60s)...")
+                for _ in range(30):  # Wait up to 60 seconds
+                    time.sleep(2)
+                    result = run_kubectl(
+                        ["get", "pod", "postgres-0", "-n", "argo", "-o", "jsonpath={.status.phase}"],
+                        check=False,
+                    )
+                    if result.returncode == 0 and result.stdout.strip() == "Running":
+                        # Double-check readiness
+                        result = run_kubectl(
+                            ["get", "pod", "postgres-0", "-n", "argo", "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
+                            check=False,
+                        )
+                        if result.returncode == 0 and result.stdout.strip() == "True":
+                            typer.echo("  PostgreSQL is ready.")
+                            break
+                else:
+                    typer.echo("  Note: PostgreSQL startup taking longer than expected.")
+                    typer.echo("       Check with: kubectl get pods -n argo -l app=postgres")
+
+                # Restart workflow controller to pick up PostgreSQL configuration
+                typer.echo("  Restarting workflow-controller to connect to PostgreSQL...")
+                run_kubectl(
+                    [
+                        "rollout",
+                        "restart",
+                        "deployment",
+                        "workflow-controller",
+                        "-n",
+                        "argo",
+                    ],
+                    check=False,
+                )
+                typer.echo("  Workflow controller restarted.")
+            else:
+                typer.echo(f"  Warning: Could not create PostgreSQL: {result.stderr}")
+        else:
+            typer.echo(f"  Warning: postgres.yaml not found at {postgres_yaml}")
+
     typer.echo()
     typer.echo(f"Config saved to: {get_config_path()}")
     typer.echo()

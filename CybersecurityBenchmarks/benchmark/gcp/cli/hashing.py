@@ -447,9 +447,7 @@ def check_deps_need_rebuild(bucket: str, build_dir: Path) -> tuple[bool, str, bo
 # =============================================================================
 
 
-def compute_local_patch_hashes(
-    patch_dir: Path, case_ids: list[str]
-) -> dict[str, str]:
+def compute_local_patch_hashes(patch_dir: Path, case_ids: list[str]) -> dict[str, str]:
     """Compute hashes of local patch files for given case IDs.
 
     Returns:

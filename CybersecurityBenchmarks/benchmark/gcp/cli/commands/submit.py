@@ -695,7 +695,9 @@ def submit(
     fuzzing_duration: Annotated[
         Optional[int], typer.Option(help="Fuzzing duration in seconds")
     ] = None,
-    build_version: Annotated[str, typer.Option(help="Build version tag ('auto' = content hash)")] = "auto",
+    build_version: Annotated[
+        str, typer.Option(help="Build version tag ('auto' = content hash)")
+    ] = "auto",
     config_file: Annotated[
         Optional[Path], typer.Option("--config", "-c", help="Config file (JSON)")
     ] = None,
@@ -903,9 +905,7 @@ def submit(
         local_hashes = compute_local_build_assets_hashes(AUTOPATCH_BUILD_DIR)
         gcs_manifest = get_build_assets_manifest_from_gcs(gke_config.bucket_name)
         changed = {
-            name: h
-            for name, h in local_hashes.items()
-            if gcs_manifest.get(name) != h
+            name: h for name, h in local_hashes.items() if gcs_manifest.get(name) != h
         }
         if changed:
             echo_info(f"Syncing {len(changed)} changed build asset(s) to GCS...")
@@ -914,32 +914,46 @@ def submit(
                 local_path = AUTOPATCH_BUILD_DIR / name
                 if local_path.is_dir():
                     subprocess.run(
-                        ["gsutil", "-m", "-q", "rsync", "-r",
-                         str(local_path), f"{bucket_url}/{name}/"],
-                        capture_output=True, text=True,
+                        [
+                            "gsutil",
+                            "-m",
+                            "-q",
+                            "rsync",
+                            "-r",
+                            str(local_path),
+                            f"{bucket_url}/{name}/",
+                        ],
+                        capture_output=True,
+                        text=True,
                     )
                 else:
                     subprocess.run(
-                        ["gsutil", "-q", "cp",
-                         str(local_path), f"{bucket_url}/"],
-                        capture_output=True, text=True,
+                        ["gsutil", "-q", "cp", str(local_path), f"{bucket_url}/"],
+                        capture_output=True,
+                        text=True,
                     )
                 typer.echo(f"  {name}: uploaded")
             # Update manifest in GCS
             import json as _json
             from datetime import datetime as _dt
+
             manifest_data = dict(local_hashes)
             manifest_data["uploaded_at"] = _dt.utcnow().isoformat() + "Z"
             import tempfile as _tf
-            with _tf.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False
-            ) as tmp:
+
+            with _tf.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
                 _json.dump(manifest_data, tmp, indent=2)
                 tmp_path = tmp.name
             subprocess.run(
-                ["gsutil", "-q", "cp", tmp_path,
-                 f"{bucket_url}/build-assets-manifest.json"],
-                capture_output=True, text=True,
+                [
+                    "gsutil",
+                    "-q",
+                    "cp",
+                    tmp_path,
+                    f"{bucket_url}/build-assets-manifest.json",
+                ],
+                capture_output=True,
+                text=True,
             )
             Path(tmp_path).unlink(missing_ok=True)
             echo_success("Build assets synced")
@@ -959,13 +973,10 @@ def submit(
         local_hashes = compute_local_patch_hashes(patch_dir, run_config.cases)
         gcs_manifest = get_patch_manifest_from_gcs(gke_config.bucket_name)
         changed = {
-            name: h
-            for name, h in local_hashes.items()
-            if gcs_manifest.get(name) != h
+            name: h for name, h in local_hashes.items() if gcs_manifest.get(name) != h
         }
         missing = [
-            cid for cid in run_config.cases
-            if f"{cid}-patch.json" not in local_hashes
+            cid for cid in run_config.cases if f"{cid}-patch.json" not in local_hashes
         ]
         for cid in missing:
             typer.echo(f"  Warning: No patch file for case {cid}")
@@ -975,7 +986,9 @@ def submit(
                 local_path = patch_dir / name
                 subprocess.run(
                     [
-                        "gsutil", "-q", "cp",
+                        "gsutil",
+                        "-q",
+                        "cp",
                         str(local_path),
                         f"gs://{gke_config.bucket_name}/patches/{name}",
                     ],
@@ -985,18 +998,24 @@ def submit(
             # Update manifest in GCS
             import json as _json
             from datetime import datetime as _dt
+
             manifest_data = dict(local_hashes)
             manifest_data["uploaded_at"] = _dt.utcnow().isoformat() + "Z"
             import tempfile as _tf
-            with _tf.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False
-            ) as tmp:
+
+            with _tf.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
                 _json.dump(manifest_data, tmp, indent=2)
                 tmp_path = tmp.name
             subprocess.run(
-                ["gsutil", "-q", "cp", tmp_path,
-                 f"gs://{gke_config.bucket_name}/patches/patch-manifest.json"],
-                capture_output=True, text=True,
+                [
+                    "gsutil",
+                    "-q",
+                    "cp",
+                    tmp_path,
+                    f"gs://{gke_config.bucket_name}/patches/patch-manifest.json",
+                ],
+                capture_output=True,
+                text=True,
             )
             Path(tmp_path).unlink(missing_ok=True)
             echo_success(f"Patch files synced ({len(changed)} uploaded)")

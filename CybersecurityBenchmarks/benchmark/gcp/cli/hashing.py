@@ -440,3 +440,42 @@ def check_deps_need_rebuild(bucket: str, build_dir: Path) -> tuple[bool, str, bo
         )
 
     return False, "deps up to date", False
+
+
+# =============================================================================
+# Patch File Hash Functions (gtbackporter)
+# =============================================================================
+
+
+def compute_local_patch_hashes(
+    patch_dir: Path, case_ids: list[str]
+) -> dict[str, str]:
+    """Compute hashes of local patch files for given case IDs.
+
+    Returns:
+        Dict of "{case_id}-patch.json" -> sha256 hash
+    """
+    hashes: dict[str, str] = {}
+    for case_id in case_ids:
+        patch_file = patch_dir / f"{case_id}-patch.json"
+        if patch_file.exists():
+            hashes[f"{case_id}-patch.json"] = compute_file_hash(patch_file)
+    return hashes
+
+
+def get_patch_manifest_from_gcs(bucket: str) -> dict:
+    """Get patch files manifest from GCS.
+
+    Returns:
+        Dict of filename -> hash (as last uploaded), or empty dict.
+    """
+    result = run_gsutil(
+        ["cat", f"gs://{bucket}/patches/patch-manifest.json"],
+        check=False,
+    )
+    if result.returncode == 0:
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            pass
+    return {}

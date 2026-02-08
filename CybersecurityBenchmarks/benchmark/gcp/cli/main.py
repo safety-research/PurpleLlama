@@ -70,8 +70,9 @@ def cmd_submit(
     fuzzing_duration: Optional[int] = typer.Option(
         None, help="Fuzzing duration (seconds)"
     ),
-    run_gt: Optional[bool] = typer.Option(None, "--gt/--no-gt", help="Run ground truth"),
-    build_version: str = typer.Option("auto", help="Build version tag ('auto' = content hash)"),
+    build_version: str = typer.Option(
+        "auto", help="Build version tag ('auto' = content hash)"
+    ),
     config_file: str = typer.Option(None, "--config", "-c", help="Config file"),
     upload_runtime: bool = typer.Option(True, "--upload-runtime/--no-upload-runtime"),
     check_deps: bool = typer.Option(
@@ -92,7 +93,6 @@ def cmd_submit(
         model=model,
         experiment_id=experiment_id,
         fuzzing_duration=fuzzing_duration,
-        run_gt=run_gt,
         build_version=build_version,
         config_file=Path(config_file) if config_file else None,
         upload_runtime=upload_runtime,
@@ -115,6 +115,9 @@ def cmd_status(
         "--active-only",
         help="Hide completed/skipped tasks (watch mode)",
     ),
+    brief: bool = typer.Option(
+        False, "-b", "--brief", help="Brief summary only"
+    ),
 ) -> None:
     """Show workflow status."""
     status.status(
@@ -123,6 +126,7 @@ def cmd_status(
         running=running,
         limit=limit,
         hide_done=hide_done,
+        brief=brief,
     )
 
 

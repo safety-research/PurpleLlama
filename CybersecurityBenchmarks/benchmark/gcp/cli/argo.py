@@ -446,9 +446,7 @@ def _fetch_gcs_archived_logs(
 
         output = cat_result.stdout
         if grep:
-            output = "\n".join(
-                line for line in output.split("\n") if grep in line
-            )
+            output = "\n".join(line for line in output.split("\n") if grep in line)
 
         if output.strip():
             print(output)
@@ -506,8 +504,14 @@ def get_workflow_logs(
     # Check if archiveLogs is configured in the cluster
     cm = subprocess.run(
         [
-            "kubectl", "get", "configmap", "workflow-controller-configmap",
-            "-n", "argo", "-o", "jsonpath={.data.artifactRepository}",
+            "kubectl",
+            "get",
+            "configmap",
+            "workflow-controller-configmap",
+            "-n",
+            "argo",
+            "-o",
+            "jsonpath={.data.artifactRepository}",
         ],
         capture_output=True,
         text=True,
@@ -519,9 +523,7 @@ def get_workflow_logs(
         typer.echo(
             "Warning: archiveLogs is NOT configured in the workflow-controller-configmap."
         )
-        typer.echo(
-            "Logs are not being archived to GCS. Re-run setup to fix:"
-        )
+        typer.echo("Logs are not being archived to GCS. Re-run setup to fix:")
         typer.echo("  python -m cli setup --skip-cluster")
         typer.echo()
 
@@ -529,17 +531,11 @@ def get_workflow_logs(
 
     if not found:
         typer.echo(f"No archived logs found in GCS for workflow '{name}'.")
-        typer.echo(
-            f"Checked: gs://{config.bucket_name}/argo-logs/.../{name}/..."
-        )
+        typer.echo(f"Checked: gs://{config.bucket_name}/argo-logs/.../{name}/...")
         if "archiveLogs" not in artifact_repo_config:
             typer.echo()
-            typer.echo(
-                "This is expected — archiveLogs is not configured."
-            )
-            typer.echo(
-                "Fix with: python -m cli setup --skip-cluster"
-            )
+            typer.echo("This is expected — archiveLogs is not configured.")
+            typer.echo("Fix with: python -m cli setup --skip-cluster")
 
 
 def cancel_workflow(name: str, namespace: str = "argo") -> bool:

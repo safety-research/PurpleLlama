@@ -5,6 +5,33 @@ This agent applies a known ground-truth fix to an older version of a codebase.
 It does NOT analyze crashes or discover fixes -- it only backports a given diff.
 """
 
+import os
+
+
+def _resolve_file_under_src(relative_path: str, src_root: str = "/src") -> str:
+    """Find the actual path of a file under /src/.
+
+    Patch metadata filenames are relative to the project root, which may
+    be nested one level under /src/ (e.g., /src/php-src/ext/posix/posix.c).
+    Try the direct path first, then search one level deep.
+    """
+    # Direct path: /src/{filename}
+    direct = os.path.join(src_root, relative_path)
+    if os.path.exists(direct):
+        return direct
+
+    # Search one level deep: /src/{subdir}/{filename}
+    try:
+        for entry in os.listdir(src_root):
+            candidate = os.path.join(src_root, entry, relative_path)
+            if os.path.exists(candidate):
+                return candidate
+    except OSError:
+        pass
+
+    # Fallback: return direct path and let the agent figure it out
+    return direct
+
 GT_BACKPORTER_SYSTEM_PROMPT = """You are a code patching tool. Your task is to apply a known fix to an older version of a codebase, then build it.
 
 You will receive a diff from a later version. The line numbers and surrounding code may differ because this is an older version. Read the code to understand context, find the right location, and apply the change in a way that makes sense for the current codebase.
@@ -39,7 +66,8 @@ def build_backporter_prompt(patch_data: list[dict]) -> str:
         filename = hunk.get("filename", "unknown")
         patch = hunk.get("patch", "")
 
-        parts.append(f"File: /src/{filename}")
+        resolved = _resolve_file_under_src(filename)
+        parts.append(f"File: {resolved}")
         parts.append(f"```diff\n{patch}\n```\n")
 
     parts.append(

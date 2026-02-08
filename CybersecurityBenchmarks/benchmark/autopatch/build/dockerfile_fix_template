@@ -9,13 +9,13 @@ COPY ./differential-debugging-deps-20.04.deb /tmp/differential-debugging-deps-20
 
 RUN OSVER=$(cat /etc/os-release |grep VERSION_ID | cut -c13-17) && \
     case "$OSVER" in \
-        "16.04") ln -s /tmp/differential-debugging-deps-16.04.deb /tmp/differential-debugging-deps.deb ;; \
-        "20.04") ln -s /tmp/differential-debugging-deps-20.04.deb /tmp/differential-debugging-deps.deb && \
-                 apt update && \
-                 apt install -y --no-install-recommends libssl-dev \
-                 libexpat1-dev \
-                 libfreetype-dev  ;; \
-        *) echo "Unknown OS VERSION: $OSVER" ;; \
+    "16.04") ln -s /tmp/differential-debugging-deps-16.04.deb /tmp/differential-debugging-deps.deb ;; \
+    "20.04") ln -s /tmp/differential-debugging-deps-20.04.deb /tmp/differential-debugging-deps.deb && \
+    apt update && \
+    apt install -y --no-install-recommends libssl-dev \
+    libexpat1-dev \
+    libfreetype-dev  ;; \
+    *) echo "Unknown OS VERSION: $OSVER" ;; \
     esac
 
 RUN apt -f -y install /tmp/differential-debugging-deps.deb && echo '/usr/local/lib' > /etc/ld.so.conf.d/local.conf && ldconfig
@@ -45,11 +45,11 @@ RUN mkdir -p /usr/local/casr && \
     rm /tmp/casr.tar.gz && \
     # Patch each CASR binary to use the new glibc via RPATH and dynamic linker
     for tool in /usr/local/casr/bin/casr-*; do \
-        # Set RPATH to find new glibc libraries
-        patchelf --set-rpath /opt/glibc-new/lib/x86_64-linux-gnu "$tool" && \
-        # Set interpreter to use new dynamic linker
-        patchelf --set-interpreter /opt/glibc-new/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 "$tool" && \
-        echo "Patched $(basename $tool)"; \
+    # Set RPATH to find new glibc libraries
+    patchelf --set-rpath /opt/glibc-new/lib/x86_64-linux-gnu "$tool" && \
+    # Set interpreter to use new dynamic linker
+    patchelf --set-interpreter /opt/glibc-new/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 "$tool" && \
+    echo "Patched $(basename $tool)"; \
     done && \
     # Create symlinks in /usr/bin for convenience
     ln -sf /usr/local/casr/bin/casr-afl /usr/bin/casr-afl && \
@@ -95,33 +95,33 @@ RUN cd /src/libfuzzer && \
     if [ "$PROJECT_ARCH" = "i386" ]; then FUZZER_ARCH="i386"; else FUZZER_ARCH="x86_64"; fi && \
     echo "Detected project architecture: $PROJECT_ARCH -> target: $FUZZER_ARCH" && \
     if grep -q 'fsanitize=fuzzer' /usr/local/bin/compile_libfuzzer 2>/dev/null; then \
-        COMPILE_TYPE="NEW"; \
-        echo "compile_libfuzzer type: NEW (uses -fsanitize=fuzzer, library replacement REQUIRED)"; \
+    COMPILE_TYPE="NEW"; \
+    echo "compile_libfuzzer type: NEW (uses -fsanitize=fuzzer, library replacement REQUIRED)"; \
     else \
-        COMPILE_TYPE="OLD"; \
-        echo "compile_libfuzzer type: OLD (compiles from /src/libfuzzer/, source method works)"; \
+    COMPILE_TYPE="OLD"; \
+    echo "compile_libfuzzer type: OLD (compiles from /src/libfuzzer/, source method works)"; \
     fi && \
     FUZZER_LIB=$(find /usr/local/lib/clang -name "libclang_rt.fuzzer-${FUZZER_ARCH}.a" 2>/dev/null | head -1) && \
     if [ -n "$FUZZER_LIB" ]; then CLANG_LIB_DIR=$(dirname "$FUZZER_LIB"); else CLANG_LIB_DIR=""; fi && \
     if [ -n "$CLANG_LIB_DIR" ]; then \
-        echo "=== Building and replacing system libfuzzer ===" && \
-        ARCH=$FUZZER_ARCH ./build.sh && \
-        echo "Replacing system libfuzzer at: $CLANG_LIB_DIR (arch: $FUZZER_ARCH)" && \
-        cp libFuzzer.a "$CLANG_LIB_DIR/libclang_rt.fuzzer-${FUZZER_ARCH}.a" && \
-        cp libFuzzer_no_main.a "$CLANG_LIB_DIR/libclang_rt.fuzzer_no_main-${FUZZER_ARCH}.a" && \
-        echo "LIBRARY method: system libfuzzer replaced successfully"; \
+    echo "=== Building and replacing system libfuzzer ===" && \
+    ARCH=$FUZZER_ARCH ./build.sh && \
+    echo "Replacing system libfuzzer at: $CLANG_LIB_DIR (arch: $FUZZER_ARCH)" && \
+    cp libFuzzer.a "$CLANG_LIB_DIR/libclang_rt.fuzzer-${FUZZER_ARCH}.a" && \
+    cp libFuzzer_no_main.a "$CLANG_LIB_DIR/libclang_rt.fuzzer_no_main-${FUZZER_ARCH}.a" && \
+    echo "LIBRARY method: system libfuzzer replaced successfully"; \
     else \
-        echo "=== No system libfuzzer found (clang $(/usr/local/bin/clang --version 2>/dev/null | head -1 || echo 'unknown')) ===" && \
-        if [ "$COMPILE_TYPE" = "NEW" ]; then \
-            echo "WARNING: NEW compile_libfuzzer but no system library to replace!"; \
-            echo "Custom crash logging may not work for this case."; \
-        fi && \
-        echo "SOURCE method: using /src/libfuzzer/ (already installed)"; \
+    echo "=== No system libfuzzer found (clang $(/usr/local/bin/clang --version 2>/dev/null | head -1 || echo 'unknown')) ===" && \
+    if [ "$COMPILE_TYPE" = "NEW" ]; then \
+    echo "WARNING: NEW compile_libfuzzer but no system library to replace!"; \
+    echo "Custom crash logging may not work for this case."; \
+    fi && \
+    echo "SOURCE method: using /src/libfuzzer/ (already installed)"; \
     fi && \
     if [ -f /usr/lib/libFuzzingEngine.a ]; then \
-        echo "Also replacing /usr/lib/libFuzzingEngine.a" && \
-        ARCH=$FUZZER_ARCH ./build.sh 2>/dev/null || true && \
-        cp libFuzzer.a /usr/lib/libFuzzingEngine.a 2>/dev/null || true; \
+    echo "Also replacing /usr/lib/libFuzzingEngine.a" && \
+    ARCH=$FUZZER_ARCH ./build.sh 2>/dev/null || true && \
+    cp libFuzzer.a /usr/lib/libFuzzingEngine.a 2>/dev/null || true; \
     fi && \
     echo "Modified libFuzzer installed (source at /src/libfuzzer/)"
 

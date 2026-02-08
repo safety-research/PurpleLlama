@@ -6,6 +6,8 @@ from typing import Annotated, Optional
 
 import typer
 
+import subprocess
+
 from ..argo import (
     get_current_user,
     get_workflow_status,
@@ -42,6 +44,14 @@ def status(
             help="Hide completed/skipped tasks (watch mode)",
         ),
     ] = False,
+    brief: Annotated[
+        bool,
+        typer.Option(
+            "--brief",
+            "-b",
+            help="Show only header summary (phase, progress, timestamps)",
+        ),
+    ] = False,
 ) -> None:
     """Show workflow status.
 
@@ -50,7 +60,8 @@ def status(
         python -m cli status --mine             # List only your workflows
         python -m cli status --owner camyang    # Filter by owner
         python -m cli status --running --mine   # Your running workflows
-        python -m cli status arvo-benchmark-xyz # Specific workflow status
+        python -m cli status arvo-benchmark-xyz # Specific workflow (full node tree)
+        python -m cli status arvo-benchmark-xyz -b  # Brief summary only
         python -m cli status <wf> -w --hide-done  # Watch, hiding completed tasks
     """
     if workflow_name:
@@ -62,24 +73,30 @@ def status(
             watch_workflow(workflow_name, hide_done=hide_done)
             return
 
-        wf_status = get_workflow_status(workflow_name)
-        if not wf_status:
-            typer.echo(f"Workflow not found: {workflow_name}")
-            raise typer.Exit(1)
+        if brief:
+            wf_status = get_workflow_status(workflow_name)
+            if not wf_status:
+                typer.echo(f"Workflow not found: {workflow_name}")
+                raise typer.Exit(1)
 
-        typer.echo("=" * 50)
-        typer.echo(f"Workflow: {wf_status.name}")
-        typer.echo("=" * 50)
-        typer.echo(f"Phase:    {wf_status.phase}")
-        typer.echo(f"Progress: {wf_status.progress}")
-        if wf_status.owner:
-            typer.echo(f"Owner:    {wf_status.owner}")
-        if wf_status.started_at:
-            typer.echo(f"Started:  {wf_status.started_at}")
-        if wf_status.finished_at:
-            typer.echo(f"Finished: {wf_status.finished_at}")
-        if wf_status.message:
-            typer.echo(f"Message:  {wf_status.message}")
+            typer.echo("=" * 50)
+            typer.echo(f"Workflow: {wf_status.name}")
+            typer.echo("=" * 50)
+            typer.echo(f"Phase:    {wf_status.phase}")
+            typer.echo(f"Progress: {wf_status.progress}")
+            if wf_status.owner:
+                typer.echo(f"Owner:    {wf_status.owner}")
+            if wf_status.started_at:
+                typer.echo(f"Started:  {wf_status.started_at}")
+            if wf_status.finished_at:
+                typer.echo(f"Finished: {wf_status.finished_at}")
+            if wf_status.message:
+                typer.echo(f"Message:  {wf_status.message}")
+            return
+
+        # argo get (without -o json) prints the full node tree — same
+        # content as "argo watch" but exits immediately.
+        subprocess.run(["argo", "get", workflow_name, "-n", "argo"])
 
     else:
         # Build label selector

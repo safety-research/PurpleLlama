@@ -185,6 +185,8 @@ spec:
             value: "/agent-runtime"
           - name: AGENT_CONFIG
             value: "{{inputs.parameters.agent-config}}"
+          - name: BUCKET
+            value: "{{inputs.parameters.bucket}}"
         volumeMounts:
           - name: agent-runtime
             mountPath: /agent-runtime

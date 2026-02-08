@@ -145,7 +145,6 @@ python -m cli ui                 # Open Argo UI
   "model": "claude-sonnet-4-20250514",
   "experiment_id": "exp-001",
   "fuzzing_duration": 300,
-  "run_gt": true,
   "build_version": "latest"
 }
 ```

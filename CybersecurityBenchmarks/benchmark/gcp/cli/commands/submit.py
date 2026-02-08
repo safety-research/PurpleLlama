@@ -27,8 +27,10 @@ from ..hashing import (
     compute_deps_source_hash,
     compute_image_build_version,
     compute_local_build_assets_hashes,
+    compute_local_patch_hashes,
     get_build_assets_manifest_from_gcs,
     get_deps_manifest_from_gcs,
+    get_patch_manifest_from_gcs,
     run_gsutil,
 )
 from ..output import echo_error, echo_info, echo_success, echo_warning
@@ -693,9 +695,6 @@ def submit(
     fuzzing_duration: Annotated[
         Optional[int], typer.Option(help="Fuzzing duration in seconds")
     ] = None,
-    run_gt: Annotated[
-        Optional[bool], typer.Option("--gt/--no-gt", help="Run ground truth fuzzing")
-    ] = None,
     build_version: Annotated[str, typer.Option(help="Build version tag ('auto' = content hash)")] = "auto",
     config_file: Annotated[
         Optional[Path], typer.Option("--config", "-c", help="Config file (JSON)")
@@ -731,6 +730,7 @@ def submit(
 
     # Load run config
     run_config = RunConfig()
+    run_gt = False
 
     if config_file:
         with open(config_file) as f:
@@ -743,10 +743,7 @@ def submit(
         if "agents" in data:
             # Parse structured agent specs
             try:
-                run_config.agents, config_run_gt = parse_agent_specs(data["agents"])
-                # Only override run_gt from config if "gt" was explicitly in agents list
-                if config_run_gt:
-                    run_config.run_gt = True
+                run_config.agents, run_gt = parse_agent_specs(data["agents"])
             except ValueError as e:
                 echo_error(f"Invalid agent spec in config: {e}")
                 raise typer.Exit(1)
@@ -754,8 +751,6 @@ def submit(
             run_config.experiment_id = data["experiment_id"]
         if "fuzzing_duration" in data:
             run_config.fuzzing_duration = data["fuzzing_duration"]
-        if "run_gt" in data:
-            run_config.run_gt = data["run_gt"]
         if "build_version" in data:
             run_config.build_version = data["build_version"]
         if "patch_use_spot" in data:
@@ -779,8 +774,6 @@ def submit(
         run_config.experiment_id = experiment_id
     if fuzzing_duration is not None:
         run_config.fuzzing_duration = fuzzing_duration
-    if run_gt is not None:
-        run_config.run_gt = run_gt
     if build_version:
         run_config.build_version = build_version
 
@@ -825,7 +818,7 @@ def submit(
     for spec in run_config.agents:
         typer.echo(f"             - {spec.id} ({spec.agent_type}, {spec.model})")
     typer.echo(f"Fuzz Time:   {run_config.fuzzing_duration}s")
-    typer.echo(f"Run GT:      {run_config.run_gt}")
+    typer.echo(f"Run GT:      {run_gt}")
     typer.echo(f"Build Ver:   {run_config.build_version}")
     typer.echo()
 
@@ -959,36 +952,63 @@ def submit(
         spec.agent_type == "gtbackporter" for spec in run_config.agents
     )
     if has_backporter and not dry_run:
-        typer.echo("Uploading patch files for gtbackporter agents...")
+        typer.echo("Checking patch files for gtbackporter agents...")
         patch_dir = (
             get_script_dir().parent.parent / "datasets" / "autopatch" / "arvo_meta"
         )
-        uploaded = 0
-        for case_id in run_config.cases:
-            patch_file = patch_dir / f"{case_id}-patch.json"
-            if patch_file.exists():
-                result = subprocess.run(
+        local_hashes = compute_local_patch_hashes(patch_dir, run_config.cases)
+        gcs_manifest = get_patch_manifest_from_gcs(gke_config.bucket_name)
+        changed = {
+            name: h
+            for name, h in local_hashes.items()
+            if gcs_manifest.get(name) != h
+        }
+        missing = [
+            cid for cid in run_config.cases
+            if f"{cid}-patch.json" not in local_hashes
+        ]
+        for cid in missing:
+            typer.echo(f"  Warning: No patch file for case {cid}")
+        if changed:
+            echo_info(f"Syncing {len(changed)} changed patch file(s) to GCS...")
+            for name in changed:
+                local_path = patch_dir / name
+                subprocess.run(
                     [
-                        "gsutil",
-                        "cp",
-                        str(patch_file),
-                        f"gs://{gke_config.bucket_name}/patches/{case_id}-patch.json",
+                        "gsutil", "-q", "cp",
+                        str(local_path),
+                        f"gs://{gke_config.bucket_name}/patches/{name}",
                     ],
                     capture_output=True,
                     text=True,
                 )
-                if result.returncode == 0:
-                    uploaded += 1
-            else:
-                typer.echo(f"  Warning: No patch file for case {case_id}")
-        typer.echo(f"  Uploaded {uploaded}/{len(run_config.cases)} patch files.")
+            # Update manifest in GCS
+            import json as _json
+            from datetime import datetime as _dt
+            manifest_data = dict(local_hashes)
+            manifest_data["uploaded_at"] = _dt.utcnow().isoformat() + "Z"
+            import tempfile as _tf
+            with _tf.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False
+            ) as tmp:
+                _json.dump(manifest_data, tmp, indent=2)
+                tmp_path = tmp.name
+            subprocess.run(
+                ["gsutil", "-q", "cp", tmp_path,
+                 f"gs://{gke_config.bucket_name}/patches/patch-manifest.json"],
+                capture_output=True, text=True,
+            )
+            Path(tmp_path).unlink(missing_ok=True)
+            echo_success(f"Patch files synced ({len(changed)} uploaded)")
+        else:
+            echo_success("Patch files up to date")
         typer.echo()
 
     # Generate workflow YAML with case-pipeline template (withParam over cases)
     # Agent tasks are statically expanded in the template; cases are passed via parameter
     base_workflow_path = get_script_dir() / "argo" / "workflows" / "arvo-benchmark.yaml"
     tasks_per_case = 4 + len(run_config.agents) * 4  # build checks + agent tasks
-    if run_config.run_gt:
+    if run_gt:
         tasks_per_case += 2  # GT tasks
     total_tasks = len(run_config.cases) * tasks_per_case
     typer.echo("Generating workflow (withParam over cases)...")
@@ -999,7 +1019,7 @@ def submit(
     workflow_yaml = _generate_workflow_yaml(
         base_workflow_path,
         run_config.agents,
-        run_gt=run_config.run_gt,
+        run_gt=run_gt,
     )
     typer.echo()
 
@@ -1047,7 +1067,7 @@ def submit(
             id_safe = _sanitize_name(spec.id)
             typer.echo(f"    - chk-patch-{id_safe} -> patch-{id_safe}")
             typer.echo(f"    - chk-fuzz-{id_safe} -> fuzz-{id_safe}")
-        if run_config.run_gt:
+        if run_gt:
             typer.echo("    - chk-gt -> fuzz-gt")
         if build_casr or build_dd:
             typer.echo()

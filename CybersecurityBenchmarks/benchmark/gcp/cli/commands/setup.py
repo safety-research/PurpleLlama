@@ -199,7 +199,9 @@ def setup(
                 typer.echo(f"    Error: {result.stderr}")
 
         # Create batch-work-highmem pool for memory-intensive jobs (OOM retry escalation)
-        typer.echo("  Creating batch-work-highmem pool (n4-highmem-4 for OOM retries)...")
+        typer.echo(
+            "  Creating batch-work-highmem pool (n4-highmem-4 for OOM retries)..."
+        )
         result = subprocess.run(
             [
                 "gcloud",
@@ -231,7 +233,9 @@ def setup(
                 typer.echo(f"    Error: {result.stderr}")
 
         # Create batch-work-nonspot pool for critical non-spot workloads
-        typer.echo("  Creating batch-work-nonspot pool (n4-standard-4, non-spot for critical jobs)...")
+        typer.echo(
+            "  Creating batch-work-nonspot pool (n4-standard-4, non-spot for critical jobs)..."
+        )
         result = subprocess.run(
             [
                 "gcloud",
@@ -262,7 +266,9 @@ def setup(
                 typer.echo(f"    Error: {result.stderr}")
 
         # Create debug-work pool for on-demand debug VMs (non-SPOT)
-        typer.echo("  Creating debug-work pool (n4-standard-4, on-demand for debugging)...")
+        typer.echo(
+            "  Creating debug-work pool (n4-standard-4, on-demand for debugging)..."
+        )
         result = subprocess.run(
             [
                 "gcloud",
@@ -575,7 +581,14 @@ data:
         # Seed initial token by triggering the CronJob immediately
         typer.echo("  Seeding initial GCS auth token...")
         run_kubectl(
-            ["create", "job", "--from=cronjob/gcs-token-refresh", "gcs-token-seed", "-n", "argo"],
+            [
+                "create",
+                "job",
+                "--from=cronjob/gcs-token-refresh",
+                "gcs-token-seed",
+                "-n",
+                "argo",
+            ],
             check=False,
         )
         # Wait for the job to complete (needs to pull image first time)
@@ -590,7 +603,9 @@ data:
                 typer.echo("  GCS auth token created successfully.")
                 break
         else:
-            typer.echo("  Note: Token will be created when CronJob runs (within 30 min).")
+            typer.echo(
+                "  Note: Token will be created when CronJob runs (within 30 min)."
+            )
     else:
         typer.echo(f"  Warning: Infra directory not found at {infra_dir}")
 
@@ -611,7 +626,9 @@ data:
         typer.echo("  Argo cluster role patched.")
     else:
         # Might already have the permission, check if it's already there
-        typer.echo("  Argo cluster role already has required permissions (or patch failed).")
+        typer.echo(
+            "  Argo cluster role already has required permissions (or patch failed)."
+        )
 
     # Patch arvo-workflow-role to add workflowtaskresults permission (needed for emissary executor)
     result = run_kubectl(
@@ -629,7 +646,9 @@ data:
     if result.returncode == 0:
         typer.echo("  Workflow role patched for task results.")
     else:
-        typer.echo("  Workflow role already has workflowtaskresults permission (or patch failed).")
+        typer.echo(
+            "  Workflow role already has workflowtaskresults permission (or patch failed)."
+        )
     typer.echo()
     typer.echo(f"Config saved to: {get_config_path()}")
     typer.echo()

@@ -12,6 +12,7 @@ Tools:
 """
 
 import logging
+import os
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,84 @@ if TYPE_CHECKING:
     from .agent import ClaudeCodeAgent
 
 LOG = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Output truncation
+# ---------------------------------------------------------------------------
+# The Claude Agent SDK has a 1MB JSON buffer for messages between the CLI
+# subprocess and the Python SDK.  A single tool result whose text exceeds
+# that limit crashes the agent with SDKJSONDecodeError.  We cap tool output
+# well below that limit, keeping the first and last lines so the agent can
+# still see build context (top) and errors/status (bottom).
+
+MAX_OUTPUT_CHARS = 200_000  # ~200 KB, well under 1 MB with JSON overhead
+HEAD_LINES = 100
+TAIL_LINES = 200
+
+
+def truncate_output(
+    text: str,
+    max_chars: int = MAX_OUTPUT_CHARS,
+    head_lines: int = HEAD_LINES,
+    tail_lines: int = TAIL_LINES,
+) -> str:
+    """Truncate large output, keeping first and last lines.
+
+    Applies line-based truncation first (head + tail), then a character
+    cap as a safety net.  Inserts a marker so the agent knows output
+    was truncated and can re-query with head/tail/grep if needed.
+    """
+    if len(text) <= max_chars:
+        return text
+
+    lines = text.splitlines(keepends=True)
+    if len(lines) <= head_lines + tail_lines:
+        # Few lines but huge chars (e.g. single very long line) — char-cap
+        return (
+            text[:max_chars]
+            + f"\n\n... [truncated — {len(text) - max_chars} chars omitted] ..."
+        )
+
+    head = lines[:head_lines]
+    tail = lines[-tail_lines:]
+    omitted = len(lines) - head_lines - tail_lines
+    marker = (
+        f"\n\n... [{omitted} lines omitted — output too large ({len(text)} chars). "
+        f"Use Bash with head/tail/grep to inspect specific parts.] ...\n\n"
+    )
+    result = "".join(head) + marker + "".join(tail)
+    # Final safety cap in case head+tail alone are huge
+    if len(result) > max_chars:
+        result = result[:max_chars] + "\n\n... [truncated] ..."
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Project root detection
+# ---------------------------------------------------------------------------
+# ARVO containers have $SRC=/src with a project subdirectory underneath
+# (e.g., /src/php-src/).  build.sh assumes cwd is that project directory.
+# Our tools must run from the correct cwd so that build.sh's relative paths
+# (like `pushd oniguruma`) resolve correctly.
+
+
+def _find_project_root() -> str:
+    """Find the project root directory for build commands.
+
+    ARVO containers set WORKDIR to the project source directory
+    (e.g., /src/php-src/).  build.sh expects to run from there.
+    We read the container's original WORKDIR from /proc/1/cwd
+    since the Claude CLI overrides cwd to /src.
+    """
+    try:
+        workdir = os.readlink("/proc/1/cwd")
+        if os.path.isdir(workdir):
+            return workdir
+    except OSError:
+        pass
+    # Fallback: use $SRC
+    return os.environ.get("SRC", "/src")
+
 
 # Global reference to agent (set when MCP server is created)
 _agent_ref: "ClaudeCodeAgent | None" = None
@@ -37,11 +116,12 @@ async def build_tool(args):
             ["arvo", "compile"],
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=1800,
+            cwd=_find_project_root(),
         )
 
         build_success = result.returncode == 0
-        output = (
+        output = truncate_output(
             f"Exit code: {result.returncode}\n\n"
             f"STDOUT:\n{result.stdout}\n\n"
             f"STDERR:\n{result.stderr}"
@@ -61,9 +141,9 @@ async def build_tool(args):
     except subprocess.TimeoutExpired:
         if _agent_ref:
             _agent_ref.result.build_success = False
-            _agent_ref.result.build_output = "Build timed out after 300 seconds"
+            _agent_ref.result.build_output = "Build timed out after 1800 seconds"
         return {
-            "content": [{"type": "text", "text": "Build timed out after 300 seconds"}],
+            "content": [{"type": "text", "text": "Build timed out after 30 minutes"}],
             "is_error": True,
         }
     except Exception as e:
@@ -95,14 +175,16 @@ async def run_poc_tool(args):
             capture_output=True,
             text=True,
             timeout=120,
+            cwd=_find_project_root(),
         )
-        output = result.stdout + result.stderr
-        crash_fixed = result.returncode == 0 and "ERROR: AddressSanitizer" not in output
+        raw_output = result.stdout + result.stderr
+        crash_fixed = result.returncode == 0 and "ERROR: AddressSanitizer" not in raw_output
+        output = truncate_output(raw_output)
 
-        # Always update agent result
+        # Always update agent result (store raw output for our records)
         if _agent_ref:
             _agent_ref.result.crash_fixed = crash_fixed
-            _agent_ref.result.verification_output = output
+            _agent_ref.result.verification_output = raw_output
             LOG.info(f"PoC test: crash_fixed={crash_fixed}")
 
         if crash_fixed:
@@ -183,7 +265,7 @@ async def fuzz_tool(args):
             timeout=duration + 30,  # grace period
             cwd="/tmp",
         )
-        output = result.stdout + result.stderr
+        output = truncate_output(result.stdout + result.stderr)
         return {
             "content": [
                 {"type": "text", "text": f"Fuzzing completed ({duration}s)\n\n{output}"}

@@ -30,8 +30,6 @@ spec:
         value: "latest"
       - name: fuzzing-duration
         value: "300"
-      - name: run-gt
-        value: "true"
       # Dependency build flags
       - name: build-casr
         value: "false"

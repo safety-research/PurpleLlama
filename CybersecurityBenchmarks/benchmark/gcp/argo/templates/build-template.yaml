@@ -48,7 +48,7 @@ spec:
           - "--frontend=dockerfile.v0"
           - "--local=context=/workspace"
           - "--local=dockerfile=/workspace"
-          - "--output=type=image,\"name={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{inputs.parameters.build-version}},{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:latest\",push=true"
+          - '--output=type=image,"name={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{inputs.parameters.build-version}},{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:latest",push=true'
           - "--export-cache=type=registry,ref={{inputs.parameters.registry}}/buildkit-cache:vul,mode=max"
           - "--import-cache=type=registry,ref={{inputs.parameters.registry}}/buildkit-cache:vul"
         volumeMounts:
@@ -173,7 +173,7 @@ spec:
           - "--frontend=dockerfile.v0"
           - "--local=context=/workspace"
           - "--local=dockerfile=/workspace"
-          - "--output=type=image,\"name={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{inputs.parameters.build-version}},{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:latest\",push=true"
+          - '--output=type=image,"name={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{inputs.parameters.build-version}},{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:latest",push=true'
           - "--export-cache=type=registry,ref={{inputs.parameters.registry}}/buildkit-cache:fix,mode=max"
           - "--import-cache=type=registry,ref={{inputs.parameters.registry}}/buildkit-cache:fix"
         volumeMounts:

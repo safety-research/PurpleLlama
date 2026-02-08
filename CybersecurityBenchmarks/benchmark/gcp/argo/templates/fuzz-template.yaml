@@ -117,12 +117,9 @@ spec:
                 chmod +x /binary/rebuilt_binary
 
                 # Download original (pre-patch) binary for regression analysis
-                gsutil cp gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/${AGENT_ID}/original_binary /binary/original_binary || {
-                  echo "ERROR: Could not download original_binary for regression analysis"
-                  echo "Run the backfill-original-binary workflow or re-run patch step"
-                  exit 1
-                }
-                chmod +x /binary/original_binary
+                # Stored per-case (not per-agent) since it's the same vul binary for all agents
+                gsutil cp gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/original_binary /binary/original_binary 2>/dev/null || true
+                [ -f /binary/original_binary ] && chmod +x /binary/original_binary || true
               fi
           volumeMounts:
             - name: binary

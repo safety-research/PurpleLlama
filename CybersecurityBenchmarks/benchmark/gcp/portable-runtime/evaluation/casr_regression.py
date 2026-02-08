@@ -209,14 +209,16 @@ def analyze_regressions(
         timeout_per_crash: Timeout for each replay (seconds)
 
     Returns:
-        RegressionAnalysis result, or None if casr-compare is not available
+        RegressionAnalysis result, or None on error
+
+    Raises:
+        RuntimeError: If casr-compare binary is not found
     """
     if not _is_casr_compare_available():
-        LOG.warning(
-            "casr-compare not available, skipping regression analysis. "
-            "Build it from benchmark/autopatch/build/casr/"
+        raise RuntimeError(
+            "casr-compare binary not found on PATH. "
+            "Rebuild images with updated CASR (includes casr-compare symlink)."
         )
-        return None
 
     if not timeline.crashes:
         LOG.info("No crashes to analyze for regressions")

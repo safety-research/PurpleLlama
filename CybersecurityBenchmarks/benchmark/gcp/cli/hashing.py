@@ -150,6 +150,62 @@ def compute_build_version(build_dir: Path) -> tuple[str, dict]:
     return version_hash, asset_hashes
 
 
+def compute_image_build_version(build_dir: Path) -> tuple[str, dict]:
+    """Compute image build version from all inputs that affect Docker images.
+
+    Unlike compute_build_version() which hashes built artifacts (tarballs, debs),
+    this hashes SOURCE inputs so that changing CASR/DD source immediately
+    invalidates the build version even before artifacts are rebuilt.
+
+    Returns:
+        Tuple of (version_hash, input_hashes_dict)
+        version_hash is first 8 chars of combined hash
+    """
+    input_hashes: dict[str, str] = {}
+
+    # Hash Dockerfile templates
+    for template_name in [
+        "dockerfile_vul_template",
+        "dockerfile_fix_template",
+        "dockerfile_fuzzing_template",
+    ]:
+        template_file = build_dir / template_name
+        if template_file.exists():
+            input_hashes[template_name] = compute_file_hash(template_file)
+
+    # Hash libfuzzer-modern directory
+    libfuzzer_dir = build_dir / "libfuzzer-modern"
+    if libfuzzer_dir.exists():
+        input_hashes["libfuzzer-modern"] = compute_directory_hash(libfuzzer_dir)
+
+    # Hash CASR and DD SOURCE (not built artifacts)
+    # This ensures changing source invalidates images before deps are rebuilt
+    casr_hash, dd_hash = compute_deps_source_hash(build_dir)
+    if casr_hash:
+        input_hashes["casr-source"] = casr_hash
+    if dd_hash:
+        input_hashes["dd-source"] = dd_hash
+
+    # Hash casr_cluster.py
+    casr_cluster_py = build_dir / "casr_cluster.py"
+    if casr_cluster_py.exists():
+        input_hashes["casr_cluster.py"] = compute_file_hash(casr_cluster_py)
+
+    # Hash glibc deb (rarely changes, but include for correctness)
+    glibc_deb = build_dir / "libc6_2.35-0ubuntu3_amd64.deb"
+    if glibc_deb.exists():
+        input_hashes["libc6_2.35-0ubuntu3_amd64.deb"] = compute_file_hash(glibc_deb)
+
+    # Compute combined hash
+    combined = hashlib.sha256()
+    for key in sorted(input_hashes.keys()):
+        combined.update(key.encode())
+        combined.update(input_hashes[key].encode())
+
+    version_hash = combined.hexdigest()[:8]
+    return version_hash, input_hashes
+
+
 def get_build_version_from_gcs(bucket: str) -> Optional[str]:
     """Get current build version from GCS manifest."""
     result = run_gsutil(

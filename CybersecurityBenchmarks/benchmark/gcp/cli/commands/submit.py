@@ -25,6 +25,7 @@ from ..hashing import (
     AUTOPATCH_BUILD_DIR,
     check_runtime_needs_rebuild,
     compute_deps_source_hash,
+    compute_image_build_version,
     get_deps_manifest_from_gcs,
 )
 from ..output import echo_error, echo_info, echo_success, echo_warning
@@ -692,7 +693,7 @@ def submit(
     run_gt: Annotated[
         bool, typer.Option("--gt/--no-gt", help="Run ground truth fuzzing")
     ] = True,
-    build_version: Annotated[str, typer.Option(help="Build version tag")] = "latest",
+    build_version: Annotated[str, typer.Option(help="Build version tag ('auto' = content hash)")] = "auto",
     config_file: Annotated[
         Optional[Path], typer.Option("--config", "-c", help="Config file (JSON)")
     ] = None,
@@ -796,6 +797,17 @@ def submit(
     if not run_config.cases:
         typer.echo("Error: No cases specified. Use --cases or --config.")
         raise typer.Exit(1)
+
+    # Auto-compute build version from content hash of all image inputs
+    if run_config.build_version == "auto":
+        typer.echo("Computing build version from image inputs...")
+        version_hash, input_hashes = compute_image_build_version(AUTOPATCH_BUILD_DIR)
+        run_config.build_version = version_hash
+        typer.echo(f"  Build version: {version_hash}")
+        if dry_run:
+            for name, h in sorted(input_hashes.items()):
+                typer.echo(f"    {name}: {h[:12]}...")
+        typer.echo()
 
     owner = get_current_user()
 

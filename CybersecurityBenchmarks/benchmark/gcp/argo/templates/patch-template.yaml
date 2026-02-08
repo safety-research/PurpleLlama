@@ -78,7 +78,7 @@ spec:
               none: {}
             gcs:
               bucket: "{{inputs.parameters.bucket}}"
-              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/original_binary"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/original_binary"
           - name: success-marker
             path: /output/_SUCCESS
             optional: true

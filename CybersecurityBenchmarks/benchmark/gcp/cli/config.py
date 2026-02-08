@@ -159,7 +159,7 @@ class RunConfig:
     experiment_id: str = "default"
     fuzzing_duration: int = 300
     run_gt: bool = True
-    build_version: str = "latest"
+    build_version: str = "auto"
     patch_use_spot: bool = True
     fuzz_use_spot: bool = True
 

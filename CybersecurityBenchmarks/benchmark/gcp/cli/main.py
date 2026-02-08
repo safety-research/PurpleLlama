@@ -71,7 +71,7 @@ def cmd_submit(
         None, help="Fuzzing duration (seconds)"
     ),
     run_gt: bool = typer.Option(True, "--gt/--no-gt", help="Run ground truth"),
-    build_version: str = typer.Option("latest", help="Build version tag"),
+    build_version: str = typer.Option("auto", help="Build version tag ('auto' = content hash)"),
     config_file: str = typer.Option(None, "--config", "-c", help="Config file"),
     upload_runtime: bool = typer.Option(True, "--upload-runtime/--no-upload-runtime"),
     check_deps: bool = typer.Option(

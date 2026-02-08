@@ -71,8 +71,59 @@ spec:
         workload-type: work
       serviceAccountName: arvo-workflow-sa
       activeDeadlineSeconds: 600
+
+      # Init container: runs in the vul image to find and copy the binary
+      initContainers:
+        - name: find-binary
+          image: "{{workflow.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{workflow.parameters.build-version}}"
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              # Find the fuzzer binary (mirrors agent base.py _find_fuzzer_binary logic)
+              BINARY=""
+
+              # Priority 1: Parse /bin/arvo for the actual run command
+              if [ -f /bin/arvo ]; then
+                CANDIDATE=$(sed -n 's|.*exec[[:space:]]\+\(/[^ ]*\).*|\1|p' /bin/arvo | head -1)
+                if [ -z "$CANDIDATE" ]; then
+                  CANDIDATE=$(sed -n 's|.*/out/\([^ ]*\).*|/out/\1|p' /bin/arvo | head -1)
+                fi
+                if [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ] && [ -x "$CANDIDATE" ]; then
+                  BINARY="$CANDIDATE"
+                fi
+              fi
+
+              # Priority 2: Find executable in /out/, prefer "fuzz" in name
+              if [ -z "$BINARY" ]; then
+                BINARY=$(find /out/ -maxdepth 1 -type f -executable \
+                  ! -name "*.dict" ! -name "*.options" ! -name "*.zip" ! -name "*.txt" \
+                  ! -name "llvm-*" ! -name "*.a" ! -name "*.o" \
+                  -name "*fuzz*" 2>/dev/null | head -1)
+              fi
+              if [ -z "$BINARY" ]; then
+                BINARY=$(find /out/ -maxdepth 1 -type f -executable \
+                  ! -name "*.dict" ! -name "*.options" ! -name "*.zip" ! -name "*.txt" \
+                  ! -name "llvm-*" ! -name "*.a" ! -name "*.o" \
+                  2>/dev/null | head -1)
+              fi
+
+              if [ -z "$BINARY" ] || [ ! -f "$BINARY" ]; then
+                echo "ERROR: Could not find fuzzer binary for case {{inputs.parameters.case-id}}"
+                exit 1
+              fi
+
+              cp "$BINARY" /shared/original_binary
+              chmod +x /shared/original_binary
+              echo "Copied ${BINARY} to /shared/original_binary"
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+      # Main container: cloud-sdk for gsutil operations
       container:
-        image: "{{workflow.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{workflow.parameters.build-version}}"
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
         command:
           - /bin/bash
           - -c
@@ -81,66 +132,27 @@ spec:
             CASE_ID="{{inputs.parameters.case-id}}"
             BUCKET="{{workflow.parameters.bucket}}"
             EXPERIMENT_ID="{{workflow.parameters.experiment-id}}"
-            RESULTS_PREFIX="gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}"
+            DEST="gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/original_binary"
 
-            # Find the fuzzer binary (same logic as agent base.py)
-            BINARY=""
-
-            # Try /bin/arvo run command first
-            if [ -f /bin/arvo ]; then
-              BINARY=$(grep -oP '(?<=exec\s|\./)[\w/.-]+' /bin/arvo 2>/dev/null | head -1)
-              # Resolve relative paths
-              if [ -n "$BINARY" ] && [ ! -f "$BINARY" ]; then
-                BINARY="/out/$BINARY"
-              fi
-              [ -f "$BINARY" ] && [ -x "$BINARY" ] || BINARY=""
-            fi
-
-            # Fallback: find executable in /out/
-            if [ -z "$BINARY" ]; then
-              BINARY=$(find /out/ -maxdepth 1 -type f -executable \
-                ! -name "*.dict" ! -name "*.options" ! -name "*.zip" ! -name "*.txt" \
-                2>/dev/null | head -1)
-            fi
-
-            if [ -z "$BINARY" ] || [ ! -f "$BINARY" ]; then
-              echo "ERROR: Could not find fuzzer binary for case ${CASE_ID}"
+            if [ ! -f /shared/original_binary ]; then
+              echo "ERROR: No binary found by init container"
               exit 1
             fi
 
-            echo "Found binary: ${BINARY}"
-            ls -la "$BINARY"
+            SIZE=$(stat -c%s /shared/original_binary 2>/dev/null || stat -f%z /shared/original_binary)
+            echo "Binary: ${SIZE} bytes"
 
-            # List all agent-id directories that have results for this case
-            AGENT_DIRS=$(gsutil ls "${RESULTS_PREFIX}/" 2>/dev/null | grep -v '/$' -v | sed 's|/$||' | xargs -I{} basename {})
-            if [ -z "$AGENT_DIRS" ]; then
-              echo "No agent results found for case ${CASE_ID}, skipping"
-              exit 0
+            # Upload once per case (same binary for all agents)
+            if gsutil -q stat "$DEST" 2>/dev/null; then
+              echo "Case ${CASE_ID}: already exists, skipping"
+            else
+              gsutil -q cp /shared/original_binary "$DEST"
+              echo "Case ${CASE_ID}: uploaded"
             fi
-
-            # Upload to each agent-id path (skip gt -- gt doesn't need regression analysis)
-            UPLOADED=0
-            SKIPPED=0
-            for AGENT_ID in $AGENT_DIRS; do
-              if [ "$AGENT_ID" = "gt" ]; then
-                continue
-              fi
-
-              DEST="${RESULTS_PREFIX}/${AGENT_ID}/original_binary"
-
-              # Skip if already exists
-              if gsutil -q stat "$DEST" 2>/dev/null; then
-                echo "  ${AGENT_ID}: already exists, skipping"
-                SKIPPED=$((SKIPPED + 1))
-                continue
-              fi
-
-              gsutil cp "$BINARY" "$DEST"
-              echo "  ${AGENT_ID}: uploaded"
-              UPLOADED=$((UPLOADED + 1))
-            done
-
-            echo "Case ${CASE_ID}: uploaded=${UPLOADED}, skipped=${SKIPPED}"
+        volumeMounts:
+          - name: shared
+            mountPath: /shared
+            readOnly: true
         resources:
           requests:
             cpu: "500m"
@@ -148,3 +160,7 @@ spec:
           limits:
             cpu: "1"
             memory: "512Mi"
+
+      volumes:
+        - name: shared
+          emptyDir: {}

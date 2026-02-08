@@ -8,6 +8,8 @@ Usage:
     python -m cli logs <workflow>    # View logs
 """
 
+import json
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -488,6 +490,170 @@ def cmd_ui() -> None:
     subprocess.run(
         ["kubectl", "port-forward", "svc/argo-server", "-n", "argo", "2746:2746"]
     )
+
+
+# Between-commits analysis commands
+analysis_app = typer.Typer(help="Between-commits analysis for fairness evaluation")
+app.add_typer(analysis_app, name="analyze-between-commits")
+
+ANALYSIS_DIR = (
+    Path(__file__).parent.parent.parent.parent / "analysis" / "between_commits"
+)
+
+
+@analysis_app.command("extract")
+def cmd_analysis_extract(
+    cases: Optional[str] = typer.Option(
+        None, help="Comma-separated case IDs (default: all)"
+    ),
+    batch_size: int = typer.Option(20, help="Parallel batch size"),
+    build_version: str = typer.Option("latest", help="Build version tag"),
+    cleanup: bool = typer.Option(False, help="Delete pods after completion"),
+    dry_run: bool = typer.Option(False, help="Show what would be done"),
+) -> None:
+    """Submit GKE jobs to extract intermediate commits for each APB case."""
+    import subprocess
+
+    cmd = ["python", str(ANALYSIS_DIR / "extract_commits_job.py")]
+    if cases:
+        cmd += ["--cases", cases]
+    cmd += ["--batch-size", str(batch_size)]
+    cmd += ["--build-version", build_version]
+    if cleanup:
+        cmd.append("--cleanup")
+    if dry_run:
+        cmd.append("--dry-run")
+
+    subprocess.run(cmd)
+
+
+@analysis_app.command("analyze")
+def cmd_analysis_analyze(
+    local_dir: Optional[str] = typer.Option(
+        None, help="Local directory with extracted data"
+    ),
+    output: Optional[str] = typer.Option(None, help="Output report path"),
+) -> None:
+    """Analyze extracted commits and cross-reference against ARVO database."""
+    import subprocess
+
+    cmd = ["python", str(ANALYSIS_DIR / "analyze_between_commits.py")]
+    if local_dir:
+        cmd += ["--local-dir", local_dir]
+    if output:
+        cmd += ["--output", output]
+
+    subprocess.run(cmd)
+
+
+@analysis_app.command("collect-pocs")
+def cmd_analysis_collect_pocs(
+    report: Optional[str] = typer.Option(None, help="Path to report.json"),
+    arvo_ids: Optional[str] = typer.Option(None, help="Comma-separated ARVO IDs"),
+    batch_size: int = typer.Option(20, help="Parallel batch size"),
+    cleanup: bool = typer.Option(False, help="Delete pods after completion"),
+    dry_run: bool = typer.Option(False, help="Show what would be done"),
+) -> None:
+    """Collect PoCs for ARVO IDs identified in the analysis."""
+    import subprocess
+
+    cmd = ["python", str(ANALYSIS_DIR / "collect_pocs_job.py")]
+    if report:
+        cmd += ["--report", report]
+    elif arvo_ids:
+        cmd += ["--arvo-ids", arvo_ids]
+    else:
+        # Default to the report in the analysis directory
+        default_report = ANALYSIS_DIR / "report.json"
+        if default_report.exists():
+            cmd += ["--report", str(default_report)]
+        else:
+            typer.echo(
+                "Error: No report found. Run 'analyze' first or provide --report/--arvo-ids."
+            )
+            raise typer.Exit(1)
+
+    cmd += ["--batch-size", str(batch_size)]
+    if cleanup:
+        cmd.append("--cleanup")
+    if dry_run:
+        cmd.append("--dry-run")
+
+    subprocess.run(cmd)
+
+
+@analysis_app.command("run")
+def cmd_analysis_run(
+    batch_size: int = typer.Option(20, help="Parallel batch size"),
+    build_version: str = typer.Option("latest", help="Build version tag"),
+    cleanup: bool = typer.Option(True, help="Delete pods after completion"),
+) -> None:
+    """Run full pipeline: extract commits, analyze, collect PoCs."""
+    import subprocess
+
+    typer.echo("=" * 60)
+    typer.echo("Step 1: Extract intermediate commits")
+    typer.echo("=" * 60)
+    r = subprocess.run(
+        [
+            "python",
+            str(ANALYSIS_DIR / "extract_commits_job.py"),
+            "--batch-size",
+            str(batch_size),
+            "--build-version",
+            build_version,
+        ]
+        + (["--cleanup"] if cleanup else [])
+    )
+    if r.returncode != 0:
+        typer.echo("Extract step failed")
+        raise typer.Exit(1)
+
+    typer.echo()
+    typer.echo("=" * 60)
+    typer.echo("Step 2: Analyze and cross-reference")
+    typer.echo("=" * 60)
+    report_path = ANALYSIS_DIR / "report.json"
+    r = subprocess.run(
+        [
+            "python",
+            str(ANALYSIS_DIR / "analyze_between_commits.py"),
+            "--output",
+            str(report_path),
+        ]
+    )
+    if r.returncode != 0:
+        typer.echo("Analyze step failed")
+        raise typer.Exit(1)
+
+    # Check if we need to collect PoCs
+    with open(report_path) as f:
+        report = json.load(f)
+    needed = report.get("all_needed_arvo_ids", [])
+    if not needed:
+        typer.echo("\nNo bonus ARVO fixes found -- all cases are clean!")
+        return
+
+    typer.echo()
+    typer.echo("=" * 60)
+    typer.echo(f"Step 3: Collect PoCs for {len(needed)} ARVO IDs")
+    typer.echo("=" * 60)
+    r = subprocess.run(
+        [
+            "python",
+            str(ANALYSIS_DIR / "collect_pocs_job.py"),
+            "--report",
+            str(report_path),
+            "--batch-size",
+            str(batch_size),
+        ]
+        + (["--cleanup"] if cleanup else [])
+    )
+    if r.returncode != 0:
+        typer.echo("PoC collection step failed")
+        raise typer.Exit(1)
+
+    typer.echo("\nDone! Report at: " + str(report_path))
 
 
 def main() -> None:

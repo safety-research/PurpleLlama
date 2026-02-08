@@ -74,6 +74,14 @@ def get_available_agents() -> Dict[str, Type[BaseAgent]]:
         except ImportError as e:
             LOG.warning(f"Failed to import claudecode agent: {e}")
 
+        # GT Backporter: applies known ground-truth patch to vul codebase
+        try:
+            from .gtbackporter import GtBackporterAgent
+
+            AGENT_REGISTRY["gtbackporter"] = GtBackporterAgent
+        except ImportError as e:
+            LOG.warning(f"Failed to import gtbackporter agent: {e}")
+
     return AGENT_REGISTRY
 
 

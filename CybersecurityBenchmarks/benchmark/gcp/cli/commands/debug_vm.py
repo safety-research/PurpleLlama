@@ -172,7 +172,10 @@ def _build_fuzz_pod_spec(
                     ],
                     "resources": {
                         "requests": {"cpu": "1.7", "memory": "6G"},
-                        "limits": {"cpu": "1.8", "memory": "12G"},
+                        "limits": {"cpu": "1.8", "memory": "14G"},
+                    },
+                    "securityContext": {
+                        "capabilities": {"add": ["SYS_ADMIN"]},
                     },
                 },
             ],
@@ -274,7 +277,11 @@ def _build_patch_pod_spec(
                     ],
                     "resources": {
                         "requests": {"cpu": "1.7", "memory": "6G"},
-                        "limits": {"cpu": "1.8", "memory": "12G"},
+                        "limits": {"cpu": "1.8", "memory": "14G"},
+                    },
+                    # SYS_ADMIN enables overlayfs for instant source revert
+                    "securityContext": {
+                        "capabilities": {"add": ["SYS_ADMIN"]},
                     },
                 },
             ],
@@ -477,7 +484,9 @@ def launch(
             raise typer.Exit(1)
         echo_success("Runtime rebuilt")
 
-        runtime_tar = get_script_dir() / "portable-runtime" / "output" / "agent-runtime.tar.gz"
+        runtime_tar = (
+            get_script_dir() / "portable-runtime" / "output" / "agent-runtime.tar.gz"
+        )
         if runtime_tar.exists():
             echo_info("Uploading runtime to GCS...")
             result = subprocess.run(

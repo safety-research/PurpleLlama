@@ -16,6 +16,8 @@ Evaluation (fuzzing, crash detection) is handled separately by the evaluation pi
 """
 
 import logging
+import os
+import shutil
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -167,6 +169,174 @@ class BaseAgent(ABC):
             model=model,
             start_time=datetime.utcnow().isoformat() + "Z",
         )
+
+        # Snapshot the original (pre-patch) binary for regression analysis.
+        # Must happen before any patching since `arvo compile` overwrites /out/.
+        self._save_original_binary()
+
+        # Overlay state (initialized by _setup_overlays)
+        self._use_overlay = False
+        self._overlay_mounted: list[str] = []
+
+    # -------------------------------------------------------------------------
+    # OverlayFS-based source/build snapshot and revert
+    # -------------------------------------------------------------------------
+    # These methods provide instant filesystem revert for retry attempts.
+    # With SYS_ADMIN capability, overlayfs is used (instant, zero-copy).
+    # Without it, falls back to cp -a snapshots (slow but correct).
+
+    _overlay_paths = ["/src", "/out", "/work"]
+    _overlay_base = "/tmp/overlay"
+    _snapshot_suffix = ".bak"
+
+    def _setup_overlays(self) -> None:
+        """Mount overlayfs on writable paths. Call once before patching.
+
+        Falls back to cp -a if overlayfs is not available (no SYS_ADMIN).
+        """
+        for path in self._overlay_paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                self._mount_overlay(path)
+                self._use_overlay = True
+            except (subprocess.CalledProcessError, PermissionError, OSError) as e:
+                if not self._overlay_mounted:
+                    # First path failed -- overlay not available, use cp fallback
+                    LOG.warning(
+                        f"OverlayFS not available ({e}), falling back to cp -a snapshots"
+                    )
+                    self._use_overlay = False
+                    self._setup_snapshots()
+                    return
+                else:
+                    LOG.warning(f"Failed to mount overlay on {path}: {e}")
+
+        if self._overlay_mounted:
+            LOG.info(f"OverlayFS mounted on {self._overlay_mounted} for retry support")
+
+    def _mount_overlay(self, path: str) -> None:
+        """Mount a single overlayfs on a path."""
+        upper = f"{self._overlay_base}{path}/upper"
+        work = f"{self._overlay_base}{path}/work"
+        os.makedirs(upper, exist_ok=True)
+        os.makedirs(work, exist_ok=True)
+        subprocess.run(
+            [
+                "mount",
+                "-t",
+                "overlay",
+                "overlay",
+                "-o",
+                f"lowerdir={path},upperdir={upper},workdir={work}",
+                path,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self._overlay_mounted.append(path)
+
+    def _reset_overlays(self) -> None:
+        """Revert all paths to their pre-patching state.
+
+        With overlay: unmount, clear upper layer, remount (instant).
+        Without overlay: restore from cp -a backup.
+        """
+        if self._use_overlay:
+            for path in self._overlay_mounted:
+                try:
+                    subprocess.run(
+                        ["umount", path],
+                        check=True,
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    upper = f"{self._overlay_base}{path}/upper"
+                    work = f"{self._overlay_base}{path}/work"
+                    shutil.rmtree(upper)
+                    shutil.rmtree(work)
+                    os.makedirs(upper)
+                    os.makedirs(work)
+                    subprocess.run(
+                        [
+                            "mount",
+                            "-t",
+                            "overlay",
+                            "overlay",
+                            "-o",
+                            f"lowerdir={path},upperdir={upper},workdir={work}",
+                            path,
+                        ],
+                        check=True,
+                        capture_output=True,
+                        timeout=30,
+                    )
+                except Exception as e:
+                    LOG.warning(f"Failed to reset overlay on {path}: {e}")
+            LOG.info("Reset overlays (instant revert)")
+        else:
+            self._restore_snapshots()
+
+    def _teardown_overlays(self) -> None:
+        """Unmount all overlays. Call at end of run."""
+        if not self._use_overlay:
+            return
+        for path in self._overlay_mounted:
+            try:
+                subprocess.run(
+                    ["umount", path],
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except Exception:
+                pass  # Best effort
+        self._overlay_mounted.clear()
+
+    # -- cp -a fallback --
+
+    def _setup_snapshots(self) -> None:
+        """Fallback: take cp -a snapshots of writable paths."""
+        for path in self._overlay_paths:
+            backup = path + self._snapshot_suffix
+            if os.path.exists(backup) or not os.path.exists(path):
+                continue
+            try:
+                subprocess.run(
+                    ["cp", "-a", path, backup],
+                    check=True,
+                    capture_output=True,
+                    timeout=120,
+                )
+            except Exception as e:
+                LOG.warning(f"Failed to snapshot {path}: {e}")
+        LOG.info("Snapshotted source/build dirs (cp -a fallback)")
+
+    def _restore_snapshots(self) -> None:
+        """Fallback: restore from cp -a snapshots."""
+        for path in self._overlay_paths:
+            backup = path + self._snapshot_suffix
+            if not os.path.exists(backup):
+                continue
+            try:
+                subprocess.run(
+                    ["rm", "-rf", path],
+                    check=True,
+                    capture_output=True,
+                    timeout=60,
+                )
+                subprocess.run(
+                    ["mv", backup, path],
+                    check=True,
+                    capture_output=True,
+                    timeout=60,
+                )
+            except Exception as e:
+                LOG.warning(f"Failed to restore {path}: {e}")
+        # Re-snapshot for next retry
+        self._setup_snapshots()
+        LOG.info("Restored source/build dirs from snapshots")
 
     @abstractmethod
     async def run(self) -> AgentResult:
@@ -368,6 +538,27 @@ class BaseAgent(ABC):
 
         LOG.error("Could not find fuzzer binary")
         return None
+
+    def _save_original_binary(self) -> None:
+        """Snapshot the original (pre-patch) fuzzer binary for regression analysis.
+
+        Saves to /output/original_binary. Called at init time, before the agent
+        patches anything, so /out/ still has the vulnerable binary.
+        """
+        import shutil
+
+        binary_path = self._find_fuzzer_binary()
+        if not binary_path:
+            LOG.warning("Could not find original fuzzer binary to snapshot")
+            return
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.output_dir / "original_binary"
+        try:
+            shutil.copy2(binary_path, dest)
+            LOG.info(f"Saved original binary to {dest}")
+        except Exception as e:
+            LOG.error(f"Failed to save original binary: {e}")
 
     def _save_binary_for_fuzzing(self) -> bool:
         """

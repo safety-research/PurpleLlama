@@ -34,7 +34,7 @@ spec:
           factor: 2
           cap: "10m"
       container:
-        image: docker.io/library/rust:1.83-bookworm
+        image: docker.io/library/rust:1.93-bookworm
         command:
           - /bin/bash
           - -c

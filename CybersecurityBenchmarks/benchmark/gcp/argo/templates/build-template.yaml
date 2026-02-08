@@ -32,20 +32,30 @@ spec:
           duration: "30s"
           factor: 2
           cap: "10m"
+      # BuildKit daemonless — replaces Kaniko.
+      # Fixes OCI layer unpacking bugs (e.g. case 57448 mkdir file-exists error).
+      # Requires privileged mode for overlayfs snapshotting.
       container:
-        image: gcr.io/kaniko-project/executor:latest
+        image: moby/buildkit:buildx-stable-1
+        securityContext:
+          privileged: true
+        env:
+          - name: DOCKER_CONFIG
+            value: "/auth"
+        command: ["buildctl-daemonless.sh"]
         args:
-          - "--dockerfile=/workspace/Dockerfile"
-          - "--context=/workspace"
-          - "--destination={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{inputs.parameters.build-version}}"
-          - "--destination={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:latest"
-          - "--cache=true"
-          - "--cache-repo={{inputs.parameters.registry}}/kaniko-cache"
+          - "build"
+          - "--frontend=dockerfile.v0"
+          - "--local=context=/workspace"
+          - "--local=dockerfile=/workspace"
+          - "--output=type=image,\"name={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{inputs.parameters.build-version}},{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:latest\",push=true"
+          - "--export-cache=type=registry,ref={{inputs.parameters.registry}}/buildkit-cache:vul,mode=max"
+          - "--import-cache=type=registry,ref={{inputs.parameters.registry}}/buildkit-cache:vul"
         volumeMounts:
           - name: workspace
             mountPath: /workspace
-          - name: docker-config
-            mountPath: /kaniko/.docker
+          - name: auth
+            mountPath: /auth
             readOnly: true
         resources:
           requests:
@@ -74,17 +84,50 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: /workspace
+        # Merge Docker Hub pull creds + Artifact Registry push token into a
+        # single config.json that BuildKit can use for both pull and push.
+        - name: prepare-registry-auth
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              # Start with Docker Hub creds if they exist
+              if [ -f /docker-secret/.dockerconfigjson ]; then
+                cp /docker-secret/.dockerconfigjson /auth/config.json
+              else
+                echo '{"auths":{}}' > /auth/config.json
+              fi
+              # Add Artifact Registry token
+              TOKEN=$(gcloud auth print-access-token)
+              REGISTRY_HOST=$(echo "{{inputs.parameters.registry}}" | cut -d/ -f1)
+              python3 -c "
+              import json, os
+              cfg = json.load(open('/auth/config.json'))
+              cfg.setdefault('auths', {})['https://${REGISTRY_HOST}'] = {
+                  'auth': '$(echo -n "oauth2accesstoken:${TOKEN}" | base64 -w0)'
+              }
+              json.dump(cfg, open('/auth/config.json', 'w'))
+              "
+              echo "Registry auth configured for Docker Hub + ${REGISTRY_HOST}"
+          volumeMounts:
+            - name: docker-secret
+              mountPath: /docker-secret
+              readOnly: true
+            - name: auth
+              mountPath: /auth
       volumes:
         - name: workspace
           emptyDir: {}
-        # Docker Hub credentials for Kaniko to pull n132/arvo base images
-        - name: docker-config
+        # Raw Docker Hub secret (read by prepare-registry-auth init container)
+        - name: docker-secret
           secret:
             secretName: dockerhub-registry
-            items:
-              - key: .dockerconfigjson
-                path: config.json
             optional: true
+        # Merged auth config (Docker Hub + Artifact Registry)
+        - name: auth
+          emptyDir: {}
 
     - name: build-fix
       inputs:
@@ -113,21 +156,31 @@ spec:
           duration: "30s"
           factor: 2
           cap: "10m"
+      # BuildKit daemonless — replaces Kaniko.
+      # Fixes OCI layer unpacking bugs (e.g. case 57448 mkdir file-exists error).
+      # Requires privileged mode for overlayfs snapshotting.
+      # No --single-snapshot equivalent needed; BuildKit uses overlayfs natively.
       container:
-        image: gcr.io/kaniko-project/executor:latest
+        image: moby/buildkit:buildx-stable-1
+        securityContext:
+          privileged: true
+        env:
+          - name: DOCKER_CONFIG
+            value: "/auth"
+        command: ["buildctl-daemonless.sh"]
         args:
-          - "--dockerfile=/workspace/Dockerfile"
-          - "--context=/workspace"
-          - "--destination={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{inputs.parameters.build-version}}"
-          - "--destination={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:latest"
-          - "--cache=true"
-          - "--cache-repo={{inputs.parameters.registry}}/kaniko-cache"
-          - "--single-snapshot"
+          - "build"
+          - "--frontend=dockerfile.v0"
+          - "--local=context=/workspace"
+          - "--local=dockerfile=/workspace"
+          - "--output=type=image,\"name={{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{inputs.parameters.build-version}},{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:latest\",push=true"
+          - "--export-cache=type=registry,ref={{inputs.parameters.registry}}/buildkit-cache:fix,mode=max"
+          - "--import-cache=type=registry,ref={{inputs.parameters.registry}}/buildkit-cache:fix"
         volumeMounts:
           - name: workspace
             mountPath: /workspace
-          - name: docker-config
-            mountPath: /kaniko/.docker
+          - name: auth
+            mountPath: /auth
             readOnly: true
         resources:
           requests:
@@ -162,14 +215,47 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: /workspace
+        # Merge Docker Hub pull creds + Artifact Registry push token into a
+        # single config.json that BuildKit can use for both pull and push.
+        - name: prepare-registry-auth
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              # Start with Docker Hub creds if they exist
+              if [ -f /docker-secret/.dockerconfigjson ]; then
+                cp /docker-secret/.dockerconfigjson /auth/config.json
+              else
+                echo '{"auths":{}}' > /auth/config.json
+              fi
+              # Add Artifact Registry token
+              TOKEN=$(gcloud auth print-access-token)
+              REGISTRY_HOST=$(echo "{{inputs.parameters.registry}}" | cut -d/ -f1)
+              python3 -c "
+              import json, os
+              cfg = json.load(open('/auth/config.json'))
+              cfg.setdefault('auths', {})['https://${REGISTRY_HOST}'] = {
+                  'auth': '$(echo -n "oauth2accesstoken:${TOKEN}" | base64 -w0)'
+              }
+              json.dump(cfg, open('/auth/config.json', 'w'))
+              "
+              echo "Registry auth configured for Docker Hub + ${REGISTRY_HOST}"
+          volumeMounts:
+            - name: docker-secret
+              mountPath: /docker-secret
+              readOnly: true
+            - name: auth
+              mountPath: /auth
       volumes:
         - name: workspace
           emptyDir: {}
-        # Docker Hub credentials for Kaniko to pull n132/arvo base images
-        - name: docker-config
+        # Raw Docker Hub secret (read by prepare-registry-auth init container)
+        - name: docker-secret
           secret:
             secretName: dockerhub-registry
-            items:
-              - key: .dockerconfigjson
-                path: config.json
             optional: true
+        # Merged auth config (Docker Hub + Artifact Registry)
+        - name: auth
+          emptyDir: {}

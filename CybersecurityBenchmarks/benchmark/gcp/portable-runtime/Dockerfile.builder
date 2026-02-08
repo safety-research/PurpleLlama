@@ -13,20 +13,22 @@
 #
 # Output: /output/agent-runtime.tar.gz
 
+# Force x86_64 platform since all ARVO containers are amd64
+ARG TARGETPLATFORM=linux/amd64
+
 # =============================================================================
 # Stage 0: Get ALL musl runtime libraries from Alpine
 # =============================================================================
 # The Claude Code musl binary needs: musl libc, musl linker, libstdc++, libgcc_s.
 # ALL must come from the same musl ecosystem to avoid ABI mismatches.
 # Alpine uses musl natively, so we extract everything from a single Alpine image.
-FROM --platform=linux/amd64 alpine:3.21 AS alpine-libs
+FROM --platform=$TARGETPLATFORM alpine:3.21 AS alpine-libs
 RUN apk add --no-cache libstdc++ libgcc musl
 
 # =============================================================================
 # Stage 1: Download all components
 # =============================================================================
-# Force x86_64 platform since all ARVO containers are amd64
-FROM --platform=linux/amd64 debian:bookworm AS downloader
+FROM --platform=$TARGETPLATFORM debian:bookworm AS downloader
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -57,9 +59,9 @@ ARG CLAUDE_CODE_VERSION=latest
 RUN mkdir -p /runtime/bin && \
     GCS_BUCKET="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases" && \
     if [ "${CLAUDE_CODE_VERSION}" = "latest" ]; then \
-        CC_VERSION=$(curl -fsSL "$GCS_BUCKET/latest"); \
+    CC_VERSION=$(curl -fsSL "$GCS_BUCKET/latest"); \
     else \
-        CC_VERSION="${CLAUDE_CODE_VERSION}"; \
+    CC_VERSION="${CLAUDE_CODE_VERSION}"; \
     fi && \
     echo "Downloading Claude Code CLI v${CC_VERSION} (linux-x64-musl)..." && \
     curl -fsSL -o /runtime/bin/claude "$GCS_BUCKET/$CC_VERSION/linux-x64-musl/claude" && \
@@ -73,8 +75,8 @@ COPY --from=alpine-libs /lib/ld-musl-x86_64.so.1 /runtime/lib/libc.musl-x86_64.s
 COPY --from=alpine-libs /usr/lib/libstdc++.so.6 /runtime/lib/
 COPY --from=alpine-libs /usr/lib/libgcc_s.so.1 /runtime/lib/
 RUN patchelf --set-interpreter /agent-runtime/lib/ld-musl-x86_64.so.1 \
-             --set-rpath /agent-runtime/lib \
-             /runtime/bin/claude && \
+    --set-rpath /agent-runtime/lib \
+    /runtime/bin/claude && \
     echo "Patched claude binary (interpreter + rpath)" && \
     echo "Bundled libs:" && ls -lh /runtime/lib/
 
@@ -129,11 +131,4 @@ RUN rm -rf /runtime/python/include && \
 RUN mkdir -p /runtime/agent
 
 # Default command: show contents and sizes
-CMD echo "=== Agent Runtime Contents ===" && \
-    ls -la /runtime && \
-    echo "" && \
-    echo "=== Size ===" && \
-    du -sh /runtime/* && \
-    echo "" && \
-    echo "=== Total ===" && \
-    du -sh /runtime
+CMD ["sh", "-c", "echo '=== Agent Runtime Contents ===' && ls -la /runtime && echo '' && echo '=== Size ===' && du -sh /runtime/* && echo '' && echo '=== Total ===' && du -sh /runtime"]

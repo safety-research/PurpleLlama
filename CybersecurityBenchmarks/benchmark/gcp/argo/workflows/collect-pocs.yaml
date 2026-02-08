@@ -1,0 +1,88 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: collect-pocs-
+  namespace: argo
+spec:
+  entrypoint: collect-all
+  serviceAccountName: arvo-workflow-sa
+
+  parallelism: 50
+
+  podMetadata:
+    labels:
+      owner: "{{workflow.labels.owner}}"
+      job-type: "collect-pocs"
+
+  arguments:
+    parameters:
+      - name: arvo-ids-json
+        value: "[]"
+      - name: bucket
+        value: ""
+
+  templates:
+    - name: collect-all
+      dag:
+        failFast: false
+        tasks:
+          - name: collect
+            withParam: "{{workflow.parameters.arvo-ids-json}}"
+            template: collect-poc
+            arguments:
+              parameters:
+                - name: arvo-id
+                  value: "{{item}}"
+
+    - name: collect-poc
+      inputs:
+        parameters:
+          - name: arvo-id
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "work"
+          effect: "NoSchedule"
+      initContainers:
+        - name: extract-poc
+          image: "docker.io/n132/arvo:{{inputs.parameters.arvo-id}}-vul"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              if [ -f /tmp/poc ]; then
+                cp /tmp/poc /shared/poc
+                echo "PoC extracted for ARVO {{inputs.parameters.arvo-id}}"
+              else
+                echo "ERROR: /tmp/poc not found"
+                exit 1
+              fi
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+      container:
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command:
+          - /bin/sh
+          - -c
+          - |
+            ARVO_ID="{{inputs.parameters.arvo-id}}"
+            BUCKET="{{workflow.parameters.bucket}}"
+            gsutil cp /shared/poc gs://${BUCKET}/analysis/relevant_pocs/${ARVO_ID}/poc
+            echo "Uploaded PoC for ARVO ${ARVO_ID}"
+        volumeMounts:
+          - name: shared
+            mountPath: /shared
+            readOnly: true
+        resources:
+          requests:
+            cpu: 500m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 512Mi
+
+      volumes:
+        - name: shared
+          emptyDir: {}

@@ -63,9 +63,7 @@ async def build_tool(args):
             _agent_ref.result.build_success = False
             _agent_ref.result.build_output = "Build timed out after 300 seconds"
         return {
-            "content": [
-                {"type": "text", "text": "Build timed out after 300 seconds"}
-            ],
+            "content": [{"type": "text", "text": "Build timed out after 300 seconds"}],
             "is_error": True,
         }
     except Exception as e:
@@ -99,9 +97,7 @@ async def run_poc_tool(args):
             timeout=120,
         )
         output = result.stdout + result.stderr
-        crash_fixed = (
-            result.returncode == 0 and "ERROR: AddressSanitizer" not in output
-        )
+        crash_fixed = result.returncode == 0 and "ERROR: AddressSanitizer" not in output
 
         # Always update agent result
         if _agent_ref:

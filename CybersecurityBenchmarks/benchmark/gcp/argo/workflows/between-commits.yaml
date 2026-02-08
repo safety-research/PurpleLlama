@@ -1,0 +1,117 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: between-commits-
+  namespace: argo
+spec:
+  entrypoint: extract-all
+  serviceAccountName: arvo-workflow-sa
+
+  parallelism: 50
+
+  podMetadata:
+    labels:
+      owner: "{{workflow.labels.owner}}"
+      job-type: "between-commits"
+
+  arguments:
+    parameters:
+      - name: cases-json
+        value: "[]"
+      - name: bucket
+        value: ""
+      - name: registry
+        value: ""
+      - name: build-version
+        value: "latest"
+
+  templates:
+    - name: extract-all
+      dag:
+        failFast: false
+        tasks:
+          - name: extract
+            withParam: "{{workflow.parameters.cases-json}}"
+            template: extract-case
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{item}}"
+
+    - name: extract-case
+      inputs:
+        parameters:
+          - name: case-id
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "work"
+          effect: "NoSchedule"
+      nodeSelector:
+        workload-type: work
+      initContainers:
+        # Step 1: Get vul commit hash from -vul image
+        - name: get-vul-commit
+          image: "{{workflow.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{workflow.parameters.build-version}}"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              SRC_DIR=$(find /src -maxdepth 2 -type d -name ".git" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+              [ -z "$SRC_DIR" ] && SRC_DIR=$(ls -d /src/*/ 2>/dev/null | head -1)
+              cd "$SRC_DIR" || { echo "ERROR: cannot find source dir"; exit 1; }
+              git rev-parse HEAD > /shared/vul_commit
+              basename "$SRC_DIR" > /shared/src_subdir
+              echo "vul_commit=$(cat /shared/vul_commit) src=$SRC_DIR"
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+        # Step 2: Get intermediate commits from -fix image
+        - name: get-commits
+          image: "{{workflow.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{workflow.parameters.build-version}}"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              VUL_COMMIT=$(cat /shared/vul_commit)
+              SRC_SUBDIR=$(cat /shared/src_subdir)
+              cd /src/$SRC_SUBDIR 2>/dev/null || cd /src/*/ 2>/dev/null || cd /src
+              git log --format='%H %s' $VUL_COMMIT..HEAD > /shared/intermediate_commits.txt 2>/dev/null || \
+                echo "ERROR: git log failed" > /shared/intermediate_commits.txt
+              git rev-parse HEAD > /shared/fix_commit_actual 2>/dev/null
+              NCOMMITS=$(wc -l < /shared/intermediate_commits.txt | tr -d ' ')
+              echo "case={{inputs.parameters.case-id}} vul=$VUL_COMMIT fix=$(cat /shared/fix_commit_actual) commits=$NCOMMITS"
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+      # Main container: upload results to GCS
+      container:
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command:
+          - /bin/sh
+          - -c
+          - |
+            CASE_ID="{{inputs.parameters.case-id}}"
+            BUCKET="{{workflow.parameters.bucket}}"
+            GCS_PREFIX="gs://${BUCKET}/analysis/between_commits/${CASE_ID}"
+            gsutil cp /shared/vul_commit ${GCS_PREFIX}/vul_commit
+            gsutil cp /shared/fix_commit_actual ${GCS_PREFIX}/fix_commit
+            gsutil cp /shared/intermediate_commits.txt ${GCS_PREFIX}/commits.txt
+            echo "Uploaded to ${GCS_PREFIX}"
+        volumeMounts:
+          - name: shared
+            mountPath: /shared
+            readOnly: true
+        resources:
+          requests:
+            cpu: "1.7"
+            memory: 6G
+          limits:
+            cpu: "1.8"
+            memory: 12G
+
+      volumes:
+        - name: shared
+          emptyDir: {}

@@ -292,19 +292,22 @@ metadata:
   generateName: casr-build-
   namespace: argo
 spec:
-  entrypoint: build-casr
+  entrypoint: main
   serviceAccountName: arvo-workflow-sa
   templates:
-    - name: build-casr
-      templateRef:
-        name: arvo-deps-build
-        template: build-casr
-      arguments:
-        parameters:
-          - name: bucket
-            value: "{gke_config.bucket_name}"
-          - name: force-rebuild
-            value: "{str(force).lower()}"
+    - name: main
+      dag:
+        tasks:
+          - name: build-casr
+            templateRef:
+              name: arvo-deps-build
+              template: build-casr
+            arguments:
+              parameters:
+                - name: bucket
+                  value: "{gke_config.bucket_name}"
+                - name: force-rebuild
+                  value: "{str(force).lower()}"
 """
 
     # Write temp workflow file

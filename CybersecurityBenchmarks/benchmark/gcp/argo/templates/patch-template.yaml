@@ -71,6 +71,14 @@ spec:
             gcs:
               bucket: "{{inputs.parameters.bucket}}"
               key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/rebuilt_binary"
+          - name: original-binary
+            path: /output/original_binary
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/original_binary"
           - name: success-marker
             path: /output/_SUCCESS
             optional: true
@@ -98,6 +106,17 @@ spec:
           duration: "30s"
           factor: 2
           cap: "5m"
+
+      # On OOM retries (retry 2+), escalate memory request to 16G so the pod
+      # lands on an n4-highmem-4 node (32GB) instead of n4-standard-4 (16GB).
+      podSpecPatch: |
+        containers:
+        - name: main
+          resources:
+            requests:
+              memory: "{{= sprig.int(retries) >= 2 ? '16G' : '6G'}}"
+            limits:
+              memory: "{{= sprig.int(retries) >= 2 ? '28G' : '14G'}}"
 
       activeDeadlineSeconds: 18000
 
@@ -178,7 +197,11 @@ spec:
             memory: "6G"
           limits:
             cpu: "1.8"
-            memory: "12G"
+            memory: "14G"
+        # SYS_ADMIN enables overlayfs for instant source revert between retries
+        securityContext:
+          capabilities:
+            add: ["SYS_ADMIN"]
 
       volumes:
         - name: agent-runtime

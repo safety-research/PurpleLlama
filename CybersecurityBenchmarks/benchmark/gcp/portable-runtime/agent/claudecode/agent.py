@@ -50,7 +50,7 @@ class ClaudeCodeAgent(BaseAgent):
     - conversation.json full structured interaction history (via _save_additional_results)
 
     Configurable parameters (flow through from AGENT_CONFIG JSON via **kwargs):
-    - max_turns (int): Max agentic loop iterations (default: 50)
+    - max_turns (int): Max agentic loop iterations (default: 100)
     - enable_fuzzing (bool): Whether to expose the fork-mode fuzzer tool (default: False)
     - fuzz_duration (int): Seconds to run fork-mode fuzzing when enabled (default: 60)
     """
@@ -64,7 +64,7 @@ class ClaudeCodeAgent(BaseAgent):
         model=None,
         dry_run=False,
         max_retries=10,
-        max_turns=50,
+        max_turns=100,
         enable_fuzzing=False,
         fuzz_duration=60,
         **kwargs,
@@ -84,10 +84,19 @@ class ClaudeCodeAgent(BaseAgent):
         )
 
     async def run(self) -> AgentResult:
-        """Run the Claude Code agent patching pipeline."""
+        """Run the Claude Code agent patching pipeline.
+
+        Gives the agent up to max_retries (default 10) fresh attempts to fix
+        the crash, on par with the autopatchbench agents.  Each attempt starts
+        a brand-new agentic session with a clean conversation and reverted
+        source tree.
+        """
         try:
             LOG.info(f"Starting ClaudeCode agent for case {self.case_id}")
             self.result.status = AgentStatus.RUNNING
+
+            # 0. Set up overlayfs for instant source revert between retries
+            self._setup_overlays()
 
             # 1. Analyze crash output
             crash_output = self._analyze_crash()
@@ -101,67 +110,107 @@ class ClaudeCodeAgent(BaseAgent):
                 self.result.status = AgentStatus.SUCCESS
                 return self._finalize_and_save()
 
-            # 2. Create custom MCP tools for ARVO operations
-            arvo_server = create_arvo_mcp_server(self)
-
-            # 3. Configure Claude Code Agent with restrictions
-            allowed_tools = [
-                "Read",
-                "Write",
-                "Edit",
-                "Grep",
-                "Glob",
-                "Bash",
-                "mcp__arvo__build",
-                "mcp__arvo__run_poc",
-            ]
-            if self.enable_fuzzing:
-                allowed_tools.append("mcp__arvo__fuzz")
-
-            options = ClaudeAgentOptions(
-                cli_path=self.cli_path,
-                system_prompt=ARVO_SYSTEM_PROMPT,
-                cwd="/src",
-                allowed_tools=allowed_tools,
-                mcp_servers={"arvo": arvo_server},
-                can_use_tool=restrict_file_writes,
-                permission_mode="default",
-                max_turns=self.max_turns,
-                model=self.model,
-            )
-
-            # 4. Run agentic loop
-            initial_prompt = self._build_initial_prompt(crash_output)
-            LOG.info(f"Starting agentic loop with max_turns={self.max_turns}")
-
-            async with ClaudeSDKClient(options=options) as client:
-                await client.query(initial_prompt)
-                async for message in client.receive_response():
-                    self._process_message(message)
-
-            # 5. Determine final status
-            # (run_poc tool updates crash_fixed directly)
-            if self.result.crash_fixed:
-                self.result.status = AgentStatus.SUCCESS
-                LOG.info("Agent completed successfully - crash fixed!")
-            elif self.result.patch_generated:
-                self.result.status = AgentStatus.PARTIAL
+            # 2. Retry loop — up to max_retries fresh agentic sessions
+            for attempt in range(1, self.max_retries + 1):
                 LOG.info(
-                    "Agent completed with partial success - "
-                    "patch generated but crash not fixed"
+                    f"Attempt {attempt}/{self.max_retries} for case {self.case_id}"
                 )
-            else:
-                self.result.status = AgentStatus.FAILED
-                LOG.info("Agent failed - no valid patch generated")
+
+                # Reset per-attempt state
+                self.result.crash_fixed = False
+                self.result.build_success = False
+
+                # Revert source/build changes from previous attempt
+                if attempt > 1:
+                    self._reset_overlays()
+                    self._conversation_messages.append(
+                        {"type": "retry_separator", "attempt": attempt}
+                    )
+
+                success = await self._run_agentic_session(crash_output)
+
+                if success:
+                    self.result.status = AgentStatus.SUCCESS
+                    LOG.info(
+                        f"Agent succeeded on attempt "
+                        f"{attempt}/{self.max_retries} — crash fixed!"
+                    )
+                    break
+                else:
+                    LOG.info(
+                        f"Attempt {attempt}/{self.max_retries} failed — crash not fixed"
+                    )
+
+            # 3. Determine final status if no attempt succeeded
+            if self.result.status != AgentStatus.SUCCESS:
+                if self.result.patch_generated:
+                    self.result.status = AgentStatus.PARTIAL
+                    LOG.info(
+                        f"All {self.max_retries} attempts exhausted — "
+                        "partial (patch generated but crash not fixed)"
+                    )
+                else:
+                    self.result.status = AgentStatus.FAILED
+                    LOG.info(
+                        f"All {self.max_retries} attempts exhausted — "
+                        "no valid patch generated"
+                    )
 
         except Exception as e:
             LOG.exception(f"Agent failed with exception: {e}")
             self.result.status = AgentStatus.FAILED
             self.result.exception = str(e)
+        finally:
+            self._teardown_overlays()
 
         # _finalize_and_save() calls _save_binary_for_fuzzing() and
         # _generate_patch_diff() which handle binary + patch output
         return self._finalize_and_save()
+
+    async def _run_agentic_session(self, crash_output: str) -> bool:
+        """Run a single Claude Code agentic session.
+
+        Returns True if the crash was fixed by the end of the session.
+        """
+        # Create custom MCP tools for ARVO operations
+        arvo_server = create_arvo_mcp_server(self)
+
+        # Configure Claude Code Agent with restrictions
+        allowed_tools = [
+            "Read",
+            "Write",
+            "Edit",
+            "Grep",
+            "Glob",
+            "Bash",
+            "mcp__arvo__build",
+            "mcp__arvo__run_poc",
+        ]
+        if self.enable_fuzzing:
+            allowed_tools.append("mcp__arvo__fuzz")
+
+        options = ClaudeAgentOptions(
+            cli_path=self.cli_path,
+            system_prompt=ARVO_SYSTEM_PROMPT,
+            cwd="/src",
+            allowed_tools=allowed_tools,
+            mcp_servers={"arvo": arvo_server},
+            can_use_tool=restrict_file_writes,
+            permission_mode="default",
+            max_turns=self.max_turns,
+            model=self.model,
+        )
+
+        # Run agentic loop
+        initial_prompt = self._build_initial_prompt(crash_output)
+        LOG.info(f"Starting agentic loop with max_turns={self.max_turns}")
+
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(initial_prompt)
+            async for message in client.receive_response():
+                self._process_message(message)
+
+        return self.result.crash_fixed
 
     def _analyze_crash(self) -> str | None:
         """Analyze the original crash using arvo command."""
@@ -184,27 +233,24 @@ class ClaudeCodeAgent(BaseAgent):
 
     def _build_initial_prompt(self, crash_output: str) -> str:
         """Build the initial prompt for the agentic loop."""
-        return f"""A crash was detected in this project. Your task is to analyze and fix the vulnerability.
+        return f"""A crash was detected in this project. Your task is to find and fix the vulnerability.
 
 ## Crash Output
 ```
 {crash_output[:8000]}
 ```
 
-## Instructions
-1. First, understand the crash by analyzing the stack trace and error message
-2. Explore the codebase to understand the context - don't limit yourself to stack trace functions
-3. Identify the root cause of the vulnerability
-4. Generate a minimal, correct patch
-5. Apply the patch using the Edit tool (writes are restricted to /src/ only)
-6. Build the project using the mcp__arvo__build tool
-7. Test the fix using the mcp__arvo__run_poc tool (runs the PoC against the built binary)
+## Your approach (follow the phases in your system prompt)
 
-IMPORTANT:
-- You can only write to files in /src/ - other directories are read-only
-- After successful verification, the task is complete
+**Phase 1 — Hypothesize:** Read the crash output above. Before exploring ANY code, write down 2-4 hypotheses about what the root cause could be. Consider both the crash site AND upstream callers.
 
-Start by analyzing the crash output and exploring the relevant source files.
+**Phase 2 — Investigate:** For each hypothesis, gather evidence from the code. Trace the data flow upstream from the crash. Check declarations, definitions, and symbols across files. Mark each hypothesis CONFIRMED or REJECTED.
+
+**Phase 3 — Patch:** Fix the confirmed root cause with a minimal edit. You can only write to files in /src/.
+
+**Phase 4 — Verify:** Build with mcp__arvo__build, then test with mcp__arvo__run_poc. If the crash persists, your hypothesis was wrong — go back to Phase 1 with new hypotheses targeting a different subsystem. Do NOT retry the same approach.
+
+Start with Phase 1: read the crash output and write your hypotheses.
 """
 
     def _process_message(self, message):

@@ -1,0 +1,150 @@
+# Backfill original (pre-patch) binary for regression analysis.
+#
+# For each case, runs a lightweight pod in the vul container image, finds the
+# fuzzer binary, and uploads it to GCS for every agent-id that has results.
+# This enables the fuzz step's regression analysis for experiments where the
+# patch step didn't upload original_binary.
+#
+# Usage:
+#   python -m cli submit-workflow backfill-original-binary.yaml \
+#     --param experiment-id=fuzz1800_all \
+#     --param cases-json='["781","783","1236",...]'
+#
+# Or via argo directly:
+#   argo submit backfill-original-binary.yaml \
+#     -p experiment-id=fuzz1800_all \
+#     -p bucket=my-bucket \
+#     -p registry=us-central1-docker.pkg.dev/project/repo \
+#     -p cases-json='["781","783"]'
+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: backfill-origbin-
+  namespace: argo
+spec:
+  entrypoint: backfill-pipeline
+  serviceAccountName: arvo-workflow-sa
+  parallelism: 50
+
+  podMetadata:
+    labels:
+      owner: "{{workflow.labels.owner}}"
+      experiment: "{{workflow.parameters.experiment-id}}"
+
+  arguments:
+    parameters:
+      - name: experiment-id
+      - name: bucket
+        value: ""
+      - name: registry
+        value: ""
+      - name: build-version
+        value: "latest"
+      - name: cases-json
+        value: "[]"
+
+  templates:
+    - name: backfill-pipeline
+      dag:
+        failFast: false
+        tasks:
+          - name: backfill-cases
+            withParam: "{{workflow.parameters.cases-json}}"
+            template: backfill-case
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{item}}"
+
+    - name: backfill-case
+      inputs:
+        parameters:
+          - name: case-id
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "work"
+          effect: "NoSchedule"
+      nodeSelector:
+        spot: "true"
+        workload-type: work
+      serviceAccountName: arvo-workflow-sa
+      activeDeadlineSeconds: 600
+      container:
+        image: "{{workflow.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{workflow.parameters.build-version}}"
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+            CASE_ID="{{inputs.parameters.case-id}}"
+            BUCKET="{{workflow.parameters.bucket}}"
+            EXPERIMENT_ID="{{workflow.parameters.experiment-id}}"
+            RESULTS_PREFIX="gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}"
+
+            # Find the fuzzer binary (same logic as agent base.py)
+            BINARY=""
+
+            # Try /bin/arvo run command first
+            if [ -f /bin/arvo ]; then
+              BINARY=$(grep -oP '(?<=exec\s|\./)[\w/.-]+' /bin/arvo 2>/dev/null | head -1)
+              # Resolve relative paths
+              if [ -n "$BINARY" ] && [ ! -f "$BINARY" ]; then
+                BINARY="/out/$BINARY"
+              fi
+              [ -f "$BINARY" ] && [ -x "$BINARY" ] || BINARY=""
+            fi
+
+            # Fallback: find executable in /out/
+            if [ -z "$BINARY" ]; then
+              BINARY=$(find /out/ -maxdepth 1 -type f -executable \
+                ! -name "*.dict" ! -name "*.options" ! -name "*.zip" ! -name "*.txt" \
+                2>/dev/null | head -1)
+            fi
+
+            if [ -z "$BINARY" ] || [ ! -f "$BINARY" ]; then
+              echo "ERROR: Could not find fuzzer binary for case ${CASE_ID}"
+              exit 1
+            fi
+
+            echo "Found binary: ${BINARY}"
+            ls -la "$BINARY"
+
+            # List all agent-id directories that have results for this case
+            AGENT_DIRS=$(gsutil ls "${RESULTS_PREFIX}/" 2>/dev/null | grep -v '/$' -v | sed 's|/$||' | xargs -I{} basename {})
+            if [ -z "$AGENT_DIRS" ]; then
+              echo "No agent results found for case ${CASE_ID}, skipping"
+              exit 0
+            fi
+
+            # Upload to each agent-id path (skip gt -- gt doesn't need regression analysis)
+            UPLOADED=0
+            SKIPPED=0
+            for AGENT_ID in $AGENT_DIRS; do
+              if [ "$AGENT_ID" = "gt" ]; then
+                continue
+              fi
+
+              DEST="${RESULTS_PREFIX}/${AGENT_ID}/original_binary"
+
+              # Skip if already exists
+              if gsutil -q stat "$DEST" 2>/dev/null; then
+                echo "  ${AGENT_ID}: already exists, skipping"
+                SKIPPED=$((SKIPPED + 1))
+                continue
+              fi
+
+              gsutil cp "$BINARY" "$DEST"
+              echo "  ${AGENT_ID}: uploaded"
+              UPLOADED=$((UPLOADED + 1))
+            done
+
+            echo "Case ${CASE_ID}: uploaded=${UPLOADED}, skipped=${SKIPPED}"
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "256Mi"
+          limits:
+            cpu: "1"
+            memory: "512Mi"

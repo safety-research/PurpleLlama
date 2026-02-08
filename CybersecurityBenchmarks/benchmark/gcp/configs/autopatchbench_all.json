@@ -141,7 +141,10 @@
     "gt",
     {"agent": "autopatchbench", "model": "claude-opus-4-5-20251101"},
     {"agent": "autopatchbench", "model": "claude-sonnet-4-5-20250929"},
-    {"agent": "autopatchbench", "model": "claude-haiku-4-5-20251001"}
+    {"agent": "autopatchbench", "model": "claude-haiku-4-5-20251001"},
+    {"agent": "claudecode", "model": "claude-opus-4-5-20251101"},
+    {"agent": "claudecode", "model": "claude-sonnet-4-5-20250929"},
+    {"agent": "claudecode", "model": "claude-haiku-4-5-20251001"}
   ],
   "fuzzing_duration": 1800,
   "fuzz_use_spot": true,

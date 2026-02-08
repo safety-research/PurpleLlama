@@ -198,6 +198,38 @@ def setup(
             else:
                 typer.echo(f"    Error: {result.stderr}")
 
+        # Create batch-work-highmem pool for memory-intensive jobs (OOM retry escalation)
+        typer.echo("  Creating batch-work-highmem pool (n4-highmem-4 for OOM retries)...")
+        result = subprocess.run(
+            [
+                "gcloud",
+                "container",
+                "node-pools",
+                "create",
+                "batch-work-highmem",
+                f"--cluster={config.cluster_name}",
+                f"--project={config.project_id}",
+                f"--zone={config.zone}",
+                "--machine-type=n4-highmem-4",
+                "--disk-type=hyperdisk-balanced",
+                "--disk-size=100",
+                "--spot",
+                "--num-nodes=0",
+                "--enable-autoscaling",
+                "--min-nodes=0",
+                "--max-nodes=20",
+                "--node-taints=workload=work:NoSchedule",
+                f"--node-labels=owner={owner},workload-type=work",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            if "already exists" in result.stderr:
+                typer.echo("    batch-work-highmem pool already exists.")
+            else:
+                typer.echo(f"    Error: {result.stderr}")
+
         # Create batch-work-nonspot pool for critical non-spot workloads
         typer.echo("  Creating batch-work-nonspot pool (n4-standard-4, non-spot for critical jobs)...")
         result = subprocess.run(

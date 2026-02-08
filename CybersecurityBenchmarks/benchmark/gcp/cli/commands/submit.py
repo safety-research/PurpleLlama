@@ -331,6 +331,7 @@ def _generate_workflow_yaml(
     # --- Build tasks ---
 
     # Check if vulnerable image already exists (Docker v2 manifests API)
+    # Outputs status="done" (skip) or status="needed" (build); continueOn is a safety net for pod crashes
     case_tasks.append(
         {
             "name": "chk-build-vul",
@@ -347,12 +348,12 @@ def _generate_workflow_yaml(
         }
     )
 
-    # Build vulnerable image (only if check failed = image doesn't exist)
+    # Build vulnerable image (only if check reports image is needed)
     case_tasks.append(
         {
             "name": "build-vul",
             "dependencies": ["chk-build-vul"],
-            "when": "{{tasks.chk-build-vul.status}} == Failed",
+            "when": '"{{tasks.chk-build-vul.outputs.parameters.status}}" == "needed"',
             "templateRef": {
                 "name": "arvo-build",
                 "template": "build-vul",
@@ -381,6 +382,7 @@ def _generate_workflow_yaml(
     )
 
     # Check if fixed image already exists (Docker v2 manifests API)
+    # Outputs status="done" (skip) or status="needed" (build); continueOn is a safety net for pod crashes
     case_tasks.append(
         {
             "name": "chk-build-fix",
@@ -397,12 +399,12 @@ def _generate_workflow_yaml(
         }
     )
 
-    # Build fixed image (only if check failed = image doesn't exist)
+    # Build fixed image (only if check reports image is needed)
     case_tasks.append(
         {
             "name": "build-fix",
             "dependencies": ["chk-build-fix"],
-            "when": "{{tasks.chk-build-fix.status}} == Failed",
+            "when": '"{{tasks.chk-build-fix.outputs.parameters.status}}" == "needed"',
             "templateRef": {
                 "name": "arvo-build",
                 "template": "build-fix",
@@ -466,7 +468,7 @@ def _generate_workflow_yaml(
             {
                 "name": f"patch-{id_safe}",
                 "dependencies": [f"chk-patch-{id_safe}"],
-                "when": f"{{{{tasks.chk-patch-{id_safe}.status}}}} == Failed",
+                "when": f'"{{{{tasks.chk-patch-{id_safe}.outputs.parameters.status}}}}" == "needed"',
                 "templateRef": {
                     "name": "arvo-patch",
                     "template": "patch-case",
@@ -535,7 +537,7 @@ def _generate_workflow_yaml(
             {
                 "name": f"fuzz-{id_safe}",
                 "dependencies": [f"chk-fuzz-{id_safe}"],
-                "when": f"{{{{tasks.chk-fuzz-{id_safe}.status}}}} == Failed",
+                "when": f'"{{{{tasks.chk-fuzz-{id_safe}.outputs.parameters.status}}}}" == "needed"',
                 "templateRef": {
                     "name": "arvo-fuzz",
                     "template": "fuzz-case",
@@ -610,7 +612,7 @@ def _generate_workflow_yaml(
             {
                 "name": "fuzz-gt",
                 "dependencies": ["chk-gt"],
-                "when": "{{tasks.chk-gt.status}} == Failed",
+                "when": '"{{tasks.chk-gt.outputs.parameters.status}}" == "needed"',
                 "templateRef": {
                     "name": "arvo-fuzz",
                     "template": "fuzz-case",
@@ -873,6 +875,36 @@ def submit(
                 typer.echo(f"  Warning: {result.stderr}")
         else:
             typer.echo("  Warning: Runtime tarball not found.")
+        typer.echo()
+
+    # Upload patch files for gtbackporter agents
+    has_backporter = any(
+        spec.agent_type == "gtbackporter" for spec in run_config.agents
+    )
+    if has_backporter and not dry_run:
+        typer.echo("Uploading patch files for gtbackporter agents...")
+        patch_dir = (
+            get_script_dir().parent.parent / "datasets" / "autopatch" / "arvo_meta"
+        )
+        uploaded = 0
+        for case_id in run_config.cases:
+            patch_file = patch_dir / f"{case_id}-patch.json"
+            if patch_file.exists():
+                result = subprocess.run(
+                    [
+                        "gsutil",
+                        "cp",
+                        str(patch_file),
+                        f"gs://{gke_config.bucket_name}/patches/{case_id}-patch.json",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    uploaded += 1
+            else:
+                typer.echo(f"  Warning: No patch file for case {case_id}")
+        typer.echo(f"  Uploaded {uploaded}/{len(run_config.cases)} patch files.")
         typer.echo()
 
     # Generate workflow YAML with case-pipeline template (withParam over cases)

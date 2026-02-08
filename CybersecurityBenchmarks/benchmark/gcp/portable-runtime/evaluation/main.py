@@ -236,6 +236,12 @@ def main() -> int:
         help="Original crash type for reproduction checking",
     )
     parser.add_argument(
+        "--original-binary-path",
+        type=str,
+        default=None,
+        help="Path to original (pre-patch) binary for regression analysis",
+    )
+    parser.add_argument(
         "--no-casr",
         action="store_true",
         help="Disable CASR deduplication",
@@ -279,6 +285,28 @@ def main() -> int:
     except Exception as e:
         LOG.exception(f"Fuzzing failed: {e}")
         return 1
+
+    # Regression analysis: compare LLM crashes against vul binary
+    if (
+        target == FuzzingTarget.LLM_PATCH
+        and args.original_binary_path
+        and result.timeline
+        and result.timeline.crashes
+    ):
+        from .casr_regression import analyze_regressions
+
+        LOG.info("Running regression analysis...")
+        regression = analyze_regressions(
+            timeline=result.timeline,
+            llm_binary_path=args.binary_path,
+            vul_binary_path=args.original_binary_path,
+            output_dir=output_dir,
+        )
+        if regression:
+            # Save regression analysis alongside other results
+            regression_file = output_dir / "regression_analysis.json"
+            regression_file.write_text(json.dumps(regression.to_dict(), indent=2))
+            LOG.info(f"Regression analysis saved to {regression_file}")
 
     # Print summary
     print_summary(result)

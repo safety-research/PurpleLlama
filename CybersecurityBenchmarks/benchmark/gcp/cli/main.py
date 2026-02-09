@@ -115,9 +115,7 @@ def cmd_status(
         "--active-only",
         help="Hide completed/skipped tasks (implies watch mode)",
     ),
-    brief: bool = typer.Option(
-        False, "-b", "--brief", help="Brief summary only"
-    ),
+    brief: bool = typer.Option(False, "-b", "--brief", help="Brief summary only"),
 ) -> None:
     """Show workflow status."""
     status.status(

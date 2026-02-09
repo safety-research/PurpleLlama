@@ -81,9 +81,9 @@ spec:
         - name: main
           resources:
             requests:
-              memory: "{{= sprig.int(retries) >= 2 ? '16G' : '6G'}}"
+              memory: "{{= sprig.int(retries) >= 1 ? '16G' : '6G'}}"
             limits:
-              memory: "{{= sprig.int(retries) >= 2 ? '28G' : '14G'}}"
+              memory: "{{= sprig.int(retries) >= 1 ? '28G' : '14G'}}"
 
       activeDeadlineSeconds: 7200
 

@@ -167,6 +167,7 @@ def setup(
                 typer.echo(f"    Error: {result.stderr}")
 
         # Create batch-work pool for 2-vCPU fuzz/patch jobs
+        # NOTE: spot=true label is REQUIRED — fuzz/patch pods use nodeSelector {spot: "true"}
         typer.echo("  Creating batch-work pool (n4-standard-4 for fuzz/patch)...")
         result = subprocess.run(
             [
@@ -187,7 +188,7 @@ def setup(
                 "--min-nodes=0",
                 "--max-nodes=200",
                 "--node-taints=workload=work:NoSchedule",
-                f"--node-labels=owner={owner},workload-type=work",
+                f"--node-labels=owner={owner},workload-type=work,spot=true",
             ],
             capture_output=True,
             text=True,
@@ -199,6 +200,8 @@ def setup(
                 typer.echo(f"    Error: {result.stderr}")
 
         # Create batch-work-highmem pool for memory-intensive jobs (OOM retry escalation)
+        # NOTE: spot=true label is REQUIRED — fuzz pods use nodeSelector {spot: "true", workload-type: work}
+        # and the autoscaler won't scale this pool without it.
         typer.echo(
             "  Creating batch-work-highmem pool (n4-highmem-4 for OOM retries)..."
         )
@@ -219,9 +222,9 @@ def setup(
                 "--num-nodes=0",
                 "--enable-autoscaling",
                 "--min-nodes=0",
-                "--max-nodes=20",
+                "--max-nodes=100",
                 "--node-taints=workload=work:NoSchedule",
-                f"--node-labels=owner={owner},workload-type=work",
+                f"--node-labels=owner={owner},workload-type=work,spot=true",
             ],
             capture_output=True,
             text=True,
@@ -677,24 +680,46 @@ data:
                 for _ in range(30):  # Wait up to 60 seconds
                     time.sleep(2)
                     result = run_kubectl(
-                        ["get", "pod", "postgres-0", "-n", "argo", "-o", "jsonpath={.status.phase}"],
+                        [
+                            "get",
+                            "pod",
+                            "postgres-0",
+                            "-n",
+                            "argo",
+                            "-o",
+                            "jsonpath={.status.phase}",
+                        ],
                         check=False,
                     )
                     if result.returncode == 0 and result.stdout.strip() == "Running":
                         # Double-check readiness
                         result = run_kubectl(
-                            ["get", "pod", "postgres-0", "-n", "argo", "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"],
+                            [
+                                "get",
+                                "pod",
+                                "postgres-0",
+                                "-n",
+                                "argo",
+                                "-o",
+                                "jsonpath={.status.conditions[?(@.type=='Ready')].status}",
+                            ],
                             check=False,
                         )
                         if result.returncode == 0 and result.stdout.strip() == "True":
                             typer.echo("  PostgreSQL is ready.")
                             break
                 else:
-                    typer.echo("  Note: PostgreSQL startup taking longer than expected.")
-                    typer.echo("       Check with: kubectl get pods -n argo -l app=postgres")
+                    typer.echo(
+                        "  Note: PostgreSQL startup taking longer than expected."
+                    )
+                    typer.echo(
+                        "       Check with: kubectl get pods -n argo -l app=postgres"
+                    )
 
                 # Restart workflow controller to pick up PostgreSQL configuration
-                typer.echo("  Restarting workflow-controller to connect to PostgreSQL...")
+                typer.echo(
+                    "  Restarting workflow-controller to connect to PostgreSQL..."
+                )
                 run_kubectl(
                     [
                         "rollout",

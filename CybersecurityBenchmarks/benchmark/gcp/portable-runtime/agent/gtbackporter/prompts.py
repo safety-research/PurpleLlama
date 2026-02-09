@@ -32,6 +32,7 @@ def _resolve_file_under_src(relative_path: str, src_root: str = "/src") -> str:
     # Fallback: return direct path and let the agent figure it out
     return direct
 
+
 GT_BACKPORTER_SYSTEM_PROMPT = """You are a code patching tool. Your task is to apply a known fix to an older version of a codebase, then build it.
 
 You will receive a diff from a later version. The line numbers and surrounding code may differ because this is an older version. Read the code to understand context, find the right location, and apply the change in a way that makes sense for the current codebase.

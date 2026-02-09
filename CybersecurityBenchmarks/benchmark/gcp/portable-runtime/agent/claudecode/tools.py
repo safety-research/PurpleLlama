@@ -178,7 +178,9 @@ async def run_poc_tool(args):
             cwd=_find_project_root(),
         )
         raw_output = result.stdout + result.stderr
-        crash_fixed = result.returncode == 0 and "ERROR: AddressSanitizer" not in raw_output
+        crash_fixed = (
+            result.returncode == 0 and "ERROR: AddressSanitizer" not in raw_output
+        )
         output = truncate_output(raw_output)
 
         # Always update agent result (store raw output for our records)

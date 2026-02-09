@@ -2,10 +2,12 @@
 Argo Workflows client wrapper.
 """
 
+import atexit
 import json
 import os
 import re
 import subprocess
+import time as _time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -83,6 +85,106 @@ def run_kubectl(args: list[str], check: bool = True) -> subprocess.CompletedProc
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
 
+# ---------------------------------------------------------------------------
+# Argo-server proxy for offloaded-node-status workflows
+# ---------------------------------------------------------------------------
+
+# Module-level port-forward process so we can clean up on exit.
+_port_forward_proc: Optional[subprocess.Popen] = None
+
+
+def _cleanup_port_forward() -> None:
+    global _port_forward_proc
+    if _port_forward_proc is not None:
+        _port_forward_proc.terminate()
+        try:
+            _port_forward_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            _port_forward_proc.kill()
+        _port_forward_proc = None
+
+
+atexit.register(_cleanup_port_forward)
+
+
+def _ensure_argo_server_proxy(port: int = 2746) -> dict[str, str]:
+    """Start a kubectl port-forward to the argo-server and return env vars
+    that make the ``argo`` CLI route through it.
+
+    The port-forward is started once and reused for the lifetime of the process.
+    Returns a dict of environment variables to pass to subprocess calls.
+    """
+    global _port_forward_proc
+
+    # If we already have a running port-forward, reuse it
+    if _port_forward_proc is not None and _port_forward_proc.poll() is None:
+        pass
+    else:
+        # Kill anything leftover on the port
+        subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True,
+        )
+
+        _port_forward_proc = subprocess.Popen(
+            [
+                "kubectl",
+                "port-forward",
+                "svc/argo-server",
+                f"{port}:{port}",
+                "-n",
+                "argo",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Give port-forward a moment to bind
+        _time.sleep(2)
+
+    # Get a short-lived token for the argo-server service account
+    token_result = run_kubectl(
+        ["create", "token", "argo-server", "-n", "argo", "--duration=10m"],
+        check=False,
+    )
+    if token_result.returncode != 0:
+        raise RuntimeError(f"Failed to create token: {token_result.stderr}")
+
+    token = token_result.stdout.strip()
+    return {
+        "ARGO_SERVER": f"localhost:{port}",
+        "ARGO_SECURE": "true",
+        "ARGO_INSECURE_SKIP_VERIFY": "true",
+        "ARGO_TOKEN": f"Bearer {token}",
+    }
+
+
+def run_argo_via_server(
+    args: list[str],
+    check: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run an ``argo`` CLI command routed through the argo-server.
+
+    Automatically sets up a port-forward and auth token so the server can
+    serve offloaded node statuses from PostgreSQL.
+    """
+    env_overrides = _ensure_argo_server_proxy()
+    env = {**os.environ, **env_overrides}
+    cmd = ["argo"] + args
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, env=env)
+
+
+def run_argo_via_server_interactive(args: list[str]) -> int:
+    """Run an argo CLI command via argo-server, inheriting stdout/stderr.
+
+    Returns the exit code.
+    """
+    env_overrides = _ensure_argo_server_proxy()
+    env = {**os.environ, **env_overrides}
+    cmd = ["argo"] + args
+    result = subprocess.run(cmd, env=env)
+    return result.returncode
+
+
 def submit_workflow(
     workflow_path: str,
     parameters: dict[str, str],
@@ -129,9 +231,23 @@ def submit_workflow(
 
 
 def get_workflow_status(name: str, namespace: str = "argo") -> Optional[WorkflowStatus]:
-    """Get status of a workflow."""
-    result = run_argo(
-        ["get", name, "-n", namespace, "-o", "json"],
+    """Get status of a workflow.
+
+    Uses kubectl to query the workflow resource directly. This avoids the
+    'offload node status is not supported' error that occurs with `argo get`
+    when nodeStatusOffLoad is enabled and the local CLI can't reach the
+    in-cluster PostgreSQL database.
+    """
+    result = run_kubectl(
+        [
+            "get",
+            "workflow",
+            name,
+            "-n",
+            namespace,
+            "-o",
+            "json",
+        ],
         check=False,
     )
     if result.returncode != 0:
@@ -275,6 +391,65 @@ def resolve_workflow_name(name: str, namespace: str = "argo") -> str:
     return resolved
 
 
+def _get_workflow_pods(workflow_name: str, namespace: str = "argo") -> list[dict]:
+    """Get pods for a workflow, classified by phase.
+
+    Returns a list of pod info dicts with keys:
+        name, template, phase, started, reason
+    """
+    result = run_kubectl(
+        [
+            "get",
+            "pods",
+            "-n",
+            namespace,
+            "-l",
+            f"workflows.argoproj.io/workflow={workflow_name}",
+            "-o",
+            "json",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+
+    try:
+        pod_data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    pods = []
+    for pod in pod_data.get("items", []):
+        pod_phase = pod.get("status", {}).get("phase", "Unknown")
+        annotations = pod.get("metadata", {}).get("annotations", {})
+        template = annotations.get("workflows.argoproj.io/template", "")
+
+        # Check container-level exit info
+        exit_reason = ""
+        for cs in pod.get("status", {}).get("containerStatuses", []):
+            terminated = cs.get("state", {}).get("terminated", {})
+            if terminated:
+                reason = terminated.get("reason", "")
+                exit_code = terminated.get("exitCode", 0)
+                if reason:
+                    exit_reason = reason
+                elif exit_code != 0:
+                    exit_reason = f"exit={exit_code}"
+
+        started_at = pod.get("status", {}).get("startTime", "")
+        pods.append(
+            {
+                "name": pod.get("metadata", {}).get("name", ""),
+                "template": template,
+                "phase": pod_phase,
+                "started": started_at[:19] if started_at else "",
+                "reason": exit_reason,
+            }
+        )
+
+    return pods
+
+
 def watch_workflow(
     name: str,
     namespace: str = "argo",
@@ -288,114 +463,111 @@ def watch_workflow(
         hide_done: If True, hide Succeeded and Skipped tasks (show only active/pending/failed)
     """
     if not hide_done:
-        # Use standard argo watch
-        subprocess.run(["argo", "watch", name, "-n", namespace])
-        return
+        # Try standard argo watch first
+        result = subprocess.run(
+            ["argo", "watch", name, "-n", namespace],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            print(result.stdout, end="")
+            return
+        if "offload node status" not in result.stderr.lower():
+            # Non-offloading error — print it
+            typer.echo(f"Error: {result.stderr.strip()}")
+            return
+        # Offloaded — retry through argo-server
+        typer.echo("Node status offloaded — routing through argo-server...")
+        rc = run_argo_via_server_interactive(["watch", name, "-n", namespace])
+        if rc == 0:
+            return
+        # Server route also failed — fall through to kubectl-based watch
 
-    # Custom watch with filtering
+    # kubectl + pod-based watch (also used for --hide-done)
     import sys
     import time
 
-    # Status symbols and colors
-    SYMBOLS = {
-        "Pending": "\033[33m◷\033[0m",  # Yellow clock
-        "Running": "\033[36m●\033[0m",  # Cyan circle
-        "Succeeded": "\033[32m✔\033[0m",  # Green check
-        "Failed": "\033[31m✖\033[0m",  # Red X
-        "Error": "\033[31m✖\033[0m",  # Red X
-        "Skipped": "\033[90m○\033[0m",  # Gray circle
-        "Omitted": "\033[90m○\033[0m",  # Gray circle
-    }
-
-    # Phases to show when hide_done is True (only truly in-progress tasks)
-    # Note: "Failed" is excluded because condition checks (chk-*) that evaluate
-    # to false are marked as Failed, but they're not really errors
-    ACTIVE_PHASES = {"Pending", "Running"}
-
     try:
         while True:
-            # Get workflow status as JSON
-            result = run_argo(
-                ["get", name, "-n", namespace, "-o", "json"],
-                check=False,
-            )
-            if result.returncode != 0:
-                typer.echo(f"Error getting workflow: {result.stderr}")
+            wf = get_workflow_status(name, namespace)
+            if not wf:
+                typer.echo(f"Error: Workflow not found: {name}")
                 raise typer.Exit(1)
 
-            try:
-                data = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                typer.echo("Error parsing workflow data")
-                raise typer.Exit(1)
+            pods = _get_workflow_pods(name, namespace)
 
-            status = data.get("status", {})
-            phase = status.get("phase", "Unknown")
-            progress = status.get("progress", "")
-            nodes = status.get("nodes", {})
-
-            # Clear screen and move cursor to top
+            # Clear screen
             sys.stdout.write("\033[2J\033[H")
             sys.stdout.flush()
 
+            # Parse progress
+            progress_parts = wf.progress.split("/") if "/" in wf.progress else []
+            completed = int(progress_parts[0]) if len(progress_parts) == 2 else 0
+            total_tasks = int(progress_parts[1]) if len(progress_parts) == 2 else 0
+            pct = f"{completed * 100 / total_tasks:.1f}%" if total_tasks > 0 else "-"
+
             # Header
-            typer.echo(f"Workflow: {name}")
-            typer.echo(f"Phase: {phase}  Progress: {progress}")
-            typer.echo(f"Mode: Hiding completed/skipped tasks (--hide-done)")
-            typer.echo("-" * 60)
+            typer.echo(
+                f"Workflow: {name}   Phase: {wf.phase}   Progress: {wf.progress} ({pct})"
+            )
+            typer.echo(f"Started:  {wf.started_at or '-'}")
 
-            # Count by phase
-            phase_counts: dict[str, int] = {}
-            active_nodes = []
+            # Progress bar
+            if total_tasks > 0:
+                bar_w = 50
+                filled = int(bar_w * completed / total_tasks)
+                bar = "\033[32m" + "#" * filled + "\033[0m" + "-" * (bar_w - filled)
+                typer.echo(f"[{bar}] {completed}/{total_tasks}")
 
-            for node_id, node in nodes.items():
-                node_phase = node.get("phase", "Unknown")
-                node_type = node.get("type", "")
-                display_name = node.get("displayName", node.get("name", node_id))
+            # Classify pods
+            running = [p for p in pods if p["phase"] == "Running"]
+            pending = [p for p in pods if p["phase"] == "Pending"]
+            failed = [p for p in pods if p["phase"] == "Failed"]
+            succeeded = sum(1 for p in pods if p["phase"] == "Succeeded")
 
-                # Count all phases
-                phase_counts[node_phase] = phase_counts.get(node_phase, 0) + 1
+            parts = []
+            if running:
+                parts.append(f"\033[36mRunning: {len(running)}\033[0m")
+            if pending:
+                parts.append(f"\033[33mPending: {len(pending)}\033[0m")
+            parts.append(f"\033[32mSucceeded: {succeeded}\033[0m")
+            if failed:
+                parts.append(f"\033[31mFailed: {len(failed)}\033[0m")
+            typer.echo(f"Pods: {' | '.join(parts)}")
+            typer.echo("-" * 70)
 
-                # Skip DAG/Steps container nodes (only show actual tasks)
-                if node_type in ("DAG", "Steps", "StepGroup"):
-                    continue
+            if running:
+                typer.echo(f"\n\033[1mRunning ({len(running)}):\033[0m")
+                for p in sorted(running, key=lambda x: x["started"])[:30]:
+                    tmpl = f"  [{p['template']}]" if p["template"] else ""
+                    typer.echo(f"  \033[36m●\033[0m {p['name']}{tmpl}  {p['started']}")
+                if len(running) > 30:
+                    typer.echo(f"  ... and {len(running) - 30} more")
 
-                # Collect active nodes
-                if node_phase in ACTIVE_PHASES:
-                    active_nodes.append((display_name, node_phase, node))
+            if pending and not hide_done:
+                typer.echo(f"\n\033[1mPending ({len(pending)}):\033[0m")
+                for p in pending[:10]:
+                    tmpl = f"  [{p['template']}]" if p["template"] else ""
+                    typer.echo(f"  \033[33m◷\033[0m {p['name']}{tmpl}")
+                if len(pending) > 10:
+                    typer.echo(f"  ... and {len(pending) - 10} more")
 
-            # Show summary line
-            summary_parts = []
-            for p in ["Running", "Pending", "Succeeded", "Failed", "Skipped"]:
-                if p in phase_counts:
-                    summary_parts.append(f"{p}: {phase_counts[p]}")
-            typer.echo(" | ".join(summary_parts))
-            typer.echo()
+            if failed:
+                typer.echo(
+                    f"\n\033[1mRecent failures ({min(len(failed), 10)}/{len(failed)}):\033[0m"
+                )
+                for p in sorted(failed, key=lambda x: x["started"], reverse=True)[:10]:
+                    reason = f"  ({p['reason']})" if p["reason"] else ""
+                    tmpl = f"  [{p['template']}]" if p["template"] else ""
+                    typer.echo(f"  \033[31m✖\033[0m {p['name']}{tmpl}{reason}")
 
-            # Show active nodes
-            if active_nodes:
-                typer.echo(f"Active tasks ({len(active_nodes)}):")
-                for display_name, node_phase, node in sorted(
-                    active_nodes, key=lambda x: x[0]
-                ):
-                    symbol = SYMBOLS.get(node_phase, "?")
-                    started = (
-                        node.get("startedAt", "")[:19] if node.get("startedAt") else ""
-                    )
-                    typer.echo(f"  {symbol} {display_name:<50} {started}")
-            else:
-                typer.echo("No active tasks.")
+            typer.echo("\nPress Ctrl+C to exit")
 
-            typer.echo()
-            typer.echo("Press Ctrl+C to exit")
-
-            # Check if workflow is done
-            if phase in ("Succeeded", "Failed", "Error"):
-                typer.echo()
-                typer.echo(f"Workflow {phase.lower()}.")
+            if wf.phase in ("Succeeded", "Failed", "Error"):
+                typer.echo(f"\nWorkflow {wf.phase.lower()}.")
                 break
 
-            time.sleep(2)
+            time.sleep(5)
 
     except KeyboardInterrupt:
         typer.echo("\nStopped watching.")

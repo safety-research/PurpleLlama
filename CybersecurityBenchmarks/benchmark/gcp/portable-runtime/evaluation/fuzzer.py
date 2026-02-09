@@ -178,6 +178,8 @@ def configure_libfuzzer_continuous_mode(
     args = [
         f"-fork={config.fork_jobs}",
         f"-max_total_time={config.duration_seconds}",
+        "-rss_limit_mb=2560",
+        "-timeout=25",
         f"-artifact_prefix={crash_dir}/",
         "-print_final_stats=1",
     ]

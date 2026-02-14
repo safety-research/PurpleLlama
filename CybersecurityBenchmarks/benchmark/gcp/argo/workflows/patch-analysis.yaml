@@ -1,0 +1,105 @@
+# Blinded pairwise patch comparison analysis workflow.
+#
+# Compares pairs of patchers across cases. No build steps -- reuses existing
+# images from the source experiment. The case-pipeline template is dynamically
+# injected by the CLI at submit time (same pattern as arvo-benchmark.yaml).
+#
+# Usage:
+#   python -m cli submit-analysis --source-experiment fuzz1800_all_0212 \
+#       --reference gt --agents cc-sonnet,cc-opus --cases 1236,9180
+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: patch-analysis-
+  namespace: argo
+spec:
+  entrypoint: analysis-pipeline
+  serviceAccountName: arvo-workflow-sa
+
+  parallelism: 200
+
+  podMetadata:
+    labels:
+      owner: "{{workflow.labels.owner}}"
+      experiment: "{{workflow.parameters.analysis-experiment}}"
+    annotations:
+      owner: "{{workflow.labels.owner}}"
+
+  arguments:
+    parameters:
+      - name: source-experiment
+        value: ""
+      - name: analysis-experiment
+        value: ""
+      - name: bucket
+        value: ""
+      - name: registry
+        value: ""
+      - name: build-version
+        value: "latest"
+      # withParam: JSON array of case objects
+      # e.g. [{"case_id":"1236","project":"wireshark"}, ...]
+      - name: cases-json
+        value: "[]"
+      - name: use-spot
+        value: "true"
+
+  templates:
+    # Main entry point: iterate over cases
+    # The case-analysis-pipeline template is injected by the CLI
+    - name: analysis-pipeline
+      dag:
+        failFast: false
+        tasks:
+          - name: process-cases
+            withParam: "{{workflow.parameters.cases-json}}"
+            template: case-analysis-pipeline
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{item.case_id}}"
+                - name: project
+                  value: "{{item.project}}"
+
+    # Completion check (same as benchmark workflow)
+    - name: check-completion
+      inputs:
+        parameters:
+          - name: bucket
+          - name: path
+      activeDeadlineSeconds: 60
+      tolerations:
+        - key: "workload"
+          operator: "Exists"
+          effect: "NoSchedule"
+      container:
+        image: busybox:1.37
+        imagePullPolicy: IfNotPresent
+        command: [sh, -c]
+        args:
+          - |
+            TOKEN="Bearer $(wget -q -O - --header 'Metadata-Flavor: Google' \
+              'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
+              | sed 's/.*"access_token":"\([^"]*\)".*/\1/')"
+            for i in 1 2 3 4 5; do
+              wget -q --spider --header "Authorization: $TOKEN" \
+                "https://storage.googleapis.com/storage/v1/b/{{inputs.parameters.bucket}}/o/{{inputs.parameters.path}}" \
+                && { echo -n done > /tmp/status; exit 0; }
+              sleep 2
+            done
+            echo -n needed > /tmp/status
+            exit 0
+        resources:
+          requests:
+            cpu: 500m
+            memory: 32Mi
+          limits:
+            cpu: "1"
+            memory: 64Mi
+      outputs:
+        parameters:
+          - name: status
+            valueFrom:
+              path: /tmp/status
+              default: "needed"

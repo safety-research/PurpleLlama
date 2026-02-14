@@ -163,6 +163,8 @@ class GtBackporterAgent(BaseAgent):
                 permission_mode="default",
                 max_turns=self.max_turns,
                 model=self.model,
+                # 100 MB buffer — avoid JSON buffer overflow on long conversations
+                max_buffer_size=100 * 1024 * 1024,
             )
 
             # Build the prompt from patch metadata

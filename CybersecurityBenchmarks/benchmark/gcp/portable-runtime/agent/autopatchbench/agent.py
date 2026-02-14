@@ -486,10 +486,16 @@ class AutoPatchBenchAgent(BaseAgent):
         result = self._run_command(["arvo"], timeout=120)
         self.result.verification_output = result.stdout + result.stderr
 
-        # Check for ASAN errors
+        # Check for ALL sanitizer crash markers (ASan, MSan, UBSan, TSan)
+        has_sanitizer_crash = (
+            "SUMMARY:" in self.result.verification_output
+            or "ERROR: AddressSanitizer" in self.result.verification_output
+            or "WARNING: MemorySanitizer" in self.result.verification_output
+            or "WARNING: ThreadSanitizer" in self.result.verification_output
+            or "runtime error:" in self.result.verification_output  # UBSan
+        )
         self.result.crash_fixed = (
-            result.returncode == 0
-            and "ERROR: AddressSanitizer" not in self.result.verification_output
+            result.returncode == 0 and not has_sanitizer_crash
         )
 
         if self.result.crash_fixed:

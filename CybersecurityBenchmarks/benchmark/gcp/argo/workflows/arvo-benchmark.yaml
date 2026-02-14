@@ -83,6 +83,7 @@ spec:
 
           # Process each case via withParam - expands to one case-pipeline per case
           # The case-pipeline template (injected by CLI) handles builds, patches, fuzz, and GT per case
+          # cases-json contains objects: [{"case_id": "1236", "project": "wireshark"}, ...]
           - name: process-cases
             dependencies: [build-casr, build-dd]
             withParam: "{{workflow.parameters.cases-json}}"
@@ -90,7 +91,9 @@ spec:
             arguments:
               parameters:
                 - name: case-id
-                  value: "{{item}}"
+                  value: "{{item.case_id}}"
+                - name: project
+                  value: "{{item.project}}"
 
     # Lightweight container check for GCS completion markers
     # Uses busybox wget to check if _SUCCESS marker exists via GCS JSON API
@@ -104,7 +107,7 @@ spec:
         parameters:
           - name: bucket
           - name: path # URL-encoded path to _SUCCESS marker
-      activeDeadlineSeconds: 60
+      activeDeadlineSeconds: 180
       tolerations:
         - key: "workload"
           operator: "Exists"
@@ -115,6 +118,9 @@ spec:
         command: [sh, -c]
         args:
           - |
+            TOKEN="Bearer $(wget -q -O - --header 'Metadata-Flavor: Google' \
+              'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
+              | sed 's/.*"access_token":"\([^"]*\)".*/\1/')"
             for i in 1 2 3 4 5; do
               wget -q --spider --header "Authorization: $TOKEN" \
                 "https://storage.googleapis.com/storage/v1/b/{{inputs.parameters.bucket}}/o/{{inputs.parameters.path}}" \
@@ -123,12 +129,6 @@ spec:
             done
             echo -n needed > /tmp/status
             exit 0
-        env:
-          - name: TOKEN
-            valueFrom:
-              secretKeyRef:
-                name: gcs-auth-token
-                key: token
         resources:
           requests:
             cpu: 500m
@@ -153,7 +153,7 @@ spec:
       inputs:
         parameters:
           - name: url # Full Docker v2 manifests URL
-      activeDeadlineSeconds: 60
+      activeDeadlineSeconds: 180
       tolerations:
         - key: "workload"
           operator: "Exists"
@@ -164,6 +164,9 @@ spec:
         command: [sh, -c]
         args:
           - |
+            TOKEN="Bearer $(wget -q -O - --header 'Metadata-Flavor: Google' \
+              'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' \
+              | sed 's/.*"access_token":"\([^"]*\)".*/\1/')"
             for i in 1 2 3 4 5; do
               wget -q -O /dev/null --header "Authorization: $TOKEN" \
                 --header "Accept: application/vnd.docker.distribution.manifest.v2+json" \
@@ -173,12 +176,6 @@ spec:
             done
             echo -n needed > /tmp/status
             exit 0
-        env:
-          - name: TOKEN
-            valueFrom:
-              secretKeyRef:
-                name: gcs-auth-token
-                key: token
         resources:
           requests:
             cpu: 500m

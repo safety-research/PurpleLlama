@@ -36,12 +36,15 @@ spec:
             arguments:
               parameters:
                 - name: case-id
-                  value: "{{item}}"
+                  value: "{{item.case_id}}"
+                - name: project
+                  value: "{{item.project}}"
 
     - name: extract-case
       inputs:
         parameters:
           - name: case-id
+          - name: project
       tolerations:
         - key: "workload"
           operator: "Equal"
@@ -57,11 +60,19 @@ spec:
             - /bin/sh
             - -c
             - |
-              SRC_DIR=$(find /src -maxdepth 2 -type d -name ".git" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
-              [ -z "$SRC_DIR" ] && SRC_DIR=$(ls -d /src/*/ 2>/dev/null | head -1)
-              cd "$SRC_DIR" || { echo "ERROR: cannot find source dir"; exit 1; }
+              # Use project name from metadata to find source dir
+              PROJECT="{{inputs.parameters.project}}"
+              SRC_DIR="/src/$PROJECT"
+
+              if [ ! -d "$SRC_DIR/.git" ]; then
+                echo "ERROR: /src/$PROJECT is not a git repo, falling back to CWD"
+                if [ -d .git ]; then SRC_DIR=$(pwd);
+                else echo "ERROR: cannot find source dir"; exit 1; fi
+              fi
+
+              cd "$SRC_DIR" || { echo "ERROR: cannot cd to source dir"; exit 1; }
               git rev-parse HEAD > /shared/vul_commit
-              basename "$SRC_DIR" > /shared/src_subdir
+              echo "$PROJECT" > /shared/src_subdir
               echo "vul_commit=$(cat /shared/vul_commit) src=$SRC_DIR"
           volumeMounts:
             - name: shared
@@ -75,8 +86,16 @@ spec:
             - -c
             - |
               VUL_COMMIT=$(cat /shared/vul_commit)
-              SRC_SUBDIR=$(cat /shared/src_subdir)
-              cd /src/$SRC_SUBDIR 2>/dev/null || cd /src/*/ 2>/dev/null || cd /src
+              PROJECT="{{inputs.parameters.project}}"
+              SRC_DIR="/src/$PROJECT"
+
+              if [ ! -d "$SRC_DIR/.git" ]; then
+                echo "ERROR: /src/$PROJECT is not a git repo, falling back to CWD"
+                if [ -d .git ]; then SRC_DIR=$(pwd);
+                else echo "ERROR: cannot find source dir"; exit 1; fi
+              fi
+
+              cd "$SRC_DIR"
               git log --format='%H %s' $VUL_COMMIT..HEAD > /shared/intermediate_commits.txt 2>/dev/null || \
                 echo "ERROR: git log failed" > /shared/intermediate_commits.txt
               git rev-parse HEAD > /shared/fix_commit_actual 2>/dev/null

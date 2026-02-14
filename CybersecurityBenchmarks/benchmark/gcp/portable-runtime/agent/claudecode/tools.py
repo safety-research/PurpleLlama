@@ -14,6 +14,7 @@ Tools:
 import logging
 import os
 import subprocess
+import uuid
 from typing import TYPE_CHECKING
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -42,30 +43,38 @@ def truncate_output(
     max_chars: int = MAX_OUTPUT_CHARS,
     head_lines: int = HEAD_LINES,
     tail_lines: int = TAIL_LINES,
+    file_hint: str | None = None,
 ) -> str:
     """Truncate large output, keeping first and last lines.
 
     Applies line-based truncation first (head + tail), then a character
     cap as a safety net.  Inserts a marker so the agent knows output
-    was truncated and can re-query with head/tail/grep if needed.
+    was truncated.
+
+    *file_hint* is an optional string (e.g. file paths) appended to the
+    truncation marker so the agent knows where to find the full output.
+    Callers are responsible for writing log files themselves.
     """
     if len(text) <= max_chars:
         return text
 
     lines = text.splitlines(keepends=True)
+
+    hint = f" {file_hint}" if file_hint else ""
+
     if len(lines) <= head_lines + tail_lines:
         # Few lines but huge chars (e.g. single very long line) — char-cap
         return (
             text[:max_chars]
-            + f"\n\n... [truncated — {len(text) - max_chars} chars omitted] ..."
+            + f"\n\n... [truncated — {len(text) - max_chars} chars omitted.{hint}] ..."
         )
 
     head = lines[:head_lines]
     tail = lines[-tail_lines:]
     omitted = len(lines) - head_lines - tail_lines
     marker = (
-        f"\n\n... [{omitted} lines omitted — output too large ({len(text)} chars). "
-        f"Use Bash with head/tail/grep to inspect specific parts.] ...\n\n"
+        f"\n\n... [{omitted} lines omitted — output too large ({len(text)} chars)."
+        f"{hint}] ...\n\n"
     )
     result = "".join(head) + marker + "".join(tail)
     # Final safety cap in case head+tail alone are huge
@@ -75,30 +84,34 @@ def truncate_output(
 
 
 # ---------------------------------------------------------------------------
-# Project root detection
+# Log-file helpers
 # ---------------------------------------------------------------------------
-# ARVO containers have $SRC=/src with a project subdirectory underneath
-# (e.g., /src/php-src/).  build.sh assumes cwd is that project directory.
-# Our tools must run from the correct cwd so that build.sh's relative paths
-# (like `pushd oniguruma`) resolve correctly.
+TOOL_LOG_DIR = "/tmp/tool_logs"
 
 
-def _find_project_root() -> str:
-    """Find the project root directory for build commands.
+def _write_log_files(
+    prefix: str,
+    stdout: str,
+    stderr: str,
+) -> tuple[str, str]:
+    """Write stdout and stderr to separate log files with a unique name.
 
-    ARVO containers set WORKDIR to the project source directory
-    (e.g., /src/php-src/).  build.sh expects to run from there.
-    We read the container's original WORKDIR from /proc/1/cwd
-    since the Claude CLI overrides cwd to /src.
+    Returns (stdout_path, stderr_path).
     """
-    try:
-        workdir = os.readlink("/proc/1/cwd")
-        if os.path.isdir(workdir):
-            return workdir
-    except OSError:
-        pass
-    # Fallback: use $SRC
-    return os.environ.get("SRC", "/src")
+    log_id = uuid.uuid4().hex[:8]
+    os.makedirs(TOOL_LOG_DIR, exist_ok=True)
+
+    stdout_path = f"{TOOL_LOG_DIR}/{prefix}_{log_id}_stdout.log"
+    stderr_path = f"{TOOL_LOG_DIR}/{prefix}_{log_id}_stderr.log"
+
+    for path, content in ((stdout_path, stdout), (stderr_path, stderr)):
+        try:
+            with open(path, "w") as f:
+                f.write(content)
+        except OSError as e:
+            LOG.warning(f"Failed to write log file {path}: {e}")
+
+    return stdout_path, stderr_path
 
 
 # Global reference to agent (set when MCP server is created)
@@ -110,6 +123,9 @@ async def build_tool(args):
     """Build the project using ARVO's compile command.
 
     Updates agent.result.build_success and agent.result.build_output.
+    Stdout and stderr are written to separate log files (UUID-named) so
+    the agent can inspect specific sections when the inline output is
+    truncated.
     """
     try:
         result = subprocess.run(
@@ -117,15 +133,25 @@ async def build_tool(args):
             capture_output=True,
             text=True,
             timeout=1800,
-            cwd=_find_project_root(),
         )
 
         build_success = result.returncode == 0
-        output = truncate_output(
+
+        # Write full stdout/stderr to separate, uniquely-named log files
+        stdout_path, stderr_path = _write_log_files(
+            "build", result.stdout, result.stderr
+        )
+        file_hint = (
+            f"Full stdout saved to {stdout_path} and stderr to {stderr_path}"
+            f" — use Read, Bash, or Grep to inspect them."
+        )
+
+        full_output = (
             f"Exit code: {result.returncode}\n\n"
             f"STDOUT:\n{result.stdout}\n\n"
             f"STDERR:\n{result.stderr}"
         )
+        output = truncate_output(full_output, file_hint=file_hint)
 
         # Update agent result
         if _agent_ref:
@@ -168,6 +194,7 @@ async def run_poc_tool(args):
     Always updates agent.result.crash_fixed and agent.result.verification_output.
     This is the single authoritative tool for testing the fix -- crash_fixed
     determines whether the patched or original binary is saved.
+    Stdout and stderr are written to separate, UUID-named log files.
     """
     try:
         result = subprocess.run(
@@ -175,13 +202,28 @@ async def run_poc_tool(args):
             capture_output=True,
             text=True,
             timeout=120,
-            cwd=_find_project_root(),
         )
         raw_output = result.stdout + result.stderr
-        crash_fixed = (
-            result.returncode == 0 and "ERROR: AddressSanitizer" not in raw_output
+        # Check for ALL sanitizer crash markers (ASan, MSan, UBSan, TSan)
+        # "SUMMARY:" is the universal marker emitted by all sanitizers.
+        has_sanitizer_crash = (
+            "SUMMARY:" in raw_output
+            or "ERROR: AddressSanitizer" in raw_output
+            or "WARNING: MemorySanitizer" in raw_output
+            or "WARNING: ThreadSanitizer" in raw_output
+            or "runtime error:" in raw_output  # UBSan
         )
-        output = truncate_output(raw_output)
+        crash_fixed = result.returncode == 0 and not has_sanitizer_crash
+
+        # Write full stdout/stderr to separate, uniquely-named log files
+        stdout_path, stderr_path = _write_log_files(
+            "run_poc", result.stdout, result.stderr
+        )
+        file_hint = (
+            f"Full stdout saved to {stdout_path} and stderr to {stderr_path}"
+            f" — use Read, Bash, or Grep to inspect them."
+        )
+        output = truncate_output(raw_output, file_hint=file_hint)
 
         # Always update agent result (store raw output for our records)
         if _agent_ref:
@@ -289,6 +331,66 @@ async def fuzz_tool(args):
         }
 
 
+@tool(
+    "reset_source",
+    "Reset ALL source code to the original unpatched state. "
+    "Use when your current approach is wrong and you want a completely fresh start. "
+    "Build artifacts are also cleared — you must rebuild after resetting.",
+    {},
+)
+async def reset_source_tool(args):
+    """Reset the source tree and build artifacts to their pristine state.
+
+    This reverts every file modification made during the current session,
+    giving the agent a fresh starting point for a new approach.  The agent's
+    conversation history and reasoning are preserved — only the filesystem
+    is reverted.
+
+    Uses the same overlay/snapshot mechanism as the inter-attempt reset.
+    """
+    if not _agent_ref:
+        return {
+            "content": [{"type": "text", "text": "Error: no agent reference"}],
+            "is_error": True,
+        }
+
+    try:
+        _agent_ref._reset_overlays()
+
+        # Reset build/verification state since source is now clean
+        _agent_ref.result.build_success = False
+        _agent_ref.result.crash_fixed = False
+        _agent_ref.result.patch_generated = False
+        _agent_ref.result.patched_file_path = ""
+
+        LOG.info("Source code reset to original state via reset_source tool")
+
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Source code has been reset to the original (unpatched) state.\n\n"
+                        "All file modifications have been reverted. "
+                        "Build artifacts have also been cleared.\n"
+                        "You now have a clean slate — start with a fresh approach.\n\n"
+                        "Next steps:\n"
+                        "1. Formulate a NEW hypothesis (different from what you already tried)\n"
+                        "2. Apply your new fix\n"
+                        "3. Rebuild with mcp__arvo__build\n"
+                        "4. Test with mcp__arvo__run_poc"
+                    ),
+                }
+            ],
+        }
+    except Exception as e:
+        LOG.exception(f"Failed to reset source: {e}")
+        return {
+            "content": [{"type": "text", "text": f"Failed to reset source: {e!s}"}],
+            "is_error": True,
+        }
+
+
 def create_arvo_mcp_server(agent: "ClaudeCodeAgent"):
     """Create the ARVO MCP server with all tools.
 
@@ -301,7 +403,7 @@ def create_arvo_mcp_server(agent: "ClaudeCodeAgent"):
     global _agent_ref
     _agent_ref = agent
 
-    tools = [build_tool, run_poc_tool]
+    tools = [build_tool, run_poc_tool, reset_source_tool]
 
     # Only include fuzz tool if enabled in agent config
     if getattr(agent, "enable_fuzzing", False):

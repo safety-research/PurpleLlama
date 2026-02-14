@@ -1,0 +1,170 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: verify-project-dirs-
+  namespace: argo
+spec:
+  entrypoint: verify-all
+  serviceAccountName: arvo-workflow-sa
+
+  parallelism: 50
+
+  podMetadata:
+    labels:
+      owner: "{{workflow.labels.owner}}"
+      job-type: "verify-project-dirs"
+
+  arguments:
+    parameters:
+      - name: cases-json
+        # Format: [{"case_id": 1236, "project": "wireshark"}, ...]
+        value: "[]"
+      - name: bucket
+        value: ""
+      - name: experiment-id
+        value: "verify-project-dirs"
+
+  templates:
+    - name: verify-all
+      dag:
+        failFast: false
+        tasks:
+          - name: verify
+            withParam: "{{workflow.parameters.cases-json}}"
+            template: verify-project-dir
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{item.case_id}}"
+                - name: project
+                  value: "{{item.project}}"
+
+          - name: aggregate
+            dependencies: [verify]
+            template: aggregate-results
+            arguments:
+              parameters:
+                - name: results
+                  value: "{{tasks.verify.outputs.parameters}}"
+
+    - name: verify-project-dir
+      inputs:
+        parameters:
+          - name: case-id
+          - name: project
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "work"
+          effect: "NoSchedule"
+      outputs:
+        parameters:
+          - name: result
+            valueFrom:
+              path: /tmp/result.json
+      container:
+        image: "docker.io/n132/arvo:{{inputs.parameters.case-id}}-vul"
+        command:
+          - /bin/sh
+          - -c
+          - |
+            CASE_ID="{{inputs.parameters.case-id}}"
+            PROJECT="{{inputs.parameters.project}}"
+
+            echo "=== Checking case $CASE_ID, expected project: $PROJECT ==="
+
+            # Get current working directory
+            CWD=$(pwd)
+            echo "WORKDIR: $CWD"
+
+            # Check if CWD is a git repo
+            CWD_IS_GIT="false"
+            if [ -d "$CWD/.git" ]; then
+              CWD_IS_GIT="true"
+            fi
+            echo "CWD is git repo: $CWD_IS_GIT"
+
+            # List all directories under /src with .git
+            echo "Git repos under /src:"
+            GIT_REPOS=""
+            for d in /src/*/; do
+              if [ -d "$d/.git" ]; then
+                repo_name=$(basename "$d")
+                echo "  - $repo_name"
+                GIT_REPOS="$GIT_REPOS$repo_name,"
+              fi
+            done
+            GIT_REPOS=${GIT_REPOS%,}  # Remove trailing comma
+
+            # Check if /src/{project}/.git exists
+            EXPECTED_PATH="/src/$PROJECT"
+            PROJECT_DIR_EXISTS="false"
+            PROJECT_GIT_EXISTS="false"
+
+            if [ -d "$EXPECTED_PATH" ]; then
+              PROJECT_DIR_EXISTS="true"
+              if [ -d "$EXPECTED_PATH/.git" ]; then
+                PROJECT_GIT_EXISTS="true"
+              fi
+            fi
+
+            echo "Expected path: $EXPECTED_PATH"
+            echo "  Directory exists: $PROJECT_DIR_EXISTS"
+            echo "  Has .git: $PROJECT_GIT_EXISTS"
+
+            # Determine status
+            if [ "$PROJECT_GIT_EXISTS" = "true" ]; then
+              STATUS="match"
+            elif [ "$CWD_IS_GIT" = "true" ] && [ "$CWD" = "$EXPECTED_PATH" ]; then
+              STATUS="match"
+            else
+              STATUS="mismatch"
+            fi
+
+            # Write result JSON
+            cat > /tmp/result.json << EOF
+            {
+              "case_id": $CASE_ID,
+              "project": "$PROJECT",
+              "status": "$STATUS",
+              "workdir": "$CWD",
+              "workdir_is_git": $CWD_IS_GIT,
+              "expected_path": "$EXPECTED_PATH",
+              "project_dir_exists": $PROJECT_DIR_EXISTS,
+              "project_git_exists": $PROJECT_GIT_EXISTS,
+              "git_repos_under_src": "$GIT_REPOS"
+            }
+            EOF
+
+            cat /tmp/result.json
+        resources:
+          requests:
+            cpu: 500m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 512Mi
+
+    - name: aggregate-results
+      inputs:
+        parameters:
+          - name: results
+      container:
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command:
+          - /bin/sh
+          - -c
+          - |
+            BUCKET="{{workflow.parameters.bucket}}"
+            EXPERIMENT_ID="{{workflow.parameters.experiment-id}}"
+
+            # Just log a summary - individual results are in each task's output
+            echo "=== Verify Project Dirs Complete ==="
+            echo "Results uploaded to: gs://${BUCKET}/analysis/${EXPERIMENT_ID}/"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi

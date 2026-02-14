@@ -116,10 +116,10 @@ def setup(
                 f"--project={config.project_id}",
                 f"--zone={config.zone}",
                 "--num-nodes=1",
-                "--machine-type=e2-small",
+                "--machine-type=e2-medium",
                 "--enable-autoscaling",
                 "--min-nodes=1",
-                "--max-nodes=3",
+                "--max-nodes=5",
                 f"--workload-pool={config.project_id}.svc.id.goog",
                 f"--labels=owner={owner}",
             ],
@@ -153,7 +153,7 @@ def setup(
                 "--num-nodes=0",
                 "--enable-autoscaling",
                 "--min-nodes=0",
-                "--max-nodes=200",
+                "--max-nodes=400",
                 "--node-taints=workload=build:NoSchedule",
                 f"--node-labels=owner={owner},workload-type=build",
             ],
@@ -186,7 +186,7 @@ def setup(
                 "--num-nodes=0",
                 "--enable-autoscaling",
                 "--min-nodes=0",
-                "--max-nodes=200",
+                "--max-nodes=400",
                 "--node-taints=workload=work:NoSchedule",
                 f"--node-labels=owner={owner},workload-type=work,spot=true",
             ],
@@ -222,7 +222,7 @@ def setup(
                 "--num-nodes=0",
                 "--enable-autoscaling",
                 "--min-nodes=0",
-                "--max-nodes=100",
+                "--max-nodes=200",
                 "--node-taints=workload=work:NoSchedule",
                 f"--node-labels=owner={owner},workload-type=work,spot=true",
             ],
@@ -255,7 +255,7 @@ def setup(
                 "--num-nodes=0",
                 "--enable-autoscaling",
                 "--min-nodes=0",
-                "--max-nodes=200",
+                "--max-nodes=400",
                 "--node-taints=workload=work:NoSchedule",
                 f"--node-labels=owner={owner},workload-type=work,spot=false",
             ],
@@ -265,6 +265,40 @@ def setup(
         if result.returncode != 0:
             if "already exists" in result.stderr:
                 typer.echo("    batch-work-nonspot pool already exists.")
+            else:
+                typer.echo(f"    Error: {result.stderr}")
+
+        # Create batch-work-nonspot-highmem pool for memory-intensive non-spot jobs (patch OOM retries)
+        # NOTE: spot=false label is REQUIRED — patch pods with use-spot=false need this
+        typer.echo(
+            "  Creating batch-work-nonspot-highmem pool (n4-highmem-4, non-spot for OOM retries)..."
+        )
+        result = subprocess.run(
+            [
+                "gcloud",
+                "container",
+                "node-pools",
+                "create",
+                "batch-work-nonspot-highmem",
+                f"--cluster={config.cluster_name}",
+                f"--project={config.project_id}",
+                f"--zone={config.zone}",
+                "--machine-type=n4-highmem-4",
+                "--disk-type=hyperdisk-balanced",
+                "--disk-size=100",
+                "--num-nodes=0",
+                "--enable-autoscaling",
+                "--min-nodes=0",
+                "--max-nodes=200",
+                "--node-taints=workload=work:NoSchedule",
+                f"--node-labels=owner={owner},workload-type=work,spot=false",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            if "already exists" in result.stderr:
+                typer.echo("    batch-work-nonspot-highmem pool already exists.")
             else:
                 typer.echo(f"    Error: {result.stderr}")
 
@@ -574,73 +608,6 @@ data:
         check=False,
     )
 
-    # Set up GCS token refresh infrastructure for HTTP-based completion checks
-    # This replaces Argo memoization with sub-second GCS API calls
-    typer.echo()
-    typer.echo("[11/12] Setting up GCS token refresh for completion checks...")
-    infra_dir = get_script_dir() / "argo" / "infra"
-    if infra_dir.exists():
-        result = run_kubectl(
-            ["apply", "-f", str(infra_dir), "-n", "argo"],
-            check=False,
-        )
-        if result.returncode == 0:
-            typer.echo("  Token refresh CronJob and RBAC installed.")
-        else:
-            typer.echo(f"  Warning: Could not apply infra: {result.stderr}")
-
-        # Seed initial token by triggering the CronJob immediately
-        typer.echo("  Seeding initial GCS auth token...")
-        run_kubectl(
-            [
-                "create",
-                "job",
-                "--from=cronjob/gcs-token-refresh",
-                "gcs-token-seed",
-                "-n",
-                "argo",
-            ],
-            check=False,
-        )
-        # Wait for the job to complete (needs to pull image first time)
-        typer.echo("  Waiting for token seed job (may take up to 60s on first run)...")
-        for _ in range(12):  # Wait up to 60 seconds
-            time.sleep(5)
-            result = run_kubectl(
-                ["get", "secret", "gcs-auth-token", "-n", "argo"],
-                check=False,
-            )
-            if result.returncode == 0:
-                typer.echo("  GCS auth token created successfully.")
-                break
-        else:
-            typer.echo(
-                "  Note: Token will be created when CronJob runs (within 30 min)."
-            )
-    else:
-        typer.echo(f"  Warning: Infra directory not found at {infra_dir}")
-
-    # Patch argo-cluster-role to add workflowtasksets/status permission (needed for HTTP templates)
-    typer.echo()
-    typer.echo("[12/13] Patching Argo RBAC for HTTP templates...")
-    result = run_kubectl(
-        [
-            "patch",
-            "clusterrole",
-            "argo-cluster-role",
-            "--type=json",
-            '-p=[{"op": "add", "path": "/rules/-", "value": {"apiGroups": ["argoproj.io"], "resources": ["workflowtasksets/status"], "verbs": ["get", "patch", "update"]}}]',
-        ],
-        check=False,
-    )
-    if result.returncode == 0:
-        typer.echo("  Argo cluster role patched.")
-    else:
-        # Might already have the permission, check if it's already there
-        typer.echo(
-            "  Argo cluster role already has required permissions (or patch failed)."
-        )
-
     # Patch arvo-workflow-role to add workflowtaskresults permission (needed for emissary executor)
     result = run_kubectl(
         [
@@ -664,7 +631,7 @@ data:
     # Set up PostgreSQL for node status offloading
     if not skip_argo:
         typer.echo()
-        typer.echo("[13/13] Setting up PostgreSQL for workflow offloading...")
+        typer.echo("[11/11] Setting up PostgreSQL for workflow offloading...")
         infra_dir = get_script_dir() / "argo" / "infra"
         postgres_yaml = infra_dir / "postgres.yaml"
         if postgres_yaml.exists():

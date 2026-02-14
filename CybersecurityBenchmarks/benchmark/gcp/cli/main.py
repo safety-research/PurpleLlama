@@ -25,6 +25,7 @@ from .commands import (
     setup,
     status,
     submit,
+    submit_analysis,
 )
 
 app = typer.Typer(
@@ -98,6 +99,70 @@ def cmd_submit(
         upload_runtime=upload_runtime,
         check_deps=check_deps,
         auto_build_deps=auto_build_deps,
+        dry_run=dry_run,
+    )
+
+
+# Submit analysis command
+@app.command("submit-analysis")
+def cmd_submit_analysis(
+    source_experiment: str = typer.Option(
+        ..., "--source-experiment", "-s", help="Source experiment with patch results"
+    ),
+    cases: str = typer.Option(None, help="Case IDs: '42,43', '42-50', or '@file.json'"),
+    reference: Optional[str] = typer.Option(
+        None,
+        "--reference",
+        "-r",
+        help="Reference patcher to compare each agent against (e.g. 'gt')",
+    ),
+    pairwise: bool = typer.Option(
+        False, "--pairwise", help="Compare all agents pairwise"
+    ),
+    pairs: Optional[str] = typer.Option(
+        None, "--pairs", help="Explicit pairs: 'agent1:agent2,agent3:gt'"
+    ),
+    agents: Optional[str] = typer.Option(
+        None, "--agents", "-a", help="Comma-separated agent IDs"
+    ),
+    analysis_experiment: Optional[str] = typer.Option(
+        None, "--experiment", "-e", help="Analysis experiment ID"
+    ),
+    analysis_model: str = typer.Option(
+        "claude-sonnet-4-5-20250929", "--model", "-m", help="Analysis model"
+    ),
+    max_runtime_seconds: int = typer.Option(
+        1800, "--max-runtime", help="Max runtime per analysis (seconds)"
+    ),
+    thinking_budget: Optional[int] = typer.Option(
+        None, "--thinking-budget", help="Extended thinking token budget"
+    ),
+    build_version: str = typer.Option(
+        "latest", "--build-version", help="Docker image build version tag"
+    ),
+    config_file: Optional[str] = typer.Option(
+        None, "--config", "-c", help="Config file (JSON)"
+    ),
+    use_spot: bool = typer.Option(True, "--spot/--no-spot", help="Use spot instances"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be submitted"
+    ),
+) -> None:
+    """Submit a blinded pairwise patch comparison analysis workflow."""
+    submit_analysis.submit_analysis(
+        source_experiment=source_experiment,
+        cases=cases,
+        reference=reference,
+        pairwise=pairwise,
+        pairs=pairs,
+        agents=agents,
+        analysis_experiment=analysis_experiment,
+        analysis_model=analysis_model,
+        max_runtime_seconds=max_runtime_seconds,
+        thinking_budget=thinking_budget,
+        build_version=build_version,
+        config_file=Path(config_file) if config_file else None,
+        use_spot=use_spot,
         dry_run=dry_run,
     )
 

@@ -12,6 +12,11 @@ spec:
           - name: build-version
           - name: bucket
           - name: registry
+          # Optional: override the vul base image (for closest-vul mode).
+          # When empty (default), uses upstream docker.io/n132/arvo:{case-id}-vul.
+          # When set, uses the specified image (e.g. registry closest-vul image).
+          - name: vul-base-image
+            default: ""
       # NOTE: Memoization removed - image existence is checked via HTTP check-image
       # template in the DAG (Docker v2 manifests API) to avoid memoized retry nodes
       # creating empty children arrays that break assessDAGPhase BFS traversal.
@@ -79,8 +84,17 @@ spec:
               gsutil cp gs://${BUCKET}/build-assets/dockerfile_vul_template /workspace/
               gsutil cp -r gs://${BUCKET}/build-assets/libfuzzer-modern/ /workspace/ || true
 
+              # Determine vul base image (default: upstream, or override for closest-vul)
+              VUL_BASE_IMAGE="{{inputs.parameters.vul-base-image}}"
+              if [ -z "$VUL_BASE_IMAGE" ]; then
+                VUL_BASE_IMAGE="docker.io/n132/arvo:${CASE_ID}-vul"
+              fi
+              echo "Vul base image: $VUL_BASE_IMAGE"
+
               # Generate Dockerfile from template
-              sed "s|{ARVO_ID}|${CASE_ID}|g" /workspace/dockerfile_vul_template > /workspace/Dockerfile
+              sed -e "s|{ARVO_ID}|${CASE_ID}|g" \
+                  -e "s|{VUL_BASE_IMAGE}|${VUL_BASE_IMAGE}|g" \
+                  /workspace/dockerfile_vul_template > /workspace/Dockerfile
           volumeMounts:
             - name: workspace
               mountPath: /workspace

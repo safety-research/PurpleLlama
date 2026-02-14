@@ -1,0 +1,373 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: find-closest-vul-
+  namespace: argo
+spec:
+  entrypoint: find-all
+  serviceAccountName: arvo-workflow-sa
+
+  parallelism: 50
+
+  podMetadata:
+    labels:
+      owner: "{{workflow.labels.owner}}"
+      job-type: "find-closest-vul"
+
+  arguments:
+    parameters:
+      - name: cases-json
+        value: "[]"
+      - name: bucket
+        value: ""
+      - name: registry
+        value: ""
+      - name: build-version
+        value: "latest"
+
+  templates:
+    - name: find-all
+      dag:
+        failFast: false
+        tasks:
+          - name: find
+            withParam: "{{workflow.parameters.cases-json}}"
+            template: find-case
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{item.id}}"
+                - name: fix-commits-csv
+                  value: "{{item.fix_commits}}"
+                - name: project
+                  value: "{{item.project}}"
+
+    - name: find-case
+      inputs:
+        parameters:
+          - name: case-id
+          - name: fix-commits-csv
+          - name: project
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "work"
+          effect: "NoSchedule"
+      nodeSelector:
+        workload-type: work
+      initContainers:
+        # Step 1: Get vul commit hash and date from upstream -vul image
+        - name: get-vul-commit
+          image: "docker.io/n132/arvo:{{inputs.parameters.case-id}}-vul"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # Use project name from metadata to find source dir
+              PROJECT="{{inputs.parameters.project}}"
+              SRC_DIR="/src/$PROJECT"
+
+              # Verify the project directory exists and is a git repo
+              if [ ! -d "$SRC_DIR/.git" ]; then
+                echo "ERROR: /src/$PROJECT is not a git repo, falling back to CWD"
+                if [ -d .git ]; then SRC_DIR=$(pwd);
+                else echo "ERROR: cannot find source dir"; exit 1; fi
+              fi
+
+              cd "$SRC_DIR" || { echo "ERROR: cannot cd to source dir"; exit 1; }
+              git rev-parse HEAD > /shared/vul_commit
+              git log -1 --format='%ci' HEAD > /shared/vul_date
+              echo "$PROJECT" > /shared/src_subdir
+              echo "vul_commit=$(cat /shared/vul_commit) vul_date=$(cat /shared/vul_date) src=$SRC_DIR"
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+        # Step 2: Search backwards from K-1 towards A for first compiling commit
+        - name: search-closest-vul
+          image: "docker.io/n132/arvo:{{inputs.parameters.case-id}}-fix"
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -uo pipefail
+
+              CASE_ID="{{inputs.parameters.case-id}}"
+              FIX_COMMITS_CSV="{{inputs.parameters.fix-commits-csv}}"
+              PROJECT="{{inputs.parameters.project}}"
+
+              VUL_COMMIT=$(cat /shared/vul_commit)
+              VUL_DATE=$(cat /shared/vul_date)
+
+              # Use project name from metadata to find source dir
+              SRC_DIR="/src/$PROJECT"
+              if [ ! -d "$SRC_DIR/.git" ]; then
+                echo "ERROR: /src/$PROJECT is not a git repo"
+                echo '{"status":"error","reason":"no_source_dir","case_id":"'"$CASE_ID"'"}' > /shared/result.json
+                exit 0
+              fi
+              cd "$SRC_DIR"
+
+              echo "Found source dir: $SRC_DIR"
+
+              B_COMMIT=$(git rev-parse HEAD)
+
+              # Deepen shallow clone if needed to reach VUL_COMMIT
+              if ! git cat-file -e $VUL_COMMIT 2>/dev/null; then
+                echo "VUL_COMMIT not in history, fetching since $VUL_DATE..."
+                git fetch --shallow-since="$VUL_DATE" origin 2>/dev/null || true
+              fi
+
+              echo "=== Find Closest Vul Commit ==="
+              echo "Case: $CASE_ID"
+              echo "A (vul): $VUL_COMMIT"
+              echo "B (fix/HEAD): $B_COMMIT"
+              echo "Fix commits: $FIX_COMMITS_CSV"
+
+              # Set short fuzzing time for crash testing
+              sed -i 's|export FUZZER_ARGS="[^"]*"|export FUZZER_ARGS="-rss_limit_mb=2560 -timeout=25 -max_total_time=15"|' /bin/arvo
+
+              # Write fix commits to a temp file for grep
+              FIX_FILE=$(mktemp)
+              echo "$FIX_COMMITS_CSV" | tr ',' '\n' > "$FIX_FILE"
+
+              # Find K = earliest fix commit in git history between A and B
+              # git log outputs newest-first, so the LAST matching fix commit is earliest
+              K_COMMIT=$(git log --format='%H' ${VUL_COMMIT}..HEAD | grep -F -f "$FIX_FILE" | tail -1 || echo "")
+              rm -f "$FIX_FILE"
+
+              if [ -z "$K_COMMIT" ]; then
+                K_COMMIT="$B_COMMIT"
+                echo "WARNING: No fix commits found in range A..B, using B as K"
+              fi
+
+              echo "K (earliest fix): $K_COMMIT"
+
+              # Count distances
+              K_TO_B=$(git rev-list --count ${K_COMMIT}..${B_COMMIT} 2>/dev/null || echo "0")
+              A_TO_K=$(git rev-list --count ${VUL_COMMIT}..${K_COMMIT} 2>/dev/null || echo "0")
+              echo "Distance A->K: $A_TO_K commits"
+              echo "Distance K->B: $K_TO_B commits"
+
+              # Get parent of K
+              K_PARENT=$(git rev-parse ${K_COMMIT}~1 2>/dev/null || echo "")
+              if [ -z "$K_PARENT" ]; then
+                # K has no parent (root commit) -- A is the closest vul commit
+                C_TO_B=$(git rev-list --count ${VUL_COMMIT}..${B_COMMIT} 2>/dev/null || echo "-1")
+                echo "K has no parent -- using A as commit C"
+                cat > /shared/result.json <<EOFJ
+              {
+                "status": "found",
+                "case_id": "$CASE_ID",
+                "vul_commit": "$VUL_COMMIT",
+                "vul_date": "$VUL_DATE",
+                "fix_commit": "$B_COMMIT",
+                "earliest_fix_commit": "$K_COMMIT",
+                "closest_vul_commit": "$VUL_COMMIT",
+                "distance_c_to_b": $C_TO_B,
+                "distance_c_to_k": 0,
+                "distance_k_to_b": $K_TO_B,
+                "attempts": 0,
+                "total_candidates": 0,
+                "crash_verified": true
+              }
+              EOFJ
+                exit 0
+              fi
+
+              # Get commits from A (exclusive) to K-1 (inclusive), newest-first
+              COMMITS=$(git rev-list ${VUL_COMMIT}..${K_PARENT} 2>/dev/null || echo "")
+              TOTAL_CANDIDATES=$(echo "$COMMITS" | grep -c . 2>/dev/null || echo "0")
+              [ -z "$COMMITS" ] && TOTAL_CANDIDATES=0
+              echo "Total candidate commits (A to K-1): $TOTAL_CANDIDATES"
+
+              if [ "$TOTAL_CANDIDATES" -eq 0 ]; then
+                # K is adjacent to A -- A itself is the closest vul commit
+                C_TO_B=$(git rev-list --count ${VUL_COMMIT}..${B_COMMIT} 2>/dev/null || echo "-1")
+                C_TO_K=$(git rev-list --count ${VUL_COMMIT}..${K_COMMIT} 2>/dev/null || echo "-1")
+                echo "K is adjacent to A -- using A as commit C"
+                echo "C (=A): $VUL_COMMIT"
+                echo "C->B: $C_TO_B commits, C->K: $C_TO_K commits"
+                cat > /shared/result.json <<EOFJ
+              {
+                "status": "found",
+                "case_id": "$CASE_ID",
+                "vul_commit": "$VUL_COMMIT",
+                "vul_date": "$VUL_DATE",
+                "fix_commit": "$B_COMMIT",
+                "earliest_fix_commit": "$K_COMMIT",
+                "closest_vul_commit": "$VUL_COMMIT",
+                "distance_c_to_b": $C_TO_B,
+                "distance_c_to_k": $C_TO_K,
+                "distance_k_to_b": $K_TO_B,
+                "attempts": 0,
+                "total_candidates": 0,
+                "crash_verified": true
+              }
+              EOFJ
+                exit 0
+              fi
+
+              # Walk through commits (newest-first = closest to B first)
+              MAX_ATTEMPTS=10
+              ATTEMPTS=0
+              C_COMMIT=""
+              FOUND=false
+
+              for commit in $COMMITS; do
+                if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
+                  echo "Hit max attempts ($MAX_ATTEMPTS), stopping"
+                  break
+                fi
+                ATTEMPTS=$((ATTEMPTS + 1))
+
+                echo ""
+                echo "=== Attempt $ATTEMPTS/$MAX_ATTEMPTS: ${commit:0:12} ==="
+
+                # Checkout
+                if ! git checkout "$commit" --force 2>/dev/null; then
+                  echo "SKIP: checkout failed"
+                  continue
+                fi
+
+                # Delete old binaries to force rebuild
+                find /out -maxdepth 1 -type f \( -name '*fuzz*' -o -name '*fuzzer*' \) -executable -delete 2>/dev/null || true
+
+              # Try to compile (30 minute timeout)
+              echo "Compiling..."
+              if ! timeout 1800 arvo compile >/dev/null 2>&1; then
+                  echo "COMPILE: failed"
+                  continue
+                fi
+                echo "COMPILE: success"
+
+                # Test for crash (30 second timeout, fuzzer has 15s max_total_time)
+                echo "Testing for crash..."
+                timeout 30 arvo >/dev/null 2>&1
+                CRASH_EXIT=$?
+
+                # Exit 0 = no crash, 124 = timeout (no crash in time), other = crash
+                if [ $CRASH_EXIT -ne 0 ] && [ $CRASH_EXIT -ne 124 ]; then
+                  echo "CRASH: confirmed (exit $CRASH_EXIT)! This is commit C"
+                  C_COMMIT="$commit"
+                  FOUND=true
+                  break
+                else
+                  echo "NO CRASH: exit $CRASH_EXIT -- first compiling commit did not crash"
+                  C_COMMIT="$commit"
+                  FOUND=false
+                  break
+                fi
+              done
+
+              # Write result
+              if [ "$FOUND" = true ]; then
+                C_TO_B=$(git rev-list --count ${C_COMMIT}..${B_COMMIT} 2>/dev/null || echo "-1")
+                C_TO_K=$(git rev-list --count ${C_COMMIT}..${K_COMMIT} 2>/dev/null || echo "-1")
+                echo ""
+                echo "=== RESULT: FOUND ==="
+                echo "C: $C_COMMIT"
+                echo "C->B: $C_TO_B commits, C->K: $C_TO_K commits"
+
+                cat > /shared/result.json <<EOFJ
+              {
+                "status": "found",
+                "case_id": "$CASE_ID",
+                "vul_commit": "$VUL_COMMIT",
+                "vul_date": "$VUL_DATE",
+                "fix_commit": "$B_COMMIT",
+                "earliest_fix_commit": "$K_COMMIT",
+                "closest_vul_commit": "$C_COMMIT",
+                "distance_c_to_b": $C_TO_B,
+                "distance_c_to_k": $C_TO_K,
+                "distance_k_to_b": $K_TO_B,
+                "attempts": $ATTEMPTS,
+                "total_candidates": $TOTAL_CANDIDATES,
+                "crash_verified": true
+              }
+              EOFJ
+
+              elif [ -n "$C_COMMIT" ]; then
+                C_TO_B=$(git rev-list --count ${C_COMMIT}..${B_COMMIT} 2>/dev/null || echo "-1")
+                echo ""
+                echo "=== RESULT: FAILED (no crash) ==="
+                echo "First compiling commit $C_COMMIT did not crash on PoC"
+
+                cat > /shared/result.json <<EOFJ
+              {
+                "status": "failed_no_crash",
+                "case_id": "$CASE_ID",
+                "vul_commit": "$VUL_COMMIT",
+                "vul_date": "$VUL_DATE",
+                "fix_commit": "$B_COMMIT",
+                "earliest_fix_commit": "$K_COMMIT",
+                "closest_vul_commit": "$C_COMMIT",
+                "distance_c_to_b": $C_TO_B,
+                "attempts": $ATTEMPTS,
+                "total_candidates": $TOTAL_CANDIDATES,
+                "crash_verified": false
+              }
+              EOFJ
+
+              else
+                # Tried $ATTEMPTS of $TOTAL_CANDIDATES candidates, none compiled -- give up
+                echo ""
+                echo "=== RESULT: FAILED (no compile) ==="
+                echo "Tried $ATTEMPTS of $TOTAL_CANDIDATES candidates, none compiled"
+
+                cat > /shared/result.json <<EOFJ
+              {
+                "status": "failed_no_compile",
+                "case_id": "$CASE_ID",
+                "vul_commit": "$VUL_COMMIT",
+                "vul_date": "$VUL_DATE",
+                "fix_commit": "$B_COMMIT",
+                "earliest_fix_commit": "$K_COMMIT",
+                "distance_k_to_b": $K_TO_B,
+                "attempts": $ATTEMPTS,
+                "total_candidates": $TOTAL_CANDIDATES
+              }
+              EOFJ
+              fi
+
+              echo ""
+              echo "Result:"
+              cat /shared/result.json
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+          resources:
+            requests:
+              cpu: "1.7"
+              memory: 6G
+            limits:
+              cpu: "3.5"
+              memory: 12G
+
+      # Main container: upload results to GCS
+      container:
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command:
+          - /bin/sh
+          - -c
+          - |
+            CASE_ID="{{inputs.parameters.case-id}}"
+            BUCKET="{{workflow.parameters.bucket}}"
+            GCS_PREFIX="gs://${BUCKET}/analysis/closest_vul/${CASE_ID}"
+            gsutil cp /shared/result.json ${GCS_PREFIX}/result.json
+            echo "Uploaded to ${GCS_PREFIX}/result.json"
+        volumeMounts:
+          - name: shared
+            mountPath: /shared
+            readOnly: true
+        resources:
+          requests:
+            cpu: "0.5"
+            memory: 512M
+          limits:
+            cpu: "1"
+            memory: 1G
+
+      volumes:
+        - name: shared
+          emptyDir: {}

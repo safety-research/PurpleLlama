@@ -9,20 +9,20 @@ more powerful than the baseline autopatchbench agent.
 import json
 import logging
 import os
+import time
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
-    TextBlock,
-    ToolResultBlock,
     ToolUseBlock,
 )
 
 from ..base import AgentResult, AgentStatus, BaseAgent
 from .permissions import restrict_file_writes
-from .prompts import ARVO_SYSTEM_PROMPT
+from .prompts import get_project_source_path, get_system_prompt
+from .retry_tracker import RetryTimeTracker
 from .tools import create_arvo_mcp_server
 
 LOG = logging.getLogger(__name__)
@@ -50,7 +50,13 @@ class ClaudeCodeAgent(BaseAgent):
     - conversation.json full structured interaction history (via _save_additional_results)
 
     Configurable parameters (flow through from AGENT_CONFIG JSON via **kwargs):
-    - max_turns (int): Max agentic loop iterations (default: 100)
+    - max_turns (int): Max agentic loop iterations, safety net (default: 500)
+    - max_runtime_seconds (int): Max active runtime in seconds (default: 3600 = 1 hour)
+        Time spent on API retries (529 overloaded) is excluded from this budget.
+    - thinking_budget (int): Max tokens for extended thinking (default: None = disabled).
+        When set, enables extended thinking with the specified token budget.
+        Recommended values: 8000-32000 for most tasks. For Claude Opus 4.6, consider
+        using higher values as it supports adaptive thinking.
     - enable_fuzzing (bool): Whether to expose the fork-mode fuzzer tool (default: False)
     - fuzz_duration (int): Seconds to run fork-mode fuzzing when enabled (default: 60)
     """
@@ -63,20 +69,30 @@ class ClaudeCodeAgent(BaseAgent):
         output_dir,
         model=None,
         dry_run=False,
-        max_retries=10,
-        max_turns=100,
+        max_retries=3,
+        max_turns=500,
+        max_runtime_seconds=3600,
+        thinking_budget=None,
         enable_fuzzing=False,
         fuzz_duration=60,
+        escalation_timeout=1800,
         **kwargs,
     ):
         super().__init__(case_id, output_dir, model, dry_run, max_retries)
         # These flow through from AGENT_CONFIG JSON via **kwargs
         self.max_turns = max_turns
+        self.max_runtime_seconds = max_runtime_seconds
+        self.thinking_budget = thinking_budget
         self.enable_fuzzing = enable_fuzzing
         self.fuzz_duration = fuzz_duration
+        self.escalation_timeout = escalation_timeout
 
         # Full structured conversation log (serialized to conversation.json)
         self._conversation_messages: list[dict] = []
+
+        # Retry time tracking (accumulated across all sessions within a run)
+        self._total_excluded_retry_seconds: float = 0.0
+        self._total_retry_count: int = 0
 
         # Get CLI path from environment or use default
         self.cli_path = os.environ.get(
@@ -94,6 +110,7 @@ class ClaudeCodeAgent(BaseAgent):
         try:
             LOG.info(f"Starting ClaudeCode agent for case {self.case_id}")
             self.result.status = AgentStatus.RUNNING
+            self.result.escalation_timeout = self.escalation_timeout
 
             # 0. Set up overlayfs for instant source revert between retries
             self._setup_overlays()
@@ -161,17 +178,36 @@ class ClaudeCodeAgent(BaseAgent):
             self.result.status = AgentStatus.FAILED
             self.result.exception = str(e)
         finally:
+            # Capture binary and patch diff BEFORE tearing down overlays.
+            # The overlay upper layer contains all source modifications; once
+            # unmounted, `git diff` sees the pristine lower layer and returns
+            # nothing.  _save_binary_for_fuzzing() also needs the patched
+            # binary in /out/ which lives on the overlay.
+            self._save_binary_for_fuzzing()
+            self._generate_patch_diff()
             self._teardown_overlays()
 
-        # _finalize_and_save() calls _save_binary_for_fuzzing() and
-        # _generate_patch_diff() which handle binary + patch output
+        # Populate retry statistics in result
+        self.result.excluded_retry_seconds = self._total_excluded_retry_seconds
+        self.result.api_retry_count = self._total_retry_count
+
         return self._finalize_and_save()
 
     async def _run_agentic_session(self, crash_output: str) -> bool:
         """Run a single Claude Code agentic session.
 
         Returns True if the crash was fixed by the end of the session.
+
+        Time budget enforcement:
+        - Tracks wall-clock time and excludes API retry time (529 errors)
+        - Interrupts the agent if active runtime exceeds max_runtime_seconds
+        - max_turns serves as a safety net (should rarely be hit)
         """
+        # Create retry tracker for this session
+        retry_tracker = RetryTimeTracker()
+        session_start = time.monotonic()
+        timeout_triggered = False
+
         # Create custom MCP tools for ARVO operations
         arvo_server = create_arvo_mcp_server(self)
 
@@ -185,13 +221,14 @@ class ClaudeCodeAgent(BaseAgent):
             "Bash",
             "mcp__arvo__build",
             "mcp__arvo__run_poc",
+            "mcp__arvo__reset_source",
         ]
         if self.enable_fuzzing:
             allowed_tools.append("mcp__arvo__fuzz")
 
         options = ClaudeAgentOptions(
             cli_path=self.cli_path,
-            system_prompt=ARVO_SYSTEM_PROMPT,
+            system_prompt=get_system_prompt(),
             cwd="/src",
             allowed_tools=allowed_tools,
             mcp_servers={"arvo": arvo_server},
@@ -199,16 +236,60 @@ class ClaudeCodeAgent(BaseAgent):
             permission_mode="default",
             max_turns=self.max_turns,
             model=self.model,
+            max_thinking_tokens=self.thinking_budget,
+            # 100 MB buffer — avoid JSON buffer overflow on long conversations
+            # (SDK default is 1 MB, which large build outputs can exceed)
+            max_buffer_size=100 * 1024 * 1024,
+            # Stderr callback for API retry tracking
+            stderr=retry_tracker.handle_stderr_line,
+            # Allow CLI to retry through long API overload windows (default: 10)
+            env={"CLAUDE_CODE_MAX_RETRIES": "500"},
         )
 
-        # Run agentic loop
+        # Run agentic loop with time budget enforcement
         initial_prompt = self._build_initial_prompt(crash_output)
-        LOG.info(f"Starting agentic loop with max_turns={self.max_turns}")
+        LOG.info(
+            f"Starting agentic loop with max_turns={self.max_turns}, "
+            f"max_runtime_seconds={self.max_runtime_seconds}"
+        )
 
         async with ClaudeSDKClient(options=options) as client:
             await client.query(initial_prompt)
             async for message in client.receive_response():
+                # Finalize any retry sequence when we receive a message
+                retry_tracker.on_message_received()
+
                 self._process_message(message)
+
+                # Check time budget after each message
+                elapsed = time.monotonic() - session_start
+                excluded = retry_tracker.get_excluded_seconds()
+                active_runtime = elapsed - excluded
+
+                if active_runtime > self.max_runtime_seconds:
+                    LOG.warning(
+                        f"Time budget exceeded: {active_runtime:.1f}s active runtime "
+                        f"(excluded {excluded:.1f}s from {retry_tracker.get_retry_count()} retries). "
+                        f"Interrupting agent."
+                    )
+                    timeout_triggered = True
+                    await client.interrupt()
+                    break
+
+        # Log session timing summary
+        session_elapsed = time.monotonic() - session_start
+        session_excluded = retry_tracker.get_excluded_seconds()
+        session_active = session_elapsed - session_excluded
+        LOG.info(
+            f"Session complete: {session_elapsed:.1f}s elapsed, "
+            f"{session_active:.1f}s active, "
+            f"{session_excluded:.1f}s excluded ({retry_tracker.get_retry_count()} retries)"
+            + (", TIMEOUT" if timeout_triggered else "")
+        )
+
+        # Accumulate retry stats across sessions
+        self._total_excluded_retry_seconds += session_excluded
+        self._total_retry_count += retry_tracker.get_retry_count()
 
         return self.result.crash_fixed
 
@@ -233,6 +314,7 @@ class ClaudeCodeAgent(BaseAgent):
 
     def _build_initial_prompt(self, crash_output: str) -> str:
         """Build the initial prompt for the agentic loop."""
+        source_path = get_project_source_path()
         return f"""A crash was detected in this project. Your task is to find and fix the vulnerability.
 
 ## Crash Output
@@ -246,7 +328,7 @@ class ClaudeCodeAgent(BaseAgent):
 
 **Phase 2 — Investigate:** For each hypothesis, gather evidence from the code. Trace the data flow upstream from the crash. Check declarations, definitions, and symbols across files. Mark each hypothesis CONFIRMED or REJECTED.
 
-**Phase 3 — Patch:** Fix the confirmed root cause with a minimal edit. You can only write to files in /src/.
+**Phase 3 — Patch:** Fix the confirmed root cause with a minimal edit. You can only write to files in {source_path}/.
 
 **Phase 4 — Verify:** Build with mcp__arvo__build, then test with mcp__arvo__run_poc. If the crash persists, your hypothesis was wrong — go back to Phase 1 with new hypotheses targeting a different subsystem. Do NOT retry the same approach.
 
@@ -313,6 +395,16 @@ Start with Phase 1: read the crash output and write your hypotheses.
                 "agent_id": self.result.agent_id,
                 "model": self.model,
                 "status": self.result.status.value,
+                # Time budget tracking
+                "timing": {
+                    "duration_seconds": self.result.duration_seconds,
+                    "active_runtime_seconds": self.result.active_runtime_seconds,
+                    "excluded_retry_seconds": self._total_excluded_retry_seconds,
+                    "api_retry_count": self._total_retry_count,
+                    "max_runtime_seconds": self.max_runtime_seconds,
+                    "max_turns": self.max_turns,
+                    "thinking_budget": self.thinking_budget,
+                },
                 "messages": self._conversation_messages,
             }
             conv_file.write_text(json.dumps(conv_data, indent=2, default=str))

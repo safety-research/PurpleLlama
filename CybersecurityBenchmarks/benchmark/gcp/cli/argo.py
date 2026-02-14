@@ -463,25 +463,42 @@ def watch_workflow(
         hide_done: If True, hide Succeeded and Skipped tasks (show only active/pending/failed)
     """
     if not hide_done:
-        # Try standard argo watch first
-        result = subprocess.run(
-            ["argo", "watch", name, "-n", namespace],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            print(result.stdout, end="")
-            return
-        if "offload node status" not in result.stderr.lower():
-            # Non-offloading error — print it
-            typer.echo(f"Error: {result.stderr.strip()}")
-            return
-        # Offloaded — retry through argo-server
-        typer.echo("Node status offloaded — routing through argo-server...")
-        rc = run_argo_via_server_interactive(["watch", name, "-n", namespace])
-        if rc == 0:
-            return
-        # Server route also failed — fall through to kubectl-based watch
+        # First, do a quick status check to detect offloading without blocking
+        # This avoids the hang from running `argo watch` with captured output
+        try:
+            check_result = subprocess.run(
+                ["argo", "get", name, "-n", namespace, "-o", "json"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            typer.echo("Timed out connecting to cluster — trying argo-server...")
+            rc = run_argo_via_server_interactive(["watch", name, "-n", namespace])
+            if rc == 0:
+                return
+            # Server route failed — fall through to kubectl-based watch
+            check_result = None
+
+        if check_result is not None:
+            if check_result.returncode != 0:
+                if "offload node status" in check_result.stderr.lower():
+                    # Offloaded — go straight to argo-server
+                    typer.echo("Node status offloaded — routing through argo-server...")
+                    rc = run_argo_via_server_interactive(["watch", name, "-n", namespace])
+                    if rc == 0:
+                        return
+                    # Server route failed — fall through to kubectl-based watch
+                else:
+                    # Non-offloading error — print it
+                    typer.echo(f"Error: {check_result.stderr.strip()}")
+                    return
+            else:
+                # Standard argo watch works — run it interactively
+                result = subprocess.run(["argo", "watch", name, "-n", namespace])
+                if result.returncode == 0:
+                    return
+                # If it failed, fall through to kubectl-based watch
 
     # kubectl + pod-based watch (also used for --hide-done)
     import sys
@@ -576,25 +593,52 @@ def watch_workflow(
 def _fetch_gcs_archived_logs(
     name: str,
     bucket: str,
+    task: Optional[str] = None,
     grep: Optional[str] = None,
 ) -> bool:
-    """Fetch workflow logs from GCS archive. Returns True if logs were found."""
-    typer.echo(f"Fetching archived logs from GCS for {name}...")
+    """Fetch workflow logs from GCS archive. Returns True if logs were found.
 
-    # List all log files for this workflow under argo-logs/
+    Argo archives logs under a date-partitioned layout:
+        gs://<bucket>/argo-logs/YYYY/MM/DD/<workflow>/<pod>/main.log
+
+    We use wildcard dates (``*/*/*/*``) but pin the workflow (and optionally
+    pod) name so we never have to list the entire bucket.
+
+    Args:
+        task: Select a specific pod/task to show (by suffix or full name).
+        grep: Filter log *content* line-by-line for this substring.
+    """
+    base = f"gs://{bucket}/argo-logs"
+
+    # Determine which pod(s) to fetch based on --task filter.
+    pod_glob: Optional[str] = None
+    if task:
+        if task.startswith(name):
+            # Full pod name supplied (e.g. "wf-patch-case-123")
+            pod_glob = task
+        else:
+            # Suffix supplied (e.g. "patch-case-123")
+            pod_glob = f"{name}-{task}"
+
+    if pod_glob:
+        pattern = f"{base}/*/*/*/{name}/{pod_glob}/main.log"
+    else:
+        pattern = f"{base}/*/*/*/{name}/*/main.log"
+
+    typer.echo(f"Fetching archived logs matching {pattern} ...")
+
     gcs_result = subprocess.run(
-        ["gsutil", "ls", "-r", f"gs://{bucket}/argo-logs/"],
+        ["gsutil", "ls", pattern],
         capture_output=True,
         text=True,
     )
     if gcs_result.returncode != 0 or not gcs_result.stdout.strip():
         return False
 
-    # Filter to lines matching this workflow name
     log_files = [
         line
         for line in gcs_result.stdout.strip().split("\n")
-        if name in line and not line.endswith("/") and not line.endswith(":")
+        if line.strip() and not line.endswith("/") and not line.endswith(":")
     ]
 
     if not log_files:
@@ -603,8 +647,9 @@ def _fetch_gcs_archived_logs(
     typer.echo(f"Found {len(log_files)} archived log file(s) in GCS.\n")
 
     for log_file in sorted(log_files):
-        # Extract pod name from path: .../workflow-name/pod-name
-        pod_name = log_file.rsplit("/", 1)[-1] if "/" in log_file else log_file
+        # Extract pod name: …/YYYY/MM/DD/workflow/pod-name/main.log
+        parts = log_file.rstrip("/").split("/")
+        pod_name = parts[-2] if len(parts) >= 2 else log_file
         typer.echo(f"--- {pod_name} ---")
 
         cat_result = subprocess.run(
@@ -633,26 +678,35 @@ def get_workflow_logs(
     namespace: str = "argo",
     follow: bool = False,
     grep: Optional[str] = None,
+    task: Optional[str] = None,
 ) -> None:
     """Stream workflow logs.
 
     Tries the Argo API first (live pod logs). If that returns empty
     (pods already cleaned up), falls back to GCS-archived logs.
+
+    Args:
+        task: Show logs for a specific pod/task (by suffix or full name).
+        grep: Filter log content line-by-line for this substring.
     """
     import sys as _s
+
+    # For argo CLI: --grep filters content, and we can pass a pod name
+    # as a positional arg to scope to a single pod.
+    argo_grep = grep or task  # argo CLI only has --grep, no --task
 
     # Follow mode: stream directly, no fallback possible
     if follow:
         args = ["logs", name, "-n", namespace, "--follow"]
-        if grep:
-            args.extend(["--grep", grep])
+        if argo_grep:
+            args.extend(["--grep", argo_grep])
         subprocess.run(["argo"] + args)
         return
 
     # Non-follow mode: capture output so we can fall back to GCS if empty
     args = ["logs", name, "-n", namespace]
-    if grep:
-        args.extend(["--grep", grep])
+    if argo_grep:
+        args.extend(["--grep", argo_grep])
 
     result = subprocess.run(["argo"] + args, capture_output=True, text=True)
 
@@ -699,11 +753,11 @@ def get_workflow_logs(
         typer.echo("  python -m cli setup --skip-cluster")
         typer.echo()
 
-    found = _fetch_gcs_archived_logs(name, config.bucket_name, grep=grep)
+    found = _fetch_gcs_archived_logs(name, config.bucket_name, task=task, grep=grep)
 
     if not found:
         typer.echo(f"No archived logs found in GCS for workflow '{name}'.")
-        typer.echo(f"Checked: gs://{config.bucket_name}/argo-logs/.../{name}/...")
+        typer.echo(f"Checked: gs://{config.bucket_name}/argo-logs/*/*/*/{name}/...")
         if "archiveLogs" not in artifact_repo_config:
             typer.echo()
             typer.echo("This is expected — archiveLogs is not configured.")

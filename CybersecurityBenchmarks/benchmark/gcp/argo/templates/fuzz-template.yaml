@@ -56,6 +56,11 @@ spec:
       # NOTE: Memoization removed from fuzz-llm due to Argo bug with nested memoized tasks
       # Caching is now handled at the DAG level (per-model-pipeline) in arvo-benchmark.yaml
       # GCS _SUCCESS marker check below provides fallback deduplication
+
+      # Disable AppArmor so SYS_ADMIN can actually mount overlayfs.
+      metadata:
+        annotations:
+          container.apparmor.security.beta.kubernetes.io/main: unconfined
       tolerations:
         - key: "workload"
           operator: "Equal"
@@ -81,9 +86,9 @@ spec:
         - name: main
           resources:
             requests:
-              memory: "{{= sprig.int(retries) >= 1 ? '16G' : '6G'}}"
+              memory: "{{= sprig.int(retries) >= 1 ? '13G' : '6G'}}"
             limits:
-              memory: "{{= sprig.int(retries) >= 1 ? '28G' : '14G'}}"
+              memory: "{{= sprig.int(retries) >= 1 ? '28G' : '12G'}}"
 
       activeDeadlineSeconds: 7200
 
@@ -102,7 +107,7 @@ spec:
             - name: agent-runtime
               mountPath: /agent-runtime
 
-        # For LLM patches: download the rebuilt binary from patch results
+        # Download binaries for fuzzing and regression analysis
         - name: fetch-binary
           image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
           command:
@@ -111,24 +116,26 @@ spec:
             - |
               set -e
               TARGET="{{inputs.parameters.target}}"
+              BUCKET="{{inputs.parameters.bucket}}"
+              EXPERIMENT_ID="{{inputs.parameters.experiment-id}}"
+              CASE_ID="{{inputs.parameters.case-id}}"
+              AGENT_ID="{{inputs.parameters.agent-id}}"
+
+              # For LLM patches: download the rebuilt binary from patch results
               if [ "${TARGET}" = "llm_patch" ]; then
-                BUCKET="{{inputs.parameters.bucket}}"
-                EXPERIMENT_ID="{{inputs.parameters.experiment-id}}"
-                CASE_ID="{{inputs.parameters.case-id}}"
-                AGENT_ID="{{inputs.parameters.agent-id}}"
-                
                 # Download rebuilt binary from patch results (uses agent-id in path)
                 gsutil cp gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/${AGENT_ID}/rebuilt_binary /binary/rebuilt_binary || {
                   echo "Warning: Could not download rebuilt binary"
                   exit 0
                 }
                 chmod +x /binary/rebuilt_binary
-
-                # Download original (pre-patch) binary for regression analysis
-                # Stored per-case (not per-agent) since it's the same vul binary for all agents
-                gsutil cp gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/original_binary /binary/original_binary 2>/dev/null || true
-                [ -f /binary/original_binary ] && chmod +x /binary/original_binary || true
               fi
+
+              # Download original (pre-patch) binary for regression analysis
+              # Stored per-case (not per-agent) since it's the same vul binary for all agents
+              # Needed for both GT and LLM patches to measure regressions
+              gsutil cp gs://${BUCKET}/results/${EXPERIMENT_ID}/${CASE_ID}/original_binary /binary/original_binary 2>/dev/null || true
+              [ -f /binary/original_binary ] && chmod +x /binary/original_binary || true
           volumeMounts:
             - name: binary
               mountPath: /binary
@@ -168,7 +175,9 @@ spec:
             if [ "${TARGET}" = "llm_patch" ] && [ -f /binary/rebuilt_binary ]; then
               CMD="${CMD} --binary-path /binary/rebuilt_binary"
             fi
-            if [ "${TARGET}" = "llm_patch" ] && [ -f /binary/original_binary ]; then
+
+            # Add original binary for regression analysis (both GT and LLM patches)
+            if [ -f /binary/original_binary ]; then
               CMD="${CMD} --original-binary-path /binary/original_binary"
             fi
 

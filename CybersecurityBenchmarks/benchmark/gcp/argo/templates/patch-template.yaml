@@ -9,6 +9,7 @@ spec:
       inputs:
         parameters:
           - name: case-id
+          - name: project # Project name from metadata (e.g., "wireshark", "php-src")
           - name: model # LLM model name (for semaphore rate limiting)
           - name: agent-id # Unique agent identifier (for GCS paths, task naming)
           - name: agent-config # JSON blob passed to agent runtime
@@ -71,14 +72,6 @@ spec:
             gcs:
               bucket: "{{inputs.parameters.bucket}}"
               key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/rebuilt_binary"
-          - name: original-binary
-            path: /output/original_binary
-            optional: true
-            archive:
-              none: {}
-            gcs:
-              bucket: "{{inputs.parameters.bucket}}"
-              key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/original_binary"
           - name: success-marker
             path: /output/_SUCCESS
             optional: true
@@ -89,6 +82,13 @@ spec:
               key: "results/{{inputs.parameters.experiment-id}}/{{inputs.parameters.case-id}}/{{inputs.parameters.agent-id}}/patch/_SUCCESS"
       # NOTE: Memoization removed - using HTTP-based GCS completion checks instead
       # See per-model-pipeline DAG in arvo-benchmark.yaml for check-completion template
+
+      # Disable AppArmor so SYS_ADMIN can actually mount overlayfs.
+      # GKE's default cri-containerd.apparmor.d profile blocks mount() even
+      # with CAP_SYS_ADMIN.
+      metadata:
+        annotations:
+          container.apparmor.security.beta.kubernetes.io/main: unconfined
       tolerations:
         - key: "workload"
           operator: "Equal"
@@ -107,18 +107,23 @@ spec:
           factor: 2
           cap: "5m"
 
-      # On OOM retries (retry 2+), escalate memory request to 16G so the pod
-      # lands on an n4-highmem-4 node (32GB) instead of n4-standard-4 (16GB).
+      # On retries, escalate resources so the pod lands on a larger node.
+      # - CPU: 1.7 -> 3.5 (helps compilation-heavy cases like 9180, 3438)
+      # - Memory: 6G -> 13G request so the pod targets n4-highmem-4 (32GB)
+      # Retries are triggered by exit code 2 (escalation timeout: agent ran
+      # >= 30 min without fixing the crash) or pod-level errors (OOM, eviction).
       podSpecPatch: |
         containers:
         - name: main
           resources:
             requests:
-              memory: "{{= sprig.int(retries) >= 2 ? '16G' : '6G'}}"
+              cpu: "{{= sprig.int(retries) >= 1 ? '3.5' : '1.7'}}"
+              memory: "{{= sprig.int(retries) >= 1 ? '13G' : '6G'}}"
             limits:
-              memory: "{{= sprig.int(retries) >= 2 ? '28G' : '14G'}}"
+              cpu: "{{= sprig.int(retries) >= 1 ? '3.8' : '1.8'}}"
+              memory: "{{= sprig.int(retries) >= 1 ? '28G' : '12G'}}"
 
-      activeDeadlineSeconds: 18000
+      activeDeadlineSeconds: 86400
 
       initContainers:
         - name: fetch-runtime
@@ -160,10 +165,21 @@ spec:
             # - Patching source code
             # - Compiling and verifying the fix
             # - Saving rebuilt_binary, patch.patch, result.json to /output
+            # Temporarily disable set -e so we can capture the exit code.
+            # Exit code 2 = escalation timeout (agent ran >= 30 min without success),
+            # triggers Argo retry with more CPU via podSpecPatch.
+            set +e
             /agent-runtime/bin/agent-entrypoint.sh python3 -m agent.main \
               --case-id ${CASE_ID} \
               --output-dir /output \
               --verbose
+            EXIT_CODE=$?
+            set -e
+
+            if [ $EXIT_CODE -ne 0 ]; then
+              echo "[RETRY] Agent exited with code $EXIT_CODE — skipping _SUCCESS marker"
+              exit $EXIT_CODE
+            fi
 
             # Write completion marker (Argo artifacts handle upload)
             # This marker is uploaded last, so its presence indicates all results uploaded successfully
@@ -187,6 +203,10 @@ spec:
             value: "{{inputs.parameters.agent-config}}"
           - name: BUCKET
             value: "{{inputs.parameters.bucket}}"
+          - name: PROJECT
+            value: "{{inputs.parameters.project}}"
+          - name: ARGO_RETRIES
+            value: "{{retries}}"
         volumeMounts:
           - name: agent-runtime
             mountPath: /agent-runtime

@@ -24,5 +24,4 @@ def logs(
     """View workflow logs."""
     # Resolve special patterns like "latest" or "last-2"
     workflow_name = resolve_workflow_name(workflow_name)
-    grep_pattern = task or grep
-    get_workflow_logs(workflow_name, follow=follow, grep=grep_pattern)
+    get_workflow_logs(workflow_name, follow=follow, grep=grep, task=task)

@@ -396,8 +396,29 @@ def main() -> int:
     # The actual status (SUCCESS, PARTIAL, FAILED, NOT_SUPPORTED) is captured in result.json
     if result.exception:
         return 1  # Unexpected exception - infrastructure failure
-    else:
-        return 0  # Graceful completion (patch may or may not have been generated)
+
+    # Exit code 2: escalation timeout — signal Argo to retry with more CPU.
+    # On the first Argo attempt (ARGO_RETRIES=0), if the agent ran for longer
+    # than escalation_timeout without fixing the crash, exit 2 so the retry
+    # lands on a larger pod.  On subsequent retries the agent runs the full
+    # time budget normally.  escalation_timeout is configurable via AGENT_CONFIG
+    # JSON (default 1800s / 30 min).
+    escalation_timeout = getattr(result, "escalation_timeout", 1800)
+    argo_retries = int(os.environ.get("ARGO_RETRIES", "0"))
+    active_runtime = result.active_runtime_seconds or result.duration_seconds
+
+    if (
+        result.status.value != "success"
+        and argo_retries == 0
+        and active_runtime >= escalation_timeout
+    ):
+        LOG.info(
+            f"Escalation timeout: {active_runtime:.0f}s >= {escalation_timeout}s "
+            f"without success, exiting with code 2 for CPU-escalated retry"
+        )
+        return 2
+
+    return 0  # Graceful completion (patch may or may not have been generated)
 
 
 if __name__ == "__main__":

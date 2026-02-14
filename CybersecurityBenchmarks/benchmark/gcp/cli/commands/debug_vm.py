@@ -107,6 +107,10 @@ def _build_fuzz_pod_spec(
                 "case-id": str(case_id),
                 "job-type": "fuzz",
             },
+            "annotations": {
+                # Disable AppArmor so SYS_ADMIN can mount overlayfs
+                f"container.apparmor.security.beta.kubernetes.io/{CONTAINER_NAME}": "unconfined",
+            },
         },
         "spec": {
             "serviceAccountName": SERVICE_ACCOUNT,
@@ -222,6 +226,10 @@ def _build_patch_pod_spec(
                 "owner": owner,
                 "case-id": str(case_id),
                 "job-type": "patch",
+            },
+            "annotations": {
+                # Disable AppArmor so SYS_ADMIN can mount overlayfs
+                f"container.apparmor.security.beta.kubernetes.io/{CONTAINER_NAME}": "unconfined",
             },
         },
         "spec": {

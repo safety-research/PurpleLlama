@@ -3,6 +3,7 @@ Submit command for benchmark workflows.
 """
 
 import json
+import json5
 import re
 import subprocess
 import tempfile
@@ -35,6 +36,21 @@ from ..hashing import (
 )
 from ..output import echo_error, echo_info, echo_success, echo_warning
 from . import semaphore
+
+# Path to arvo metadata directory
+AUTOPATCH_META_DIR = (
+    get_script_dir().parent.parent / "datasets" / "autopatch" / "arvo_meta"
+)
+
+
+def _get_project_for_case(case_id: int) -> str:
+    """Load project name from arvo_meta/{case_id}-meta.json."""
+    meta_file = AUTOPATCH_META_DIR / f"{case_id}-meta.json"
+    if meta_file.exists():
+        with open(meta_file) as f:
+            meta = json.load(f)
+        return meta.get("arvo_metadata", {}).get("project", "")
+    return ""
 
 
 def _check_semaphore_limits(
@@ -298,6 +314,7 @@ def _generate_workflow_yaml(
     base_workflow_path: Path,
     agent_specs: list[AgentSpec],
     run_gt: bool = True,
+    vul_base_image: str = "",
 ) -> str:
     """Generate workflow YAML with a case-pipeline template for withParam expansion.
 
@@ -355,6 +372,35 @@ def _generate_workflow_yaml(
     )
 
     # Build vulnerable image (only if check reports image is needed)
+    build_vul_params = [
+        {
+            "name": "case-id",
+            "value": "{{inputs.parameters.case-id}}",
+        },
+        {
+            "name": "build-version",
+            "value": "{{workflow.parameters.build-version}}",
+        },
+        {
+            "name": "bucket",
+            "value": "{{workflow.parameters.bucket}}",
+        },
+        {
+            "name": "registry",
+            "value": "{{workflow.parameters.registry}}",
+        },
+    ]
+    if vul_base_image:
+        # Replace {case_id} placeholder with Argo template expression
+        argo_pattern = vul_base_image.replace(
+            "{case_id}", "{{inputs.parameters.case-id}}"
+        )
+        build_vul_params.append(
+            {
+                "name": "vul-base-image",
+                "value": argo_pattern,
+            }
+        )
     case_tasks.append(
         {
             "name": "build-vul",
@@ -365,24 +411,7 @@ def _generate_workflow_yaml(
                 "template": "build-vul",
             },
             "arguments": {
-                "parameters": [
-                    {
-                        "name": "case-id",
-                        "value": "{{inputs.parameters.case-id}}",
-                    },
-                    {
-                        "name": "build-version",
-                        "value": "{{workflow.parameters.build-version}}",
-                    },
-                    {
-                        "name": "bucket",
-                        "value": "{{workflow.parameters.bucket}}",
-                    },
-                    {
-                        "name": "registry",
-                        "value": "{{workflow.parameters.registry}}",
-                    },
-                ]
+                "parameters": build_vul_params,
             },
         }
     )
@@ -438,6 +467,48 @@ def _generate_workflow_yaml(
         }
     )
 
+    # --- Upload original (pre-patch) binary for regression analysis ---
+    # Runs in the vul image to extract the fuzzer binary and upload to GCS.
+    # Both GT and LLM fuzz steps depend on this so regression analysis can
+    # compare crashes against the original vulnerable binary.
+    case_tasks.append(
+        {
+            "name": "upload-origbin",
+            "dependencies": [
+                "chk-build-vul",
+                "build-vul",
+            ],
+            "templateRef": {
+                "name": "arvo-upload-origbin",
+                "template": "upload-original-binary",
+            },
+            "arguments": {
+                "parameters": [
+                    {
+                        "name": "case-id",
+                        "value": "{{inputs.parameters.case-id}}",
+                    },
+                    {
+                        "name": "experiment-id",
+                        "value": "{{workflow.parameters.experiment-id}}",
+                    },
+                    {
+                        "name": "bucket",
+                        "value": "{{workflow.parameters.bucket}}",
+                    },
+                    {
+                        "name": "registry",
+                        "value": "{{workflow.parameters.registry}}",
+                    },
+                    {
+                        "name": "build-version",
+                        "value": "{{workflow.parameters.build-version}}",
+                    },
+                ]
+            },
+        }
+    )
+
     # --- Agent tasks (one set per agent spec, statically expanded) ---
     for spec in agent_specs:
         id_safe = _sanitize_name(spec.id)
@@ -485,6 +556,10 @@ def _generate_workflow_yaml(
                             "name": "case-id",
                             "value": "{{inputs.parameters.case-id}}",
                         },
+                        {
+                            "name": "project",
+                            "value": "{{inputs.parameters.project}}",
+                        },
                         {"name": "model", "value": spec.model},
                         {"name": "agent-id", "value": spec.id},
                         {
@@ -520,7 +595,11 @@ def _generate_workflow_yaml(
         case_tasks.append(
             {
                 "name": f"chk-fuzz-{id_safe}",
-                "dependencies": [f"chk-patch-{id_safe}", f"patch-{id_safe}"],
+                "dependencies": [
+                    f"chk-patch-{id_safe}",
+                    f"patch-{id_safe}",
+                    "upload-origbin",
+                ],
                 "template": "check-completion",
                 "continueOn": {"failed": True},
                 "arguments": {
@@ -595,6 +674,7 @@ def _generate_workflow_yaml(
                 "dependencies": [
                     "chk-build-fix",
                     "build-fix",
+                    "upload-origbin",
                 ],
                 "template": "check-completion",
                 "continueOn": {"failed": True},
@@ -667,6 +747,7 @@ def _generate_workflow_yaml(
         "inputs": {
             "parameters": [
                 {"name": "case-id"},
+                {"name": "project"},
             ]
         },
         "dag": {
@@ -736,7 +817,7 @@ def submit(
 
     if config_file:
         with open(config_file) as f:
-            data = json.load(f)
+            data = json5.load(f)
         if "cases" in data:
             if isinstance(data["cases"], str):
                 run_config.cases = parse_cases(data["cases"])
@@ -759,6 +840,8 @@ def submit(
             run_config.patch_use_spot = data["patch_use_spot"]
         if "fuzz_use_spot" in data:
             run_config.fuzz_use_spot = data["fuzz_use_spot"]
+        if "vul_base_image" in data:
+            run_config.vul_base_image = data["vul_base_image"]
 
     # CLI overrides
     if cases:
@@ -779,8 +862,8 @@ def submit(
     if build_version:
         run_config.build_version = build_version
 
-    # Validate: must have at least one agent spec
-    if not run_config.agents:
+    # Validate: must have at least one agent spec or run_gt enabled
+    if not run_config.agents and not run_gt:
         echo_error(
             "No agents specified. Use --config with structured agents or --model."
         )
@@ -1035,17 +1118,26 @@ def submit(
     typer.echo(f"  Agents: {len(run_config.agents)}")
     typer.echo(f"  Tasks per case: {tasks_per_case}")
     typer.echo(f"  Total tasks (runtime): {total_tasks}")
+    if run_config.vul_base_image:
+        typer.echo(f"  Vul base image: {run_config.vul_base_image}")
     workflow_yaml = _generate_workflow_yaml(
         base_workflow_path,
         run_config.agents,
         run_gt=run_gt,
+        vul_base_image=run_config.vul_base_image,
     )
     typer.echo()
 
     # Compute derived parameter values
     registry_host, registry_path = gke_config.artifact_registry.split("/", 1)
     registry_api_prefix = f"https://{registry_host}/v2/{registry_path}"
-    cases_json = json.dumps([str(c) for c in run_config.cases])
+    # Build cases array with project metadata for each case
+    cases_json = json.dumps(
+        [
+            {"case_id": str(c), "project": _get_project_for_case(c)}
+            for c in run_config.cases
+        ]
+    )
 
     # Build workflow parameters
     parameters = {

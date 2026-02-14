@@ -286,16 +286,13 @@ def main() -> int:
         LOG.exception(f"Fuzzing failed: {e}")
         return 1
 
-    # Regression analysis: compare LLM crashes against vul binary
+    # Regression analysis: compare crashes against vul binary to determine
+    # whether they are pre-existing or newly introduced by the patch.
+    # Run for both GT and LLM patches to measure regressions in both.
     # Wrapped in try/except so fuzzing results are always saved even if
     # regression fails (e.g. casr-compare not on PATH). The error is still
     # propagated via result.error -> exit code 1.
-    if (
-        target == FuzzingTarget.LLM_PATCH
-        and args.original_binary_path
-        and result.timeline
-        and result.timeline.crashes
-    ):
+    if args.original_binary_path and result.timeline and result.timeline.crashes:
         try:
             from .casr_regression import analyze_regressions
 

@@ -30,6 +30,9 @@ Usage:
 
     # Aggregate crash curves across all cases
     python analysis/plot_crash_timeline.py fuzz1800_all -l /tmp/data --aggregate
+
+    # Only use the 49 non-confounded cases (no bonus fixes between vul/fix)
+    python analysis/plot_crash_timeline.py fuzz1800_all -l /tmp/data --aggregate --clean-only
 """
 
 from __future__ import annotations
@@ -38,10 +41,13 @@ import argparse
 import gzip
 import io
 import json
+import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
@@ -107,6 +113,7 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent
 GKE_CONFIG = REPO_ROOT / "benchmark" / "gcp" / ".gke-config.json"
+BETWEEN_COMMITS_REPORT = SCRIPT_DIR / "between_commits" / "report.json"
 
 
 def get_default_bucket() -> str:
@@ -114,6 +121,33 @@ def get_default_bucket() -> str:
         with open(GKE_CONFIG) as f:
             return json.load(f).get("bucket_name", "")
     return ""
+
+
+def load_clean_case_ids(report_path: Path = BETWEEN_COMMITS_REPORT) -> set[str]:
+    """Load non-confounded ("clean") case IDs from the between-commits report.
+
+    These are cases where no other known ARVO fix commits appear between
+    the vulnerability-introducing and fix commits, so the fuzzing results
+    are not confounded by bonus bug fixes.
+
+    Returns a set of case ID strings (to match the keys in the data dict).
+    """
+    if not report_path.exists():
+        print(
+            f"Warning: between-commits report not found at {report_path}",
+            file=sys.stderr,
+        )
+        return set()
+
+    with open(report_path) as f:
+        report = json.load(f)
+
+    clean_ids: set[str] = set()
+    for detail in report.get("details", []):
+        if detail.get("status") == "clean":
+            clean_ids.add(str(detail["apb_case_id"]))
+
+    return clean_ids
 
 
 # ---------------------------------------------------------------------------
@@ -194,33 +228,95 @@ def collect_results(results_dir: Path) -> dict[str, dict[str, dict]]:
 
 
 def download_from_gcs(bucket: str, experiment_id: str) -> Path:
-    """Download experiment results from GCS, return local directory."""
+    """Download experiment results from GCS with live progress display.
+
+    Prefers ``gcloud storage rsync`` (gRPC transport, significantly faster)
+    and falls back to ``gsutil -m rsync`` when the gcloud CLI is absent.
+    Shows a live spinner with file count and elapsed time.
+    """
     gcs_path = f"gs://{bucket}/results/{experiment_id}/"
+    exclude_pattern = r".*rebuilt_binary.*|.*original_binary.*|.*\.tar\.gz$"
+
     print(f"Fetching results from {gcs_path} ...", file=sys.stderr)
 
     tmpdir = Path(tempfile.mkdtemp(prefix=f"arvo-results-{experiment_id}-"))
     print(f"Downloading to {tmpdir} ...", file=sys.stderr)
 
-    result = subprocess.run(
-        [
+    # Prefer `gcloud storage` (gRPC transport, ~2-5x faster) over gsutil
+    if shutil.which("gcloud"):
+        cmd = [
+            "gcloud",
+            "storage",
+            "rsync",
+            "--recursive",
+            f"--exclude={exclude_pattern}",
+            gcs_path,
+            str(tmpdir),
+        ]
+        tool_name = "gcloud storage"
+    else:
+        cmd = [
             "gsutil",
             "-m",
-            "-q",
             "rsync",
             "-r",
             "-x",
-            ".*rebuilt_binary.*|.*original_binary.*|.*\\.tar\\.gz$",
+            exclude_pattern,
             gcs_path,
             str(tmpdir),
-        ],
-        capture_output=True,
+        ]
+        tool_name = "gsutil"
+
+    # Run download subprocess; drain output in a background thread to
+    # prevent pipe-buffer deadlock, and poll the filesystem for a live
+    # progress indicator.
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=600,
     )
-    if result.returncode != 0:
+
+    output_lines: list[str] = []
+
+    def _drain_output() -> None:
+        if proc.stdout:
+            for line in proc.stdout:
+                output_lines.append(line)
+
+    drain = threading.Thread(target=_drain_output, daemon=True)
+    drain.start()
+
+    spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    start = time.monotonic()
+    while proc.poll() is None:
+        n_files = sum(1 for f in tmpdir.rglob("*") if f.is_file())
+        elapsed = time.monotonic() - start
+        s = spinner[int(elapsed * 8) % len(spinner)]
         print(
-            f"Warning: gsutil rsync had issues: {result.stderr[:200]}", file=sys.stderr
+            f"\r  {s} {n_files} files | {elapsed:.0f}s elapsed ({tool_name})",
+            end="",
+            file=sys.stderr,
         )
+        sys.stderr.flush()
+        time.sleep(1.0)
+
+    drain.join(timeout=10)
+
+    n_files = sum(1 for f in tmpdir.rglob("*") if f.is_file())
+    elapsed = time.monotonic() - start
+    print(
+        f"\r  Downloaded {n_files} files in {elapsed:.1f}s ({tool_name})          ",
+        file=sys.stderr,
+    )
+
+    if proc.returncode != 0:
+        err = "".join(output_lines[-5:]).strip()
+        if err:
+            print(
+                f"Warning: {tool_name} rsync had issues: {err[:300]}",
+                file=sys.stderr,
+            )
 
     return tmpdir
 
@@ -321,6 +417,16 @@ def get_common_success_cases(
                 ok.add(cid)
         common &= ok
     return common
+
+
+def get_agent_success_cases(data: dict[str, dict[str, dict]], model: str) -> set[str]:
+    """Return case IDs where a specific agent patched successfully."""
+    ok: set[str] = set()
+    for cid, case_data in data.items():
+        pr = case_data.get(model, {}).get("patch_result", {})
+        if pr.get("patch_successful") or pr.get("crash_fixed"):
+            ok.add(cid)
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -895,22 +1001,6 @@ def _plot_aggregate_panel(
     ax.grid(True, alpha=0.3)
 
 
-def get_common_success_cases(
-    data: dict[str, dict[str, dict]], models: list[str]
-) -> set[str]:
-    """Cases where every LLM agent patched successfully."""
-    llm_models = [m for m in models if m != "gt"]
-    common = set(data.keys())
-    for m in llm_models:
-        ok = set()
-        for cid, case_data in data.items():
-            pr = case_data.get(m, {}).get("patch_result", {})
-            if pr.get("patch_successful") or pr.get("crash_fixed"):
-                ok.add(cid)
-        common &= ok
-    return common
-
-
 def _plot_conditional_violin(
     ax: plt.Axes,
     data: dict[str, dict[str, dict]],
@@ -1007,36 +1097,268 @@ def _plot_regression_rate_bars(
     models: list[str],
     n_cases: int,
 ) -> None:
-    """Bar chart: % of cases with at least 1 regression, per agent."""
-    llm_models = [m for m in models if m != "gt"]
-    labels = [shorten_model(m) for m in llm_models]
-    colors = [get_model_color(m) for m in llm_models]
+    """Bar chart: % of cases with at least 1 regression, per agent.
+
+    LLM agents use cases from intersection that have fuzzing_result.
+    GT uses its own count (cases where GT has fuzzing_result).
+
+    Cases with 0 crashes during fuzzing are counted as 0 regressions.
+    """
+    labels = [shorten_model(m) for m in models]
+    colors = [get_model_color(m) for m in models]
 
     rates = []
     counts = []
-    for m in llm_models:
+    totals = []
+
+    for m in models:
         n_with_reg = 0
-        for case_data in data.values():
-            if m not in case_data:
-                continue
-            ra = case_data[m].get("regression", {})
-            if ra and ra.get("regressions", 0) > 0:
-                n_with_reg += 1
-        rates.append(n_with_reg / n_cases * 100 if n_cases > 0 else 0)
+        if m == "gt":
+            # For GT: count all cases with fuzzing_result (fuzzing completed)
+            # Cases with 0 crashes are counted as 0 regressions
+            n_total = 0
+            for case_data in data.values():
+                if m not in case_data:
+                    continue
+                if not case_data[m].get("fuzzing_result"):
+                    continue  # Fuzzing not completed
+                n_total += 1
+                ra = case_data[m].get("regression", {})
+                if ra and ra.get("regressions", 0) > 0:
+                    n_with_reg += 1
+            totals.append(n_total)
+            rates.append(n_with_reg / n_total * 100 if n_total > 0 else 0)
+        else:
+            # For LLM agents: count cases from intersection with fuzzing_result
+            # Cases with 0 crashes are counted as 0 regressions
+            n_total = 0
+            for case_data in data.values():
+                if m not in case_data:
+                    continue
+                if not case_data[m].get("fuzzing_result"):
+                    continue  # Fuzzing not completed
+                n_total += 1
+                ra = case_data[m].get("regression", {})
+                if ra and ra.get("regressions", 0) > 0:
+                    n_with_reg += 1
+            totals.append(n_total)
+            rates.append(n_with_reg / n_total * 100 if n_total > 0 else 0)
         counts.append(n_with_reg)
 
-    x = np.arange(len(llm_models))
+    x = np.arange(len(models))
     bars = ax.bar(x, rates, color=colors, edgecolor="white", linewidth=0.5)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
     ax.set_ylabel("% Cases with >= 1 Regression")
-    ax.set_title(f"P(Regression | all agents patched original PoC) N={n_cases}")
+    ax.set_title("P(Regression | agent fixed PoC)")
     ax.set_ylim(0, max(rates) * 1.3 if rates else 10)
     ax.grid(True, axis="y", alpha=0.3)
 
-    for bar, rate, cnt in zip(bars, rates, counts):
+    for bar, rate, cnt, tot in zip(bars, rates, counts, totals):
         ax.annotate(
-            f"{rate:.1f}%\n({cnt}/{n_cases})",
+            f"{rate:.1f}%\n({cnt}/{tot})",
+            xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+            ha="center",
+            va="bottom",
+            fontsize=7,
+        )
+
+
+def _build_per_agent_regression_curves(
+    data: dict[str, dict[str, dict]],
+    models: list[str],
+    resolution: int = 200,
+    max_seconds: Optional[float] = None,
+) -> tuple[dict[str, AggregateCurve], dict[str, int], float]:
+    """Build regression curves where each agent is conditioned on its OWN success.
+
+    For each LLM agent, only include cases where THAT agent patched successfully.
+    For GT, include all cases with fuzzing_result (GT is the reference fix).
+
+    Cases with fuzzing_result but no crashes are counted as zero regressions.
+
+    Returns ({model: AggregateCurve}, {model: n_cases}, max_seconds).
+    """
+    # Determine the common time axis from the median observed duration
+    if max_seconds is None:
+        all_durations: list[float] = []
+        for case_data in data.values():
+            for model in models:
+                if model not in case_data:
+                    continue
+                _, dur = extract_regression_crash_times(case_data[model])
+                if dur:
+                    all_durations.append(dur)
+        max_seconds = float(np.median(all_durations)) if all_durations else 1800.0
+
+    curves: dict[str, AggregateCurve] = {}
+    n_cases_per_model: dict[str, int] = {}
+
+    for model in models:
+        per_case: list[np.ndarray] = []
+
+        if model == "gt":
+            # For GT: include all cases that have fuzzing_result (fuzzing completed)
+            # Cases with 0 crashes are counted as 0 regressions
+            for cid, case_data in data.items():
+                if model not in case_data:
+                    continue
+                # Only include if GT has fuzzing_result (fuzzing completed)
+                if not case_data[model].get("fuzzing_result"):
+                    continue
+                crash_times, duration = extract_regression_crash_times(case_data[model])
+                if not duration:
+                    continue
+
+                row = np.zeros(resolution + 1)
+                for i in range(resolution + 1):
+                    t = (i / resolution) * max_seconds
+                    row[i] = sum(1 for ct in crash_times if ct <= t)
+                per_case.append(row)
+        else:
+            # For LLM agents: only include cases where agent patched successfully
+            # AND fuzzing completed. Cases with 0 crashes count as 0 regressions.
+            success_cases = get_agent_success_cases(data, model)
+            for cid in success_cases:
+                if cid not in data or model not in data[cid]:
+                    continue
+                # Must have fuzzing_result to be included
+                if not data[cid][model].get("fuzzing_result"):
+                    continue
+                crash_times, duration = extract_regression_crash_times(data[cid][model])
+                if not duration:
+                    continue
+
+                row = np.zeros(resolution + 1)
+                for i in range(resolution + 1):
+                    t = (i / resolution) * max_seconds
+                    row[i] = sum(1 for ct in crash_times if ct <= t)
+                per_case.append(row)
+
+        n_cases_per_model[model] = len(per_case)
+        if per_case:
+            matrix = np.stack(per_case)  # shape (n_cases, resolution+1)
+            curves[model] = AggregateCurve(
+                mean=matrix.mean(axis=0),
+                p25=np.percentile(matrix, 25, axis=0),
+                p75=np.percentile(matrix, 75, axis=0),
+            )
+
+    return curves, n_cases_per_model, max_seconds
+
+
+def _plot_per_agent_regression_panel(
+    ax: plt.Axes,
+    curves: dict[str, AggregateCurve],
+    models: list[str],
+    n_cases_per_model: dict[str, int],
+    xs: list[float],
+) -> None:
+    """Plot per-agent regression curves with individual N values in legend."""
+    for model in models:
+        if model not in curves:
+            continue
+        curve = curves[model]
+        if curve.mean[-1] == 0 and model != "gt":
+            continue
+
+        label = shorten_model(model)
+        sty = get_model_style(model)
+        markevery = max(1, len(xs) // 8)
+        n_cases = n_cases_per_model.get(model, 0)
+
+        final_val = curve.mean[-1]
+        val_str = f"{final_val:.2f}" if final_val < 100 else f"{int(final_val)}"
+
+        ax.plot(
+            xs,
+            curve.mean,
+            color=sty["color"],
+            linewidth=sty["lw"],
+            linestyle=sty["ls"],
+            marker=sty["marker"],
+            markersize=6,
+            markevery=markevery,
+            markeredgecolor="black",
+            markeredgewidth=0.5,
+            alpha=0.9,
+            label=f"{label} ({val_str}, N={n_cases})",
+        )
+
+    ax.set_xlabel("Time (seconds)")
+    ax.set_ylabel("Avg Regressions per Case")
+    ax.set_title("E[#Regressions | agent patched original PoC]")
+    ax.legend(fontsize=7, loc="upper left")
+    ax.grid(True, alpha=0.3)
+
+
+def _plot_per_agent_regression_rate_bars(
+    ax: plt.Axes,
+    data: dict[str, dict[str, dict]],
+    models: list[str],
+) -> None:
+    """Bar chart: % of cases with at least 1 regression, per agent.
+
+    For LLM agents: conditioned on that agent's successful patch AND fuzzing completed.
+    For GT: conditioned on fuzzing completed (GT is always the reference fix).
+
+    Cases with 0 crashes during fuzzing are counted as 0 regressions.
+    """
+    labels = [shorten_model(m) for m in models]
+    colors = [get_model_color(m) for m in models]
+
+    rates = []
+    counts = []
+    totals = []
+
+    for m in models:
+        if m == "gt":
+            # For GT: count cases that have fuzzing_result (fuzzing completed)
+            # Cases with 0 crashes are counted as 0 regressions
+            n_total = 0
+            n_with_reg = 0
+            for cid, case_data in data.items():
+                if m not in case_data:
+                    continue
+                if not case_data[m].get("fuzzing_result"):
+                    continue  # Fuzzing not completed
+                n_total += 1
+                ra = case_data[m].get("regression", {})
+                if ra and ra.get("regressions", 0) > 0:
+                    n_with_reg += 1
+        else:
+            # For LLM agents: count cases where agent patched successfully
+            # AND fuzzing completed. Cases with 0 crashes count as 0 regressions.
+            success_cases = get_agent_success_cases(data, m)
+            n_total = 0
+            n_with_reg = 0
+
+            for cid in success_cases:
+                if cid not in data or m not in data[cid]:
+                    continue
+                if not data[cid][m].get("fuzzing_result"):
+                    continue  # Fuzzing not completed
+                n_total += 1
+                ra = data[cid][m].get("regression", {})
+                if ra and ra.get("regressions", 0) > 0:
+                    n_with_reg += 1
+
+        rates.append(n_with_reg / n_total * 100 if n_total > 0 else 0)
+        counts.append(n_with_reg)
+        totals.append(n_total)
+
+    x = np.arange(len(models))
+    bars = ax.bar(x, rates, color=colors, edgecolor="white", linewidth=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
+    ax.set_ylabel("% Cases with >= 1 Regression")
+    ax.set_title("P(Regression | agent fixed PoC)")
+    ax.set_ylim(0, max(rates) * 1.3 if rates else 10)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    for bar, rate, cnt, tot in zip(bars, rates, counts, totals):
+        ax.annotate(
+            f"{rate:.1f}%\n({cnt}/{tot})",
             xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
             ha="center",
             va="bottom",
@@ -1048,23 +1370,24 @@ def plot_aggregate_timeline(
     data: dict[str, dict[str, dict]],
     models: list[str],
     output_path: Optional[Path] = None,
+    per_agent_regression: bool = False,
 ) -> Figure:
     """
     Aggregate crash timeline with four panels:
       Top-left:     unique crashes over time (avg per case, ALL cases)
-      Top-right:    regressions over time (avg per case, INTERSECTION cases only)
+      Top-right:    regressions over time (avg per case)
       Bottom-left:  unique crash distribution (conditional violin, all cases)
-      Bottom-right: regression distribution (conditional violin, intersection only)
+      Bottom-right: regression rate bar chart
 
-    Regressions use the intersection of cases where every LLM agent patched
-    successfully, so all agents are compared on the same vulnerabilities.
+    If per_agent_regression=False (default):
+        Regressions use the intersection of cases where every LLM agent patched
+        successfully, so all agents are compared on the same vulnerabilities.
+
+    If per_agent_regression=True:
+        Each agent's regression curve is computed only over cases where THAT
+        specific agent patched successfully (E[#reg | agent fixed PoC]).
     """
     n_all = len(data)
-
-    # --- Intersection: cases where every LLM agent patched successfully ---
-    common_cases = get_common_success_cases(data, models)
-    data_reg = {cid: data[cid] for cid in common_cases if cid in data}
-    n_common = len(data_reg)
 
     fig, axes = plt.subplots(2, 2, figsize=(20, 12), layout="constrained")
     ax_uniq = axes[0, 0]
@@ -1074,18 +1397,9 @@ def plot_aggregate_timeline(
 
     resolution = 200
 
-    # --- Build curves ---
-    # Unique crashes: all cases
+    # --- Build unique crash curves (all cases) ---
     unique_curves, max_sec = _build_aggregate_curves(
         data, models, extract_unique_crash_times, resolution
-    )
-    # Regressions: intersection cases only
-    reg_curves, _ = _build_aggregate_curves(
-        data_reg,
-        models,
-        extract_regression_crash_times,
-        resolution,
-        max_seconds=max_sec,
     )
 
     xs_sec = [i / resolution * max_sec for i in range(resolution + 1)]
@@ -1101,33 +1415,81 @@ def plot_aggregate_timeline(
         f"Unique Crashes Over Time (avg, N={n_all})",
     )
 
-    # --- Top-right: regressions (intersection cases) ---
-    has_any_reg = any(
-        model in reg_curves and reg_curves[model].mean[-1] > 0 for model in models
-    )
-    if has_any_reg:
-        _plot_aggregate_panel(
-            ax_reg,
-            reg_curves,
-            models,
-            xs_sec,
-            "Time (seconds)",
-            "Avg Regressions per Case",
-            f"E[#Regressions | all agents patched original PoC] (N={n_common})",
+    if per_agent_regression:
+        # --- Per-agent regression mode ---
+        reg_curves, n_cases_per_model, _ = _build_per_agent_regression_curves(
+            data, models, resolution, max_seconds=max_sec
         )
+
+        # Top-right: per-agent regressions
+        has_any_reg = any(
+            model in reg_curves and reg_curves[model].mean[-1] > 0 for model in models
+        )
+        if has_any_reg:
+            _plot_per_agent_regression_panel(
+                ax_reg, reg_curves, models, n_cases_per_model, xs_sec
+            )
+        else:
+            ax_reg.text(
+                0.5,
+                0.5,
+                "No regression data",
+                transform=ax_reg.transAxes,
+                ha="center",
+                va="center",
+                fontsize=12,
+                color="gray",
+            )
+            ax_reg.set_title("Regressions Over Time")
+            ax_reg.grid(True, alpha=0.3)
+
+        # Bottom-right: per-agent regression rate bars
+        _plot_per_agent_regression_rate_bars(ax_dist_r, data, models)
+
     else:
-        ax_reg.text(
-            0.5,
-            0.5,
-            "No regression data",
-            transform=ax_reg.transAxes,
-            ha="center",
-            va="center",
-            fontsize=12,
-            color="gray",
+        # --- Intersection mode (original behavior) ---
+        common_cases = get_common_success_cases(data, models)
+        data_reg = {cid: data[cid] for cid in common_cases if cid in data}
+        n_common = len(data_reg)
+
+        reg_curves, _ = _build_aggregate_curves(
+            data_reg,
+            models,
+            extract_regression_crash_times,
+            resolution,
+            max_seconds=max_sec,
         )
-        ax_reg.set_title("Regressions Over Time")
-        ax_reg.grid(True, alpha=0.3)
+
+        # Top-right: regressions (intersection cases)
+        has_any_reg = any(
+            model in reg_curves and reg_curves[model].mean[-1] > 0 for model in models
+        )
+        if has_any_reg:
+            _plot_aggregate_panel(
+                ax_reg,
+                reg_curves,
+                models,
+                xs_sec,
+                "Time (seconds)",
+                "Avg Regressions per Case",
+                f"E[#Regressions | all agents patched original PoC] (N={n_common})",
+            )
+        else:
+            ax_reg.text(
+                0.5,
+                0.5,
+                "No regression data",
+                transform=ax_reg.transAxes,
+                ha="center",
+                va="center",
+                fontsize=12,
+                color="gray",
+            )
+            ax_reg.set_title("Regressions Over Time")
+            ax_reg.grid(True, alpha=0.3)
+
+        # Bottom-right: regression rate bar chart (intersection cases)
+        _plot_regression_rate_bars(ax_dist_r, data_reg, models, n_common)
 
     # --- Bottom-left: unique crash conditional violin (all cases) ---
     _plot_conditional_violin(
@@ -1138,14 +1500,6 @@ def plot_aggregate_timeline(
         ylabel="Unique Crashes (non-zero cases)",
         title=f"Distribution of #Unique Crashes (N={n_all})",
         include_gt=True,
-    )
-
-    # --- Bottom-right: regression rate bar chart (intersection cases) ---
-    _plot_regression_rate_bars(
-        ax_dist_r,
-        data_reg,
-        models,
-        n_common,
     )
 
     if output_path:
@@ -1211,6 +1565,24 @@ def main() -> int:
         action="store_true",
         help="Force popup viewer even when -o is given (show + save)",
     )
+    parser.add_argument(
+        "--clean-only",
+        action="store_true",
+        help="Only include the non-confounded cases (no bonus fixes between vul/fix commits). "
+        "Reads from analysis/between_commits/report.json.",
+    )
+    parser.add_argument(
+        "--all-finished",
+        action="store_true",
+        help="Only include cases where all agents have finished fuzzing "
+        "(i.e., every agent has a fuzzing_result.json).",
+    )
+    parser.add_argument(
+        "--per-agent-regression",
+        action="store_true",
+        help="For regression plots, condition each agent on its OWN success "
+        "(E[#reg | agent fixed PoC]) instead of requiring all agents to have fixed it.",
+    )
 
     args = parser.parse_args()
 
@@ -1237,10 +1609,53 @@ def main() -> int:
         print("No results found.", file=sys.stderr)
         return 1
 
+    # Filter to non-confounded cases if requested
+    if args.clean_only:
+        clean_ids = load_clean_case_ids()
+        if not clean_ids:
+            print(
+                "Error: no clean case IDs found. Is the between-commits report available?",
+                file=sys.stderr,
+            )
+            return 1
+        n_before = len(data)
+        data = {cid: v for cid, v in data.items() if cid in clean_ids}
+        n_after = len(data)
+        print(
+            f"--clean-only: filtered {n_before} -> {n_after} cases "
+            f"({len(clean_ids)} clean IDs in report)",
+            file=sys.stderr,
+        )
+        if not data:
+            print("No matching cases after filtering.", file=sys.stderr)
+            return 1
+
     all_models: set[str] = set()
     for case_data in data.values():
         all_models.update(case_data.keys())
     models = get_sorted_models(all_models)
+
+    # Filter to cases where all agents have finished fuzzing
+    if args.all_finished:
+        n_before = len(data)
+        filtered_data = {}
+        for cid, case_data in data.items():
+            # Check if all models have fuzzing_result
+            all_have_fuzz = all(
+                m in case_data and case_data[m].get("fuzzing_result") for m in models
+            )
+            if all_have_fuzz:
+                filtered_data[cid] = case_data
+        data = filtered_data
+        n_after = len(data)
+        print(
+            f"--all-finished: filtered {n_before} -> {n_after} cases "
+            f"(cases where all {len(models)} agents finished fuzzing)",
+            file=sys.stderr,
+        )
+        if not data:
+            print("No matching cases after filtering.", file=sys.stderr)
+            return 1
 
     print(
         f"Loaded {len(data)} cases, {len(models)} agents: {', '.join(shorten_model(m) for m in models)}",
@@ -1262,7 +1677,12 @@ def main() -> int:
         plot_comparison(data, models, args.output)
 
     elif args.aggregate:
-        plot_aggregate_timeline(data, models, args.output)
+        plot_aggregate_timeline(
+            data,
+            models,
+            args.output,
+            per_agent_regression=args.per_agent_regression,
+        )
 
     else:
         if args.output:

@@ -55,6 +55,17 @@ class AgentResult:
     end_time: str = ""
     duration_seconds: float = 0.0
 
+    # Time budget tracking (for agents with time-based limits)
+    # active_runtime_seconds = duration_seconds - excluded_retry_seconds
+    active_runtime_seconds: float = 0.0  # Time budget was measured against
+    excluded_retry_seconds: float = 0.0  # Time excluded (API retries due to 529 errors)
+    api_retry_count: int = 0  # Number of API retries detected
+
+    # Escalation: if the agent runs >= this many seconds on the first Argo
+    # attempt without fixing the crash, main.py exits with code 2 to trigger
+    # a retry on a larger pod (more CPU).  Configurable via AGENT_CONFIG JSON.
+    escalation_timeout: int = 1800  # default 30 minutes
+
     # Status
     status: AgentStatus = AgentStatus.INIT
 
@@ -103,6 +114,9 @@ class AgentResult:
             "start_time": self.start_time,
             "end_time": self.end_time,
             "duration_seconds": self.duration_seconds,
+            "active_runtime_seconds": self.active_runtime_seconds,
+            "excluded_retry_seconds": self.excluded_retry_seconds,
+            "api_retry_count": self.api_retry_count,
             "status": self.status.value,
             "original_crash_type": self.original_crash_type,
             "patch_generated": self.patch_generated,
@@ -115,6 +129,7 @@ class AgentResult:
             "fuzzer_binary_path": self.fuzzer_binary_path,
             "error": self.error,
             "patch_successful": self.patch_successful,
+            "escalation_timeout": self.escalation_timeout,
         }
 
     def is_success(self) -> bool:
@@ -170,10 +185,6 @@ class BaseAgent(ABC):
             start_time=datetime.utcnow().isoformat() + "Z",
         )
 
-        # Snapshot the original (pre-patch) binary for regression analysis.
-        # Must happen before any patching since `arvo compile` overwrites /out/.
-        self._save_original_binary()
-
         # Overlay state (initialized by _setup_overlays)
         self._use_overlay = False
         self._overlay_mounted: list[str] = []
@@ -187,13 +198,38 @@ class BaseAgent(ABC):
 
     _overlay_paths = ["/src", "/out", "/work"]
     _overlay_base = "/tmp/overlay"
+    _overlay_tmpfs = "/mnt/overlay_tmpfs"
     _snapshot_suffix = ".bak"
 
     def _setup_overlays(self) -> None:
         """Mount overlayfs on writable paths. Call once before patching.
 
-        Falls back to cp -a if overlayfs is not available (no SYS_ADMIN).
+        Upper/work dirs are placed on a tmpfs because the container root
+        is itself an overlay filesystem (Docker/containerd), and the Linux
+        kernel requires upper/work to be on a non-overlay fs.
+
+        Falls back to cp -a if overlayfs is not available (no SYS_ADMIN
+        or AppArmor blocking mount).
         """
+        # Create a tmpfs for upper/work dirs (required: overlay can't nest
+        # upper/work on the container's own overlay root filesystem)
+        try:
+            os.makedirs(self._overlay_tmpfs, exist_ok=True)
+            subprocess.run(
+                ["mount", "-t", "tmpfs", "tmpfs", self._overlay_tmpfs],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+        except (subprocess.CalledProcessError, PermissionError, OSError) as e:
+            LOG.warning(
+                f"Cannot mount tmpfs for overlay upper/work ({e}), "
+                f"falling back to cp -a snapshots"
+            )
+            self._use_overlay = False
+            self._setup_snapshots()
+            return
+
         for path in self._overlay_paths:
             if not os.path.exists(path):
                 continue
@@ -216,9 +252,13 @@ class BaseAgent(ABC):
             LOG.info(f"OverlayFS mounted on {self._overlay_mounted} for retry support")
 
     def _mount_overlay(self, path: str) -> None:
-        """Mount a single overlayfs on a path."""
-        upper = f"{self._overlay_base}{path}/upper"
-        work = f"{self._overlay_base}{path}/work"
+        """Mount a single overlayfs on a path.
+
+        Upper/work dirs are on the tmpfs at _overlay_tmpfs so the kernel
+        doesn't reject the mount due to nested overlay filesystems.
+        """
+        upper = f"{self._overlay_tmpfs}{path}/upper"
+        work = f"{self._overlay_tmpfs}{path}/work"
         os.makedirs(upper, exist_ok=True)
         os.makedirs(work, exist_ok=True)
         subprocess.run(
@@ -252,8 +292,8 @@ class BaseAgent(ABC):
                         capture_output=True,
                         timeout=30,
                     )
-                    upper = f"{self._overlay_base}{path}/upper"
-                    work = f"{self._overlay_base}{path}/work"
+                    upper = f"{self._overlay_tmpfs}{path}/upper"
+                    work = f"{self._overlay_tmpfs}{path}/work"
                     shutil.rmtree(upper)
                     shutil.rmtree(work)
                     os.makedirs(upper)
@@ -388,6 +428,12 @@ class BaseAgent(ABC):
         end = datetime.fromisoformat(self.result.end_time.rstrip("Z"))
         self.result.duration_seconds = (end - start).total_seconds()
 
+        # Compute active runtime (excluding API retry time)
+        # Agents that track retries set excluded_retry_seconds before calling this
+        self.result.active_runtime_seconds = (
+            self.result.duration_seconds - self.result.excluded_retry_seconds
+        )
+
     def _save_results(self) -> None:
         """Save results to output directory."""
         import json
@@ -426,18 +472,31 @@ class BaseAgent(ABC):
     def _generate_patch_diff(self) -> None:
         """Generate a unified diff of all source changes (patch.patch).
 
-        Runs ``git diff`` in /src/ to capture everything the agent modified.
-        Works for all agents -- autopatchbench, claudecode, and any future agents.
-        The output is a standard unified diff that can be applied with
-        ``git apply patch.patch``.
+        Finds the git repo root (typically /src/{project}/) and runs
+        ``git diff`` there.  Works for all agents -- autopatchbench,
+        claudecode, and any future agents.  The output is a standard
+        unified diff that can be applied with ``git apply patch.patch``.
+
+        Safe to call multiple times: skips if a patch was already captured
+        (e.g. before overlay teardown).
         """
+        # Skip if we already captured the patch (e.g. before overlay teardown)
+        if self.result.patch_content:
+            LOG.debug("Patch diff already captured, skipping")
+            return
+
+        from shared.paths import find_git_root
+
+        git_root = find_git_root()
+        LOG.debug(f"Generating patch diff from git root: {git_root}")
+
         try:
             result = subprocess.run(
                 ["git", "diff"],
                 capture_output=True,
                 text=True,
                 timeout=30,
-                cwd="/src",
+                cwd=git_root,
             )
             if result.stdout.strip():
                 patch_file = self.output_dir / "patch.patch"
@@ -539,27 +598,6 @@ class BaseAgent(ABC):
         LOG.error("Could not find fuzzer binary")
         return None
 
-    def _save_original_binary(self) -> None:
-        """Snapshot the original (pre-patch) fuzzer binary for regression analysis.
-
-        Saves to /output/original_binary. Called at init time, before the agent
-        patches anything, so /out/ still has the vulnerable binary.
-        """
-        import shutil
-
-        binary_path = self._find_fuzzer_binary()
-        if not binary_path:
-            LOG.warning("Could not find original fuzzer binary to snapshot")
-            return
-
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        dest = self.output_dir / "original_binary"
-        try:
-            shutil.copy2(binary_path, dest)
-            LOG.info(f"Saved original binary to {dest}")
-        except Exception as e:
-            LOG.error(f"Failed to save original binary: {e}")
-
     def _save_binary_for_fuzzing(self) -> bool:
         """
         Always copy a fuzzer binary to output directory for downstream fuzzing.
@@ -570,10 +608,19 @@ class BaseAgent(ABC):
         This ensures the fuzz-llm step always has a binary to fuzz, enabling
         baseline fuzzing data collection even when patching fails.
 
+        Safe to call multiple times: skips if the binary was already saved
+        (e.g. before overlay teardown).
+
         Returns:
             True if binary was saved successfully, False otherwise
         """
         import shutil
+
+        # Skip if we already saved the binary (e.g. before overlay teardown)
+        dest_path = self.output_dir / "rebuilt_binary"
+        if dest_path.exists():
+            LOG.debug("Binary already saved, skipping")
+            return True
 
         # Find the binary path
         binary_path = self._find_fuzzer_binary()

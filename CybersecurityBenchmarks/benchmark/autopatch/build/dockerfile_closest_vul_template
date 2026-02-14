@@ -1,0 +1,23 @@
+FROM docker.io/n132/arvo:{ARVO_ID}-vul
+ARG TARGET_COMMIT
+ARG VUL_DATE
+ARG PROJECT
+# Use PROJECT from metadata to find source dir
+RUN SRC_DIR="/src/${PROJECT}"; \
+    if [ ! -d "$SRC_DIR/.git" ]; then \
+        echo "WARNING: /src/${PROJECT} is not a git repo, falling back"; \
+        if [ -d .git ]; then SRC_DIR=$(pwd); \
+        else SRC_DIR=$(find /src -maxdepth 2 -type d -name ".git" 2>/dev/null | head -1 | xargs dirname 2>/dev/null); fi; \
+    fi; \
+    cd "$SRC_DIR" && \
+    if ! git cat-file -e ${TARGET_COMMIT} 2>/dev/null; then \
+        echo "Commit not in history, fetching since ${VUL_DATE}..." && \
+        git fetch --shallow-since="${VUL_DATE}" origin 2>/dev/null || true; \
+    fi && \
+    git checkout ${TARGET_COMMIT} --force
+
+# Rebuild project at commit C so binaries match the checked-out source
+RUN arvo compile
+
+# QA: Assert that crash still occurs at commit C
+RUN ! arvo

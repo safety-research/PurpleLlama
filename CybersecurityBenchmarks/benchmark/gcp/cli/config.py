@@ -3,6 +3,7 @@ Configuration management for Argo/GKE CLI.
 """
 
 import json
+import json5
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -161,6 +162,9 @@ class RunConfig:
     build_version: str = "auto"
     patch_use_spot: bool = True
     fuzz_use_spot: bool = True
+    vul_base_image: str = (
+        ""  # Override vul base image, e.g. "registry/arvo-{case_id}-closest-vul:latest"
+    )
 
 
 def get_config_path() -> Path:
@@ -188,7 +192,7 @@ def parse_cases(cases_str: str) -> list[int]:
         if not path.is_absolute():
             path = get_script_dir().parent.parent / path
         with open(path) as f:
-            data = json.load(f)
+            data = json5.load(f)
         if isinstance(data, list):
             if isinstance(data[0], dict):
                 return [item.get("arvo_id") or item.get("id") for item in data]

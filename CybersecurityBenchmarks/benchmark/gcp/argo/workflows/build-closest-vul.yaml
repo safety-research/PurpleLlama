@@ -1,0 +1,158 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: build-closest-vul-
+  namespace: argo
+spec:
+  entrypoint: build-all
+  serviceAccountName: arvo-workflow-sa
+
+  parallelism: 50
+
+  podMetadata:
+    labels:
+      owner: "{{workflow.labels.owner}}"
+      job-type: "build-closest-vul"
+
+  arguments:
+    parameters:
+      - name: cases-json
+        value: "[]"
+      - name: bucket
+        value: ""
+      - name: registry
+        value: ""
+      - name: build-version
+        value: "latest"
+
+  templates:
+    - name: build-all
+      dag:
+        failFast: false
+        tasks:
+          - name: build
+            withParam: "{{workflow.parameters.cases-json}}"
+            template: build-closest-vul-case
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{item.id}}"
+                - name: target-commit
+                  value: "{{item.target_commit}}"
+                - name: vul-date
+                  value: "{{item.vul_date}}"
+                - name: project
+                  value: "{{item.project}}"
+
+    # Inline build template: upstream -fix base + git checkout to target commit.
+    # Produces a thin image used as base for dockerfile_vul_template in closest-vul mode.
+    - name: build-closest-vul-case
+      inputs:
+        parameters:
+          - name: case-id
+          - name: target-commit
+          - name: vul-date
+          - name: project
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "build"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+        workload-type: build
+      retryStrategy:
+        limit: 3
+        retryPolicy: "Always"
+        expression: 'lastRetry.status == "Error" or (lastRetry.status == "Failed" and asInt(lastRetry.exitCode) not in [0])'
+        backoff:
+          duration: "30s"
+          factor: 2
+          cap: "10m"
+      container:
+        image: moby/buildkit:buildx-stable-1
+        securityContext:
+          privileged: true
+        env:
+          - name: DOCKER_CONFIG
+            value: "/auth"
+        command: ["buildctl-daemonless.sh"]
+        args:
+          - "build"
+          - "--frontend=dockerfile.v0"
+          - "--local=context=/workspace"
+          - "--local=dockerfile=/workspace"
+          - "--opt=build-arg:TARGET_COMMIT={{inputs.parameters.target-commit}}"
+          - "--opt=build-arg:VUL_DATE={{inputs.parameters.vul-date}}"
+          - "--opt=build-arg:PROJECT={{inputs.parameters.project}}"
+          - '--output=type=image,"name={{workflow.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-closest-vul:{{workflow.parameters.build-version}},{{workflow.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-closest-vul:latest",push=true'
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+          - name: auth
+            mountPath: /auth
+            readOnly: true
+        resources:
+          requests:
+            cpu: "3"
+            memory: "8G"
+          limits:
+            cpu: "7"
+            memory: "16G"
+      initContainers:
+        - name: prepare-build-context
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              CASE_ID="{{inputs.parameters.case-id}}"
+              BUCKET="{{workflow.parameters.bucket}}"
+
+              # Download lightweight Dockerfile template (FROM upstream-fix + git checkout)
+              gsutil cp gs://${BUCKET}/build-assets/dockerfile_closest_vul_template /workspace/
+
+              # Generate Dockerfile from template
+              sed "s|{ARVO_ID}|${CASE_ID}|g" /workspace/dockerfile_closest_vul_template > /workspace/Dockerfile
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+        - name: prepare-registry-auth
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              if [ -f /docker-secret/.dockerconfigjson ]; then
+                cp /docker-secret/.dockerconfigjson /auth/config.json
+              else
+                echo '{"auths":{}}' > /auth/config.json
+              fi
+              TOKEN=$(gcloud auth print-access-token)
+              REGISTRY_HOST=$(echo "{{workflow.parameters.registry}}" | cut -d/ -f1)
+              python3 -c "
+              import json, os
+              cfg = json.load(open('/auth/config.json'))
+              cfg.setdefault('auths', {})['https://${REGISTRY_HOST}'] = {
+                  'auth': '$(echo -n "oauth2accesstoken:${TOKEN}" | base64 -w0)'
+              }
+              json.dump(cfg, open('/auth/config.json', 'w'))
+              "
+              echo "Registry auth configured for Docker Hub + ${REGISTRY_HOST}"
+          volumeMounts:
+            - name: docker-secret
+              mountPath: /docker-secret
+              readOnly: true
+            - name: auth
+              mountPath: /auth
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: docker-secret
+          secret:
+            secretName: dockerhub-registry
+            optional: true
+        - name: auth
+          emptyDir: {}

@@ -7,75 +7,71 @@ description: Build an interactive HTML explorer for ARVO patch comparison analys
 
 Generate a self-contained HTML page that displays patch comparison analysis results as an interactive table with per-case detail views, summary charts, and filtering.
 
-## Required Inputs
+## Quick Start
 
-The user must provide (or you infer from context):
-
-| Input | Description | Example |
-|-------|-------------|---------|
-| `analysis_experiment` | Analysis experiment ID (GCS path segment) | `analysis-20260213-133233` |
-| `source_experiment` | Source patching experiment ID | `fuzz1800_all_0213_3` |
-| `agent_id` | Agent being compared to GT | `claudecode-claude-opus-4-6` |
-| `cases_config` | Config file with cases list | `configs/new_vul_all.json` |
-| `output_path` | Where to save the HTML | `/tmp/analysis_explorer.html` |
-
-Optional:
-| Input | Description | Default |
-|-------|-------------|---------|
-| `image_audit_path` | Local path to image-audit results (for dirty-repo filtering) | `None` (no filtering) |
-| `bucket` | GCS bucket name | Read from `.gke-config.json` |
-
-## Steps
-
-### 1. Download artifacts from GCS
+Use the download script to fetch all artifacts and build explorers in one command:
 
 ```bash
-BUCKET=$(python3 -c "import json; print(json.load(open('.gke-config.json'))['bucket_name'])")
+# From CybersecurityBenchmarks/ directory
+python analysis/download_analysis.py <analysis-experiment> --build --open
 ```
 
-Download three types of artifacts per case to a local staging dir:
+This auto-detects the source experiment, agents, and cases from the analysis reports.
+
+## Examples
 
 ```bash
-STAGING=/tmp/explorer-staging
-# For each case_id:
-gsutil cp "gs://$BUCKET/results/$SOURCE_EXP/$CASE_ID/$AGENT_ID/patch.patch" "$STAGING/$CASE_ID/agent_patch.patch"
-gsutil cp "gs://$BUCKET/results/$SOURCE_EXP/$CASE_ID/$AGENT_ID/conversation.json" "$STAGING/$CASE_ID/conversation.json"
-gsutil cp "gs://$BUCKET/patches/$CASE_ID-patch.json" "$STAGING/$CASE_ID/gt_patch.json"
+# Download + build + open all agent explorers
+python analysis/download_analysis.py analysis-20260222-214329 --build --open
+
+# Just download (no build)
+python analysis/download_analysis.py analysis-20260222-214329
+
+# Reuse previously downloaded data
+python analysis/download_analysis.py analysis-20260222-214329 \
+    --local /tmp/explorer-analysis-20260222-214329 --build --open
+
+# Custom output directory
+python analysis/download_analysis.py analysis-20260222-214329 \
+    --output-dir /tmp/my-analysis --build
+
+# With extra build_explorer.py options
+python analysis/download_analysis.py analysis-20260222-214329 --build \
+    --build-args --image-audit /tmp/image-audit --classifications /tmp/cls.json
 ```
 
-Analysis reports are at:
+## What It Does
+
+1. **Downloads from GCS** (3 rsync operations):
+   - Analysis reports from `gs://BUCKET/analysis/patch-comparison/<analysis-experiment>/`
+   - Agent patches + conversations from `gs://BUCKET/results/<source-experiment>/`
+   - GT patches from `gs://BUCKET/patches/`
+
+2. **Auto-detects** source experiment (from report.json) and agent IDs (from directory structure)
+
+3. **Stages per-agent artifacts** into the layout `build_explorer.py` expects (using symlinks)
+
+4. **Builds HTML explorers** (one per agent) if `--build` is passed
+
+## Finding the Analysis Experiment ID
+
+List available analysis experiments:
 ```bash
-gsutil -m rsync -r "gs://$BUCKET/analysis/patch-comparison/$ANALYSIS_EXP/" "$STAGING/analysis/"
+gsutil ls gs://$(python3 -c "import json; print(json.load(open('benchmark/gcp/.gke-config.json'))['bucket_name'])")/analysis/patch-comparison/
 ```
 
-### 2. Generate the HTML
+## Manual Build (Advanced)
 
-Run the generator script, passing all parameters:
+If you need fine-grained control, run `build_explorer.py` directly:
 
 ```bash
 python3 analysis/build_explorer.py \
   --analysis-dir "$STAGING/analysis" \
-  --artifacts-dir "$STAGING" \
+  --artifacts-dir "$STAGING/per-agent/$AGENT_ID" \
   --agent-id "$AGENT_ID" \
   --output "$OUTPUT_PATH" \
   --image-audit "/tmp/image-audit"  # optional
 ```
-
-If `build_explorer.py` doesn't exist yet, create it following the template in [explorer-template.md](explorer-template.md).
-
-### 3. Open the result
-
-```bash
-open "$OUTPUT_PATH"
-```
-
-## Key Design Points
-
-- **Self-contained**: All data (JSON, base64 charts) embedded in a single HTML file
-- **GT patch format**: ARVO metadata uses `{"filename": "...", "patch": "..."}` array -- the `patch` field has the actual diff hunks
-- **Conversation parsing**: Agent conversations use SDK message format with `TextBlock(text=...)` and `ToolUseBlock(...)` string representations
-- **Blinding**: Reports use Patch A/B -- unblind via `blinding_key.json` which maps `patch_a_patcher` and `patch_b_patcher`
-- **Dirty repo filtering**: If image-audit data exists, cases with modified tracked files (not just `??` untracked) are flagged and hidden by default
 
 ## HTML Features
 
@@ -87,3 +83,11 @@ The generated page includes:
 - Keyboard nav: Escape to close, Left/Right arrows between cases
 - Diff syntax coloring (green additions, red deletions, blue hunks)
 - Stats bar updating live with filter changes
+
+## Key Design Points
+
+- **Self-contained**: All data (JSON, base64 charts) embedded in a single HTML file
+- **GT patch format**: ARVO metadata uses `{"filename": "...", "patch": "..."}` array -- the `patch` field has the actual diff hunks
+- **Conversation parsing**: Agent conversations use SDK message format with `TextBlock(text=...)` and `ToolUseBlock(...)` string representations
+- **Blinding**: Reports use Patch A/B -- unblind via `blinding_key.json` which maps `patch_a_patcher` and `patch_b_patcher`
+- **Dirty repo filtering**: If image-audit data exists, cases with modified tracked files (not just `??` untracked) are flagged and hidden by default

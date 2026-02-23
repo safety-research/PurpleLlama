@@ -227,7 +227,7 @@ def load_cases(
         bb = comp.get("which_is_better", "equivalent")
         better = pa if bb == "a" else (pb if bb == "b" else "equivalent")
         better_disp = (
-            "Opus" if agent_id in better else ("GT" if better == "gt" else "Equivalent")
+            "Agent" if agent_id in better else ("GT" if better == "gt" else "Equivalent")
         )
 
         # Agent patch
@@ -363,7 +363,7 @@ def generate_chart_b64(cases: list[dict], agent_label: str) -> str:
     # 2. Which is better
     ax = axes[0, 1]
     better_counts = Counter(c["better"] for c in completed)
-    bl = ["Opus", "Equivalent", "GT"]
+    bl = ["Agent", "Equivalent", "GT"]
     bv = [better_counts.get(b, 0) for b in bl]
     bc = ["#8e44ad", "#95a5a6", "#27ae60"]
     bars = ax.bar(bl, bv, color=bc, width=0.6)
@@ -435,14 +435,15 @@ def build_html(cases: list[dict], chart_b64: str, agent_label: str) -> str:
     """Build the self-contained HTML explorer page."""
     data_json = json.dumps(cases, ensure_ascii=True)
 
-    chart_section = ""
-    if chart_b64:
-        chart_section = f'''<div class="chart-section">
+    chart_section = f'''<div class="chart-section">
   <div class="chart-toggle open" onclick="this.classList.toggle('open'); this.nextElementSibling.classList.toggle('open');">
     <span class="arrow">&#9654;</span> Summary Charts (click to collapse)
   </div>
   <div class="chart-img-wrap open">
-    <img src="data:image/png;base64,{chart_b64}" alt="Summary Charts">
+    <canvas id="chart-similarity" width="380" height="300"></canvas>
+    <canvas id="chart-better" width="380" height="300"></canvas>
+    <canvas id="chart-correctness" width="380" height="300"></canvas>
+    <canvas id="chart-approach" width="380" height="300"></canvas>
   </div>
 </div>'''
 
@@ -489,8 +490,8 @@ tr.case-row:hover {{ background: #eaf2f8; }}
 .chart-toggle:hover {{ background: #f8f9fa; }}
 .chart-toggle .arrow {{ transition: transform 0.2s; }}
 .chart-toggle.open .arrow {{ transform: rotate(90deg); }}
-.chart-img-wrap {{ display: none; padding: 10px; text-align: center; }}
-.chart-img-wrap.open {{ display: block; }}
+.chart-img-wrap {{ display: none; padding: 15px; text-align: center; flex-wrap: wrap; justify-content: center; gap: 10px; }}
+.chart-img-wrap.open {{ display: flex; }}
 .chart-img-wrap img {{ max-width: 100%; height: auto; }}
 #detail-overlay {{ display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: #f5f6fa; z-index: 100; overflow-y: auto; }}
 #detail-overlay.active {{ display: block; }}
@@ -534,7 +535,7 @@ pre .diff-hunk {{ color: #569cd6; }}
   <div class="stats" id="stats"></div>
 </div>
 <div class="controls">
-  <label>Filter: <select id="filter-better"><option value="all">All</option><option value="Opus">Agent better</option><option value="GT">GT better</option><option value="Equivalent">Equivalent</option></select></label>
+  <label>Filter: <select id="filter-better"><option value="all">All</option><option value="Agent">Agent better</option><option value="GT">GT better</option><option value="Equivalent">Equivalent</option></select></label>
   <label>Correctness: <select id="filter-correct"><option value="all">All</option><option value="both-correct">Both correct</option><option value="opus-only">Agent correct, GT not</option><option value="gt-only">GT correct, Agent not</option></select></label>
   <label>Strategy: <select id="filter-strategy"><option value="all">All</option><option value="gt_upstream_llm_downstream">GT upstream / LLM downstream</option><option value="llm_better_strategy">LLM better strategy</option><option value="both_similar">Both similar</option><option value="other">Other</option></select></label>
   <label><input type="checkbox" id="hide-dirty" checked> Hide dirty-repo cases</label>
@@ -586,7 +587,7 @@ const DATA = {data_json};
 let sortCol = null, sortDir = 1, currentFiltered = [], currentDetailIdx = -1;
 const CO = {{correct:0,partial:1,incorrect:2,unknown:3}};
 const SO = {{identical:0,similar_approach:1,different_approach:2,fundamentally_different:3,unknown:4}};
-const BO = {{Opus:0,Equivalent:1,GT:2}};
+const BO = {{Agent:0,Equivalent:1,GT:2}};
 function sv(c,col) {{
   if(col==='id') return parseInt(c.id);
   if(col==='opus_correct') return CO[c.opus_correct]??9;
@@ -627,7 +628,7 @@ function md(s){{ if(!s) return '<p style="color:#999">(empty)</p>'; let h=esc(s)
   h=h.replace(/\\n\\n/g,'</p><p>');
   return '<p>'+h+'</p>';
 }}
-function tc(t,v){{ if(t==='correct') return 'tag-'+v; if(t==='better') return v==='Opus'?'tag-opus':v==='GT'?'tag-gt':'tag-equiv'; if(t==='sim'){{ if(v==='identical') return 'tag-identical'; if(v==='similar_approach') return 'tag-similar'; if(v==='different_approach') return 'tag-different'; return 'tag-fundamental'; }} return ''; }}
+function tc(t,v){{ if(t==='correct') return 'tag-'+v; if(t==='better') return v==='Agent'?'tag-opus':v==='GT'?'tag-gt':'tag-equiv'; if(t==='sim'){{ if(v==='identical') return 'tag-identical'; if(v==='similar_approach') return 'tag-similar'; if(v==='different_approach') return 'tag-different'; return 'tag-fundamental'; }} return ''; }}
 function sl(v){{ return v.replace(/_/g,' ').replace(/\\b\\w/g,l=>l.toUpperCase()); }}
 function openDetail(idx){{ currentDetailIdx=idx; const c=currentFiltered[idx];
   document.getElementById('detail-title').textContent='Case '+c.id+' ('+c.vuln_type+')';
@@ -646,12 +647,95 @@ function closeDetail(){{ document.getElementById('detail-overlay').classList.rem
 function navCase(dir){{ const n=currentDetailIdx+dir; if(n>=0&&n<currentFiltered.length) openDetail(n); }}
 document.addEventListener('keydown',e=>{{ if(!document.getElementById('detail-overlay').classList.contains('active')) return; if(e.key==='Escape') closeDetail(); if(e.key==='ArrowLeft') navCase(-1); if(e.key==='ArrowRight') navCase(1); }});
 document.querySelectorAll('th[data-col]').forEach(th=>{{ th.onclick=()=>{{ const col=th.dataset.col; if(sortCol===col) sortDir*=-1; else {{ sortCol=col; sortDir=1; }} document.querySelectorAll('th .sort-arrow').forEach(a=>{{ a.textContent=''; a.classList.remove('active'); }}); th.querySelector('.sort-arrow').textContent=sortDir===1?'\\u25B2':'\\u25BC'; th.querySelector('.sort-arrow').classList.add('active'); render(); }}; }});
+function drawBar(ctx,x,y,w,h,color){{ ctx.fillStyle=color; ctx.fillRect(x,y,w,h); }}
+function drawBarChart(canvasId,title,labels,values,colors){{
+  const cv=document.getElementById(canvasId); if(!cv) return;
+  const ctx=cv.getContext('2d'), W=cv.width, H=cv.height, pad=50, top=40, bot=60;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#2c3e50'; ctx.font='bold 13px sans-serif'; ctx.textAlign='center'; ctx.fillText(title,W/2,22);
+  const mx=Math.max(...values,1), bw=Math.min(50,(W-pad*2)/labels.length*0.7), chartH=H-top-bot;
+  labels.forEach((l,i)=>{{
+    const x=pad+(W-pad*2)/(labels.length)*(i+0.5)-bw/2;
+    const h=values[i]/mx*chartH;
+    drawBar(ctx,x,top+chartH-h,bw,h,colors[i]||'#8e44ad');
+    ctx.fillStyle='#2c3e50'; ctx.font='11px sans-serif'; ctx.textAlign='center';
+    ctx.fillText(l,x+bw/2,H-bot+15);
+    if(values[i]>0) ctx.fillText(values[i],x+bw/2,top+chartH-h-5);
+  }});
+}}
+function drawGroupedBar(canvasId,title,labels,v1,v2,c1,c2,l1,l2){{
+  const cv=document.getElementById(canvasId); if(!cv) return;
+  const ctx=cv.getContext('2d'), W=cv.width, H=cv.height, pad=50, top=40, bot=60;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#2c3e50'; ctx.font='bold 13px sans-serif'; ctx.textAlign='center'; ctx.fillText(title,W/2,22);
+  const mx=Math.max(...v1,...v2,1), bw=Math.min(25,(W-pad*2)/labels.length*0.3), chartH=H-top-bot;
+  labels.forEach((l,i)=>{{
+    const cx=pad+(W-pad*2)/(labels.length)*(i+0.5);
+    const h1=v1[i]/mx*chartH, h2=v2[i]/mx*chartH;
+    drawBar(ctx,cx-bw-1,top+chartH-h1,bw,h1,c1);
+    drawBar(ctx,cx+1,top+chartH-h2,bw,h2,c2);
+    ctx.fillStyle='#2c3e50'; ctx.font='10px sans-serif'; ctx.textAlign='center';
+    ctx.fillText(l,cx,H-bot+15);
+    if(v1[i]>0) ctx.fillText(v1[i],cx-bw/2-1,top+chartH-h1-4);
+    if(v2[i]>0) ctx.fillText(v2[i],cx+bw/2+1,top+chartH-h2-4);
+  }});
+  ctx.font='10px sans-serif';
+  ctx.fillStyle=c1; ctx.fillRect(W-140,top,10,10); ctx.fillStyle='#2c3e50'; ctx.fillText(l1,W-85,top+9);
+  ctx.fillStyle=c2; ctx.fillRect(W-140,top+15,10,10); ctx.fillStyle='#2c3e50'; ctx.fillText(l2,W-85,top+24);
+}}
+function drawPie(canvasId,title,labels,values,colors){{
+  const cv=document.getElementById(canvasId); if(!cv) return;
+  const ctx=cv.getContext('2d'), W=cv.width, H=cv.height, cx=W/2, cy=H/2+10, r=Math.min(W,H)/2-50;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#2c3e50'; ctx.font='bold 13px sans-serif'; ctx.textAlign='center'; ctx.fillText(title,W/2,22);
+  const total=values.reduce((a,b)=>a+b,0);
+  if(total===0) {{ ctx.fillStyle='#999'; ctx.font='12px sans-serif'; ctx.fillText('No data',cx,cy); return; }}
+  let angle=-Math.PI/2;
+  labels.forEach((l,i)=>{{
+    if(values[i]===0) return;
+    const slice=values[i]/total*Math.PI*2;
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,angle,angle+slice); ctx.closePath();
+    ctx.fillStyle=colors[i]; ctx.fill(); ctx.strokeStyle='white'; ctx.lineWidth=2; ctx.stroke();
+    const mid=angle+slice/2, lx=cx+Math.cos(mid)*(r*0.65), ly=cy+Math.sin(mid)*(r*0.65);
+    ctx.fillStyle='#fff'; ctx.font='bold 11px sans-serif'; ctx.textAlign='center';
+    const pct=Math.round(values[i]/total*100);
+    if(pct>3) ctx.fillText(pct+'%',lx,ly);
+    const ox=cx+Math.cos(mid)*(r+18), oy=cy+Math.sin(mid)*(r+18);
+    ctx.fillStyle='#2c3e50'; ctx.font='10px sans-serif';
+    if(pct>3) ctx.fillText(l+' ('+values[i]+')',ox,oy);
+    angle+=slice;
+  }});
+}}
+function renderCharts(data){{
+  const simKeys=['identical','similar_approach','different_approach','fundamentally_different'];
+  const simLabels=['Identical','Similar','Different','Fundamental'];
+  const simColors=['#2ecc71','#3498db','#f39c12','#e74c3c'];
+  const simVals=simKeys.map(k=>data.filter(c=>c.similarity===k).length);
+  drawPie('chart-similarity','Patch Similarity',simLabels,simVals,simColors);
+
+  const betterLabels=['Agent','Equivalent','GT'];
+  const betterVals=betterLabels.map(b=>data.filter(c=>c.better===b).length);
+  drawBarChart('chart-better','Which Patch is Better?',betterLabels,betterVals,['#8e44ad','#95a5a6','#27ae60']);
+
+  const corrLevels=['correct','partial','incorrect','unknown'];
+  const corrLabels=corrLevels.map(c=>c.charAt(0).toUpperCase()+c.slice(1));
+  const agentCorr=corrLevels.map(k=>data.filter(c=>c.opus_correct===k).length);
+  const gtCorr=corrLevels.map(k=>data.filter(c=>c.gt_correct===k).length);
+  drawGroupedBar('chart-correctness','Patch Correctness',corrLabels,agentCorr,gtCorr,'#8e44ad','#27ae60','Agent','GT');
+
+  const appKeys=['root_cause_fix','symptom_masking','incomplete_fix','overly_broad','no_op'];
+  const appLabels=appKeys.map(a=>a.replace(/_/g,' '));
+  const agentApp=appKeys.map(k=>data.filter(c=>c.opus_approach===k).length);
+  const gtApp=appKeys.map(k=>data.filter(c=>c.gt_approach===k).length);
+  drawGroupedBar('chart-approach','Patch Approach Type',appLabels,agentApp,gtApp,'#8e44ad','#27ae60','Agent','GT');
+}}
 function render(){{ const bF=document.getElementById('filter-better').value, cF=document.getElementById('filter-correct').value, hD=document.getElementById('hide-dirty').checked, sr=document.getElementById('search').value.trim();
   const sF=document.getElementById('filter-strategy').value;
   currentFiltered=DATA.filter(c=>{{ if(hD&&c.dirty) return false; if(sr&&!c.id.includes(sr)) return false; if(bF!=='all'&&c.better!==bF) return false; if(sF!=='all'&&(c.fix_strategy||'')!==sF) return false; if(cF==='both-correct'&&!(c.opus_correct==='correct'&&c.gt_correct==='correct')) return false; if(cF==='opus-only'&&!(c.opus_correct==='correct'&&c.gt_correct!=='correct')) return false; if(cF==='gt-only'&&!(c.gt_correct==='correct'&&c.opus_correct!=='correct')) return false; return true; }});
   if(sortCol) currentFiltered.sort((a,b)=>{{ const va=sv(a,sortCol),vb=sv(b,sortCol); if(typeof va==='number'&&typeof vb==='number') return (va-vb)*sortDir; return String(va).localeCompare(String(vb))*sortDir; }});
-  const n=currentFiltered.length, ob=currentFiltered.filter(c=>c.better==='Opus').length, gb=currentFiltered.filter(c=>c.better==='GT').length, eq=currentFiltered.filter(c=>c.better==='Equivalent').length, oc=currentFiltered.filter(c=>c.opus_correct==='correct').length, gc=currentFiltered.filter(c=>c.gt_correct==='correct').length;
+  const n=currentFiltered.length, ob=currentFiltered.filter(c=>c.better==='Agent').length, gb=currentFiltered.filter(c=>c.better==='GT').length, eq=currentFiltered.filter(c=>c.better==='Equivalent').length, oc=currentFiltered.filter(c=>c.opus_correct==='correct').length, gc=currentFiltered.filter(c=>c.gt_correct==='correct').length;
   document.getElementById('stats').innerHTML=`<span>Showing: ${{n}} cases</span><span>Agent better: ${{ob}} (${{n?Math.round(ob/n*100):0}}%)</span><span>GT better: ${{gb}} (${{n?Math.round(gb/n*100):0}}%)</span><span>Equivalent: ${{eq}} (${{n?Math.round(eq/n*100):0}}%)</span><span>Agent correct: ${{oc}}/${{n}}</span><span>GT correct: ${{gc}}/${{n}}</span>`;
+  renderCharts(currentFiltered);
   const tbody=document.getElementById('tbody'); tbody.innerHTML='';
   currentFiltered.forEach((c,idx)=>{{ const tr=document.createElement('tr'); tr.className='case-row'+(c.dirty?' dirty':'');
     const fs=c.fix_strategy||''; const fsc=fs==='gt_upstream_llm_downstream'?'tag-different':fs==='llm_better_strategy'?'tag-opus':fs==='both_similar'?'tag-identical':'tag-unknown'; const fsl=fs==='gt_upstream_llm_downstream'?'GT upstream':fs==='llm_better_strategy'?'LLM better':fs==='both_similar'?'Similar':'other';
@@ -731,13 +815,8 @@ def main():
             n_prox = sum(1 for c in cases if c.get("proximity", "unknown") != "unknown")
             print(f"  Merged {n_prox} proximity classifications")
 
-    chart_b64 = ""
-    if not args.no_charts:
-        print("Generating charts...")
-        chart_b64 = generate_chart_b64(cases, agent_label)
-
     print(f"Building HTML...")
-    html = build_html(cases, chart_b64, agent_label)
+    html = build_html(cases, "", agent_label)
 
     Path(args.output).write_text(html)
     size_mb = Path(args.output).stat().st_size / 1024 / 1024

@@ -96,13 +96,17 @@ def _resolve_patcher_patch(patcher_id: str, artifacts_dir: str) -> Optional[str]
     if patch_json.exists():
         try:
             patches = json.loads(patch_json.read_text())
-            # Convert to unified diff format
             diffs = []
             for p in patches:
                 filename = p.get("filename", "unknown")
                 patch_text = p.get("patch", "")
                 if patch_text:
-                    diffs.append(f"--- a/{filename}\n+++ b/{filename}\n@@ {patch_text}")
+                    # patch_text starts with hunk range (e.g. "-260,8 +260,19 @@ ...")
+                    # and contains the diff body with context/+/- lines.
+                    hunk = f"@@ {patch_text}"
+                    if not hunk.endswith("\n"):
+                        hunk += "\n"
+                    diffs.append(f"--- a/{filename}\n+++ b/{filename}\n{hunk}")
             return "\n".join(diffs) if diffs else None
         except (json.JSONDecodeError, KeyError) as e:
             LOG.warning(f"Failed to parse GT patch JSON: {e}")
@@ -191,18 +195,20 @@ def _create_worktree(src_dir: str, worktree_path: str, branch_name: str) -> None
     LOG.info(f"Created worktree: {worktree_path} (branch: {branch_name})")
 
 
-def _apply_patch_to_worktree(worktree_path: str, patch_diff: str) -> bool:
+def _apply_patch_to_worktree(worktree_path: str, patch_diff: str) -> None:
     """Apply a unified diff patch to a worktree.
 
-    Tries `git apply` first, falls back to `patch -p1`.
-    Returns True if the patch was applied successfully.
+    Tries `git apply` first, falls back to `patch -p1` (no fuzz allowed).
+    Raises RuntimeError if neither method can apply the patch cleanly.
+
+    GT patches from ARVO metadata sometimes have incorrect hunk line counts,
+    which makes `git apply` reject them. `patch -p1 -F0` handles these
+    since it only checks content matches, not header arithmetic.
     """
-    # Write patch to a temp file
     patch_file = Path(worktree_path) / ".tmp_patch.diff"
     patch_file.write_text(patch_diff)
 
     try:
-        # Try git apply first
         result = subprocess.run(
             ["git", "apply", str(patch_file)],
             capture_output=True,
@@ -212,23 +218,28 @@ def _apply_patch_to_worktree(worktree_path: str, patch_diff: str) -> bool:
         )
         if result.returncode == 0:
             LOG.info(f"Applied patch to {worktree_path} via git apply")
-            return True
+            return
 
-        # Fall back to patch -p1
-        LOG.info(f"git apply failed ({result.stderr.strip()}), trying patch -p1")
+        git_err = result.stderr.strip()
+        LOG.info(f"git apply failed ({git_err}), trying patch -p1")
+
+        # -F0 disables fuzz: lines must match at exact offsets (no guessing)
         result = subprocess.run(
-            ["patch", "-p1", "-i", str(patch_file)],
+            ["patch", "-p1", "-F0", "-i", str(patch_file)],
             capture_output=True,
             text=True,
             cwd=worktree_path,
             timeout=30,
         )
         if result.returncode == 0:
-            LOG.info(f"Applied patch to {worktree_path} via patch -p1")
-            return True
+            LOG.info(f"Applied patch to {worktree_path} via patch -p1 -F0")
+            return
 
-        LOG.error(f"Failed to apply patch to {worktree_path}: {result.stderr}")
-        return False
+        raise RuntimeError(
+            f"Patch cannot be applied to {worktree_path}.\n"
+            f"  git apply: {git_err}\n"
+            f"  patch -p1 -F0: {result.stderr.strip()}"
+        )
     finally:
         patch_file.unlink(missing_ok=True)
 
@@ -340,11 +351,9 @@ def setup_workspace(
     _create_worktree(git_root, patch_a_path, "analysis-patch-a")
     _create_worktree(git_root, patch_b_path, "analysis-patch-b")
 
-    # 6. Apply patches to worktrees
-    if not _apply_patch_to_worktree(patch_a_path, a_diff):
-        LOG.error("Failed to apply Patch A -- analysis may be limited")
-    if not _apply_patch_to_worktree(patch_b_path, b_diff):
-        LOG.error("Failed to apply Patch B -- analysis may be limited")
+    # 6. Apply patches to worktrees (raises RuntimeError on failure)
+    _apply_patch_to_worktree(patch_a_path, a_diff)
+    _apply_patch_to_worktree(patch_b_path, b_diff)
 
     # 7. Place binaries
     original_binary = _find_original_binary()

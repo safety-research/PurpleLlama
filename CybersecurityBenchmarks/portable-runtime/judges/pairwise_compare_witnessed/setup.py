@@ -5,7 +5,7 @@ Creates git worktrees for each patch, randomizes the blinding assignment
 (which patcher maps to Patch A vs Patch B), places pre-built binaries,
 produces crash output, and creates the witnesses directory.
 
-Reuses helper functions from analysis/setup.py.
+Reuses helper functions from judges/pairwise_compare/setup.py.
 
 Workspace layout after setup:
     /src/                          Original vulnerable source (git repo)
@@ -25,7 +25,7 @@ import os
 import shutil
 from pathlib import Path
 
-from analysis.setup import (
+from judges.pairwise_compare.setup import (
     ARTIFACTS_DIR,
     BINARIES_DIR,
     PATCHER_1_ARTIFACTS,

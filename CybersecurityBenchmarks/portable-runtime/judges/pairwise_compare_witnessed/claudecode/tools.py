@@ -31,7 +31,7 @@ from claude_agent_sdk import (
 LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Output truncation (same pattern as analysis/claudecode/tools.py)
+# Output truncation (same pattern as judges/pairwise_compare/claudecode/tools.py)
 # ---------------------------------------------------------------------------
 MAX_OUTPUT_CHARS = 200_000
 HEAD_LINES = 100

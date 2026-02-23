@@ -193,7 +193,7 @@ def cmd_submit_witnessed_analysis(
         None, "--experiment", "-e", help="Witnessed analysis experiment ID"
     ),
     analysis_model: str = typer.Option(
-        "claude-sonnet-4-5-20250929", "--model", "-m", help="Analysis model"
+        "claude-opus-4-6", "--model", "-m", help="Analysis model"
     ),
     max_runtime_seconds: int = typer.Option(
         3600, "--max-runtime", help="Max runtime per analysis (seconds)"
@@ -213,7 +213,7 @@ def cmd_submit_witnessed_analysis(
     config_file: Optional[str] = typer.Option(
         None, "--config", "-c", help="Config file (JSON)"
     ),
-    use_spot: bool = typer.Option(True, "--spot/--no-spot", help="Use spot instances"),
+    use_spot: bool = typer.Option(False, "--spot/--no-spot", help="Use spot instances"),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Show what would be submitted"
     ),

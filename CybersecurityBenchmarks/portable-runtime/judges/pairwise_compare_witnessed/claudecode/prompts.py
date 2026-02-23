@@ -7,7 +7,7 @@ no mention of human vs AI, no hints about patcher identity. The agent
 sees only "Patch A" and "Patch B".
 """
 
-from analysis.setup import WorkspaceInfo
+from judges.pairwise_compare.setup import WorkspaceInfo
 
 # ---------------------------------------------------------------------------
 # JSON schema for the analyst's final report

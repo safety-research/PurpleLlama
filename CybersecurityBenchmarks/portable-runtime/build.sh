@@ -81,7 +81,7 @@ echo "=== Step 4: Copying agent and evaluation code ==="
 mkdir -p "${OUTPUT_DIR}/agent-runtime/shared"
 mkdir -p "${OUTPUT_DIR}/agent-runtime/agent"
 mkdir -p "${OUTPUT_DIR}/agent-runtime/evaluation"
-mkdir -p "${OUTPUT_DIR}/agent-runtime/analysis"
+mkdir -p "${OUTPUT_DIR}/agent-runtime/judges"
 
 # Copy shared module (used by agent, analysis, evaluation)
 if [ -d "${SCRIPT_DIR}/shared" ]; then
@@ -107,12 +107,12 @@ else
     echo "WARNING: evaluation/ directory not found"
 fi
 
-# Copy analysis module (for blinded patch comparison)
-if [ -d "${SCRIPT_DIR}/analysis" ]; then
-    cp -r "${SCRIPT_DIR}/analysis/"* "${OUTPUT_DIR}/agent-runtime/analysis/"
-    echo "Copied analysis code"
+# Copy judges module (pairwise comparison + witnessed analysis)
+if [ -d "${SCRIPT_DIR}/judges" ]; then
+    cp -r "${SCRIPT_DIR}/judges/"* "${OUTPUT_DIR}/agent-runtime/judges/"
+    echo "Copied judges code"
 else
-    echo "WARNING: analysis/ directory not found"
+    echo "WARNING: judges/ directory not found"
 fi
 
 # Step 5: Create tarball

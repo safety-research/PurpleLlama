@@ -110,6 +110,18 @@ spec:
           factor: 2
           cap: "5m"
 
+      # On retries, escalate resources so the pod lands on a larger node.
+      podSpecPatch: |
+        containers:
+        - name: main
+          resources:
+            requests:
+              cpu: "{{= sprig.int(retries) >= 1 ? '3.5' : '1.7'}}"
+              memory: "{{= sprig.int(retries) >= 1 ? '13G' : '6G'}}"
+            limits:
+              cpu: "{{= sprig.int(retries) >= 1 ? '3.8' : '1.8'}}"
+              memory: "{{= sprig.int(retries) >= 1 ? '28G' : '12G'}}"
+
       activeDeadlineSeconds: 86400
 
       initContainers:
@@ -256,7 +268,7 @@ spec:
             cp -r /artifacts/* /tmp/artifacts/ 2>/dev/null || true
 
             # Run the witnessed analysis agent
-            /agent-runtime/bin/agent-entrypoint.sh python3 -m witnessed_analysis.main \
+            /agent-runtime/bin/agent-entrypoint.sh python3 -m judges.pairwise_compare_witnessed.main \
               --case-id ${CASE_ID} \
               --source-experiment "{{inputs.parameters.source-experiment}}" \
               --patcher-1 "${PATCHER_1}" \

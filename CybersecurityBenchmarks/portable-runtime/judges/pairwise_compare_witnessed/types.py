@@ -1,7 +1,7 @@
 """
 Data types for the witnessed analysis module.
 
-Reuses VulnerabilityInfo and PatchAnalysis from analysis/types.py for the
+Reuses VulnerabilityInfo and PatchAnalysis from judges/pairwise_compare/types.py for the
 analyst's per-patch assessment. Adds Claim and WitnessReport for the
 witnessed comparison workflow.
 """
@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List
 
-from analysis.types import (
+from judges.pairwise_compare.types import (
     ApproachType,
     Correctness,
     PatchAnalysis,
@@ -106,7 +106,7 @@ class WitnessReport:
     patcher_1: str = ""
     patcher_2: str = ""
 
-    # Analyst output (reused from analysis/)
+    # Analyst output (reused from judges/pairwise_compare/)
     vulnerability: VulnerabilityInfo = field(default_factory=VulnerabilityInfo)
     patch_a: PatchAnalysis = field(default_factory=PatchAnalysis)
     patch_b: PatchAnalysis = field(default_factory=PatchAnalysis)

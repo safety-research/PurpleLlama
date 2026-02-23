@@ -207,14 +207,14 @@ def submit_witnessed_analysis(
     pairs: Optional[str] = None,
     agents: Optional[str] = None,
     analysis_experiment: Optional[str] = None,
-    analysis_model: str = "claude-sonnet-4-5-20250929",
+    analysis_model: str = "claude-opus-4-6",
     max_runtime_seconds: int = 3600,
     max_witness_time: int = 600,
     witness_time_fraction: float = 0.7,
     thinking_budget: Optional[int] = None,
     build_version: str = "latest",
     config_file: Optional[Path] = None,
-    use_spot: bool = True,
+    use_spot: bool = False,
     dry_run: bool = False,
 ) -> None:
     """Submit a witnessed analysis workflow."""

@@ -4,7 +4,7 @@ Permission callback for the witnessed analysis agent.
 Allows writes to /workspace/*, /tmp/*, and /output/ but blocks writes
 to /src/ (the original source must remain pristine) and system paths.
 
-Identical policy to analysis/claudecode/permissions.py.
+Identical policy to judges/pairwise_compare/claudecode/permissions.py.
 """
 
 from claude_agent_sdk import (

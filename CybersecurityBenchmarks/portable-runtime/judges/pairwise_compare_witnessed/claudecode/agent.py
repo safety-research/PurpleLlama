@@ -28,7 +28,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from analysis.setup import WorkspaceInfo
+from judges.pairwise_compare.setup import WorkspaceInfo
 from ..types import Claim, WitnessReport, WitnessStatus
 from .permissions import restrict_witnessed_writes
 from .prompts import get_analyst_initial_prompt, get_analyst_system_prompt

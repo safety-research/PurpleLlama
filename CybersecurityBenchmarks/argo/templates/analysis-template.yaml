@@ -270,7 +270,7 @@ spec:
             cp -r /artifacts/* /tmp/artifacts/ 2>/dev/null || true
 
             # Run the analysis agent
-            /agent-runtime/bin/agent-entrypoint.sh python3 -m analysis.main \
+            /agent-runtime/bin/agent-entrypoint.sh python3 -m judges.pairwise_compare.main \
               --case-id ${CASE_ID} \
               --source-experiment "{{inputs.parameters.source-experiment}}" \
               --patcher-1 "${PATCHER_1}" \

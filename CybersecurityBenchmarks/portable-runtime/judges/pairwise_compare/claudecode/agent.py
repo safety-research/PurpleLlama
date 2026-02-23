@@ -16,7 +16,6 @@ from pathlib import Path
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
-    ClaudeSDKClient,
     ResultMessage,
     ToolUseBlock,
 )
@@ -26,6 +25,8 @@ from ..types import AnalysisReport, AnalysisStatus
 from .permissions import restrict_analysis_writes
 from .prompts import get_initial_prompt, get_system_prompt
 from .tools import create_analysis_mcp_server
+from shared.api_retry import RetryEvent, resilient_sdk_session
+from shared.retry_tracker import RetryTimeTracker
 
 LOG = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ class PatchAnalysisAgent:
         """Run the Claude Code agentic session."""
         session_start = time.monotonic()
         timeout_triggered = False
+        retry_tracker = RetryTimeTracker()
 
         # Create MCP server with analysis tools
         analysis_server = create_analysis_mcp_server()
@@ -142,6 +144,8 @@ class PatchAnalysisAgent:
             # 100 MB buffer — avoid JSON buffer overflow on long conversations
             # (SDK default is 1 MB, which large build outputs can exceed)
             max_buffer_size=100 * 1024 * 1024,
+            # Stderr callback for API retry tracking
+            stderr=retry_tracker.handle_stderr_line,
             # Allow CLI to retry through long API overload windows (default: 10)
             env={"CLAUDE_CODE_MAX_RETRIES": "500"},
         )
@@ -154,29 +158,44 @@ class PatchAnalysisAgent:
 
         last_assistant_text = ""
 
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(initial_prompt)
-            async for message in client.receive_response():
-                self._process_message(message)
+        async for item in resilient_sdk_session(
+            options, initial_prompt, retry_tracker=retry_tracker,
+        ):
+            if isinstance(item, RetryEvent):
+                last_assistant_text = ""
+                timeout_triggered = False
+                continue
+            client, message = item
 
-                # Accumulate assistant text for report extraction
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if hasattr(block, "text") and block.text:
-                            last_assistant_text += block.text
+            retry_tracker.on_message_received()
+            self._process_message(message)
 
-                # Check time budget
-                elapsed = time.monotonic() - session_start
-                if elapsed > self.max_runtime_seconds:
-                    LOG.warning(f"Time budget exceeded: {elapsed:.1f}s. Interrupting.")
-                    timeout_triggered = True
-                    self.report.status = AnalysisStatus.TIMEOUT.value
-                    await client.interrupt()
-                    break
+            # Accumulate assistant text for report extraction
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if hasattr(block, "text") and block.text:
+                        last_assistant_text += block.text
+
+            # Check time budget (excluding retry time)
+            elapsed = time.monotonic() - session_start
+            excluded = retry_tracker.get_excluded_seconds()
+            active = elapsed - excluded
+            if active > self.max_runtime_seconds:
+                LOG.warning(
+                    f"Time budget exceeded: {active:.1f}s active "
+                    f"(excluded {excluded:.1f}s from {retry_tracker.get_retry_count()} retries). "
+                    f"Interrupting."
+                )
+                timeout_triggered = True
+                self.report.status = AnalysisStatus.TIMEOUT.value
+                await client.interrupt()
+                break
 
         session_elapsed = time.monotonic() - session_start
+        session_excluded = retry_tracker.get_excluded_seconds()
         LOG.info(
             f"Session complete: {session_elapsed:.1f}s"
+            + (f", {session_excluded:.1f}s excluded ({retry_tracker.get_retry_count()} retries)" if session_excluded > 0 else "")
             + (", TIMEOUT" if timeout_triggered else "")
         )
 

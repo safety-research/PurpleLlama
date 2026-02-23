@@ -23,11 +23,11 @@ from pathlib import Path
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
-    ClaudeSDKClient,
     ResultMessage,
     ToolUseBlock,
 )
 
+from shared.api_retry import RetryEvent, resilient_sdk_session
 from shared.retry_tracker import RetryTimeTracker
 from judges.pairwise_compare.setup import WorkspaceInfo
 from ..types import Claim, WitnessReport, WitnessStatus
@@ -183,29 +183,35 @@ class WitnessAnalystAgent:
             stderr=retry_tracker.handle_stderr_line,
         )
 
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(initial_prompt)
-            async for message in client.receive_response():
-                retry_tracker.on_message_received()
-                self._process_message(message)
+        async for item in resilient_sdk_session(
+            options, initial_prompt, retry_tracker=retry_tracker,
+        ):
+            if isinstance(item, RetryEvent):
+                last_assistant_text = ""
+                timeout_triggered = False
+                continue
+            client, message = item
 
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if hasattr(block, "text") and block.text:
-                            last_assistant_text += block.text
+            retry_tracker.on_message_received()
+            self._process_message(message)
 
-                elapsed = time.monotonic() - session_start
-                excluded = retry_tracker.get_excluded_seconds()
-                active = elapsed - excluded
-                if active > self.max_runtime_seconds:
-                    LOG.warning(
-                        f"Time budget exceeded: {active:.1f}s active "
-                        f"(excluded {excluded:.1f}s from {retry_tracker.get_retry_count()} retries). Interrupting."
-                    )
-                    timeout_triggered = True
-                    self.report.status = WitnessStatus.TIMEOUT.value
-                    await client.interrupt()
-                    break
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if hasattr(block, "text") and block.text:
+                        last_assistant_text += block.text
+
+            elapsed = time.monotonic() - session_start
+            excluded = retry_tracker.get_excluded_seconds()
+            active = elapsed - excluded
+            if active > self.max_runtime_seconds:
+                LOG.warning(
+                    f"Time budget exceeded: {active:.1f}s active "
+                    f"(excluded {excluded:.1f}s from {retry_tracker.get_retry_count()} retries). Interrupting."
+                )
+                timeout_triggered = True
+                self.report.status = WitnessStatus.TIMEOUT.value
+                await client.interrupt()
+                break
 
         session_elapsed = time.monotonic() - session_start
         session_excluded = retry_tracker.get_excluded_seconds()

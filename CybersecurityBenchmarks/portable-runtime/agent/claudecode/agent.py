@@ -14,7 +14,6 @@ import time
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
-    ClaudeSDKClient,
     ResultMessage,
     ToolUseBlock,
 )
@@ -22,6 +21,7 @@ from claude_agent_sdk import (
 from ..base import AgentResult, AgentStatus, BaseAgent
 from .permissions import restrict_file_writes
 from .prompts import get_project_source_path, get_system_prompt
+from shared.api_retry import RetryEvent, resilient_sdk_session
 from shared.retry_tracker import RetryTimeTracker
 from .tools import create_arvo_mcp_server
 
@@ -253,28 +253,33 @@ class ClaudeCodeAgent(BaseAgent):
             f"max_runtime_seconds={self.max_runtime_seconds}"
         )
 
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(initial_prompt)
-            async for message in client.receive_response():
-                # Finalize any retry sequence when we receive a message
-                retry_tracker.on_message_received()
+        async for item in resilient_sdk_session(
+            options, initial_prompt, retry_tracker=retry_tracker,
+        ):
+            if isinstance(item, RetryEvent):
+                timeout_triggered = False
+                continue
+            client, message = item
 
-                self._process_message(message)
+            # Finalize any retry sequence when we receive a message
+            retry_tracker.on_message_received()
 
-                # Check time budget after each message
-                elapsed = time.monotonic() - session_start
-                excluded = retry_tracker.get_excluded_seconds()
-                active_runtime = elapsed - excluded
+            self._process_message(message)
 
-                if active_runtime > self.max_runtime_seconds:
-                    LOG.warning(
-                        f"Time budget exceeded: {active_runtime:.1f}s active runtime "
-                        f"(excluded {excluded:.1f}s from {retry_tracker.get_retry_count()} retries). "
-                        f"Interrupting agent."
-                    )
-                    timeout_triggered = True
-                    await client.interrupt()
-                    break
+            # Check time budget after each message
+            elapsed = time.monotonic() - session_start
+            excluded = retry_tracker.get_excluded_seconds()
+            active_runtime = elapsed - excluded
+
+            if active_runtime > self.max_runtime_seconds:
+                LOG.warning(
+                    f"Time budget exceeded: {active_runtime:.1f}s active runtime "
+                    f"(excluded {excluded:.1f}s from {retry_tracker.get_retry_count()} retries). "
+                    f"Interrupting agent."
+                )
+                timeout_triggered = True
+                await client.interrupt()
+                break
 
         # Log session timing summary
         session_elapsed = time.monotonic() - session_start

@@ -23,10 +23,12 @@ import uuid
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
-    ClaudeSDKClient,
     create_sdk_mcp_server,
     tool,
 )
+
+from shared.api_retry import RetryEvent, resilient_sdk_session
+from shared.retry_tracker import RetryTimeTracker
 
 LOG = logging.getLogger(__name__)
 
@@ -697,6 +699,8 @@ async def _run_witness_critic(
         tools=[],
     )
 
+    critic_retry_tracker = RetryTimeTracker()
+
     options = ClaudeAgentOptions(
         cli_path=cli_path,
         system_prompt=critic_system,
@@ -709,24 +713,33 @@ async def _run_witness_critic(
         model=model,
         max_thinking_tokens=thinking_budget,
         max_buffer_size=50 * 1024 * 1024,
+        stderr=critic_retry_tracker.handle_stderr_line,
+        env={"CLAUDE_CODE_MAX_RETRIES": "500"},
     )
 
     last_text = ""
     start = time.monotonic()
 
     try:
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(critic_initial)
-            async for message in client.receive_response():
-                elapsed = time.monotonic() - start
-                if elapsed > max_critic_time:
-                    LOG.warning(f"Critic for {claim_id} timed out at {elapsed:.1f}s")
-                    await client.interrupt()
-                    break
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if hasattr(block, "text"):
-                            last_text = block.text
+        async for item in resilient_sdk_session(
+            options, critic_initial, retry_tracker=critic_retry_tracker,
+        ):
+            if isinstance(item, RetryEvent):
+                last_text = ""
+                continue
+            client, message = item
+
+            elapsed = time.monotonic() - start
+            excluded = critic_retry_tracker.get_excluded_seconds()
+            active = elapsed - excluded
+            if active > max_critic_time:
+                LOG.warning(f"Critic for {claim_id} timed out at {active:.1f}s active")
+                await client.interrupt()
+                break
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if hasattr(block, "text"):
+                        last_text = block.text
     except Exception as e:
         LOG.warning(f"Critic for {claim_id} failed: {e}")
         return {"verdict": "ACCEPT", "feedback": f"Critic error: {e}"}
@@ -836,14 +849,25 @@ def _make_run_witness_tool(
 
         start = time.monotonic()
         error = None
+        builder_retry_tracker = RetryTimeTracker()
+        options.stderr = builder_retry_tracker.handle_stderr_line
+
         try:
-            async with ClaudeSDKClient(options=options) as client:
-                await client.query(initial_prompt)
-                async for message in client.receive_response():
-                    if time.monotonic() - start > time_budget:
-                        LOG.warning(f"Builder {claim_id} timed out at {time.monotonic() - start:.1f}s")
-                        await client.interrupt()
-                        break
+            async for item in resilient_sdk_session(
+                options, initial_prompt, retry_tracker=builder_retry_tracker,
+            ):
+                if isinstance(item, RetryEvent):
+                    error = None
+                    continue
+                client, message = item
+
+                elapsed = time.monotonic() - start
+                excluded = builder_retry_tracker.get_excluded_seconds()
+                active = elapsed - excluded
+                if active > time_budget:
+                    LOG.warning(f"Builder {claim_id} timed out at {active:.1f}s active")
+                    await client.interrupt()
+                    break
         except Exception as e:
             error = str(e)
             LOG.exception(f"Builder {claim_id} failed: {e}")

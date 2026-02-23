@@ -13,7 +13,6 @@ import os
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
-    ClaudeSDKClient,
     ResultMessage,
     TextBlock,
     ToolResultBlock,
@@ -24,6 +23,8 @@ from ..base import AgentResult, AgentStatus, BaseAgent
 from ..claudecode.permissions import restrict_file_writes
 from ..claudecode.tools import create_arvo_mcp_server
 from .prompts import GT_BACKPORTER_SYSTEM_PROMPT, build_backporter_prompt
+from shared.api_retry import RetryEvent, resilient_sdk_session
+from shared.retry_tracker import RetryTimeTracker
 
 LOG = logging.getLogger(__name__)
 
@@ -153,6 +154,8 @@ class GtBackporterAgent(BaseAgent):
                 "mcp__arvo__build",
             ]
 
+            retry_tracker = RetryTimeTracker()
+
             options = ClaudeAgentOptions(
                 cli_path=self.cli_path,
                 system_prompt=GT_BACKPORTER_SYSTEM_PROMPT,
@@ -165,6 +168,10 @@ class GtBackporterAgent(BaseAgent):
                 model=self.model,
                 # 100 MB buffer — avoid JSON buffer overflow on long conversations
                 max_buffer_size=100 * 1024 * 1024,
+                # Stderr callback for API retry tracking
+                stderr=retry_tracker.handle_stderr_line,
+                # Allow CLI to retry through long API overload windows (default: 10)
+                env={"CLAUDE_CODE_MAX_RETRIES": "500"},
             )
 
             # Build the prompt from patch metadata
@@ -174,11 +181,14 @@ class GtBackporterAgent(BaseAgent):
                 f"with max_turns={self.max_turns}"
             )
 
-            # Run agentic loop
-            async with ClaudeSDKClient(options=options) as client:
-                await client.query(initial_prompt)
-                async for message in client.receive_response():
-                    self._process_message(message)
+            # Run agentic loop with app-level retry on synthetic 529 errors
+            async for item in resilient_sdk_session(
+                options, initial_prompt, retry_tracker=retry_tracker,
+            ):
+                if isinstance(item, RetryEvent):
+                    continue
+                client, message = item
+                self._process_message(message)
 
             # Determine status based on whether a patch was applied and built
             if self.result.build_success:

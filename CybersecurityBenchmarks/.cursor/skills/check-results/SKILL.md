@@ -17,7 +17,7 @@ python .cursor/skills/check-results/scripts/check_results.py <experiment_id>
 
 This requires `network` permissions (it calls `gsutil`).
 
-The script auto-detects the GCS bucket from `benchmark/gcp/.gke-config.json`.
+The script auto-detects the GCS bucket from `.gke-config.json`.
 
 ## Options
 
@@ -64,4 +64,4 @@ python .cursor/skills/check-results/scripts/check_results.py fuzz1800 --local /t
 
 ## Working Directory
 
-Run from the `CybersecurityBenchmarks/` directory (or `benchmark/gcp/`). The script resolves the config path relative to its own location.
+Run from the `CybersecurityBenchmarks/` directory. The script resolves the config path relative to its own location.

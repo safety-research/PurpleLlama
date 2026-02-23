@@ -4,7 +4,7 @@ Analyze closest-vul results: collect per-case result.json files from GCS
 and produce an aggregate report.
 
 Usage:
-    python analyze_closest_vul.py --config ../../benchmark/gcp/.gke-config.json
+    python analyze_closest_vul.py --config ../../.gke-config.json
     python analyze_closest_vul.py --local-dir /tmp/closest_vul  # skip GCS download
 """
 

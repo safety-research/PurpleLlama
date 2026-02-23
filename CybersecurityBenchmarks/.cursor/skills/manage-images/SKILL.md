@@ -25,11 +25,11 @@ Example: `us-central1-docker.pkg.dev/fellows-safety-research/arvo/arvo-11429-vul
 
 ## Configuration
 
-Registry and bucket are read from `benchmark/gcp/.gke-config.json`:
+Registry and bucket are read from `.gke-config.json`:
 
 ```bash
-REGISTRY=$(python3 -c "import json; print(json.load(open('benchmark/gcp/.gke-config.json'))['artifact_registry'])")
-BUCKET=$(python3 -c "import json; print(json.load(open('benchmark/gcp/.gke-config.json'))['bucket_name'])")
+REGISTRY=$(python3 -c "import json; print(json.load(open('.gke-config.json'))['artifact_registry'])")
+BUCKET=$(python3 -c "import json; print(json.load(open('.gke-config.json'))['bucket_name'])")
 ```
 
 Build version is either a literal string from the config (e.g. `closest-vul-msan-fixed`) or an auto-computed content hash (e.g. `cd72f555`). Check the experiment config's `build_version` field -- if `"auto"`, the CLI computes a hash at submit time.
@@ -130,7 +130,7 @@ If the build version isn't obvious from the config:
 gcloud artifacts docker images list $REGISTRY/arvo-{case_id}-vul --include-tags --format="value(TAGS)"
 ```
 
-If the config uses `"build_version": "auto"`, the actual tag is a content hash computed by `compute_image_build_version()` in `benchmark/gcp/cli/hashing.py`. Inspect existing image tags to find it.
+If the config uses `"build_version": "auto"`, the actual tag is a content hash computed by `compute_image_build_version()` in `cli/hashing.py`. Inspect existing image tags to find it.
 
 ## Safety Notes
 

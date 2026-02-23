@@ -1,0 +1,319 @@
+# Witnessed pairwise patch comparison analysis template.
+#
+# Runs a Claude Code analyst agent inside the -vul container to compare two
+# patches. The analyst forms claims and spawns witness-builder sub-agents
+# that produce standalone scripts proving each claim. Artifacts include
+# report.json, witnesses.tar.gz, blinding_key.json, and conversation.json.
+#
+# Init containers (same pattern as analysis-template.yaml):
+#   1. fetch-runtime     -- download agent-runtime.tar.gz from GCS
+#   2. fetch-gt-binary   -- (conditional) extract GT binary from -fix image
+#   3. fetch-artifacts   -- download patches, binaries, crash output from GCS
+
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: arvo-witnessed-analysis
+  namespace: argo
+spec:
+  templates:
+    - name: witnessed-analysis
+      inputs:
+        parameters:
+          - name: case-id
+          - name: project
+          - name: patcher-1-id
+          - name: patcher-2-id
+          - name: analysis-model
+          - name: agent-config
+          - name: source-experiment
+          - name: analysis-experiment
+          - name: bucket
+          - name: registry
+          - name: build-version
+          - name: use-spot
+            value: "true"
+
+      synchronization:
+        semaphore:
+          configMapKeyRef:
+            name: patch-semaphores
+            key: "{{inputs.parameters.analysis-model}}"
+
+      outputs:
+        artifacts:
+          - name: report
+            path: /output/report.json
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "analysis/witnessed-analysis/{{inputs.parameters.analysis-experiment}}/{{inputs.parameters.case-id}}/{{inputs.parameters.patcher-1-id}}-vs-{{inputs.parameters.patcher-2-id}}/report.json"
+          - name: report-md
+            path: /output/report.md
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "analysis/witnessed-analysis/{{inputs.parameters.analysis-experiment}}/{{inputs.parameters.case-id}}/{{inputs.parameters.patcher-1-id}}-vs-{{inputs.parameters.patcher-2-id}}/report.md"
+          - name: blinding-key
+            path: /output/blinding_key.json
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "analysis/witnessed-analysis/{{inputs.parameters.analysis-experiment}}/{{inputs.parameters.case-id}}/{{inputs.parameters.patcher-1-id}}-vs-{{inputs.parameters.patcher-2-id}}/blinding_key.json"
+          - name: conversation
+            path: /output/conversation.json
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "analysis/witnessed-analysis/{{inputs.parameters.analysis-experiment}}/{{inputs.parameters.case-id}}/{{inputs.parameters.patcher-1-id}}-vs-{{inputs.parameters.patcher-2-id}}/conversation.json"
+          - name: witnesses
+            path: /output/witnesses.tar.gz
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "analysis/witnessed-analysis/{{inputs.parameters.analysis-experiment}}/{{inputs.parameters.case-id}}/{{inputs.parameters.patcher-1-id}}-vs-{{inputs.parameters.patcher-2-id}}/witnesses.tar.gz"
+          - name: success-marker
+            path: /output/_SUCCESS
+            optional: true
+            archive:
+              none: {}
+            gcs:
+              bucket: "{{inputs.parameters.bucket}}"
+              key: "analysis/witnessed-analysis/{{inputs.parameters.analysis-experiment}}/{{inputs.parameters.case-id}}/{{inputs.parameters.patcher-1-id}}-vs-{{inputs.parameters.patcher-2-id}}/_SUCCESS"
+
+      metadata:
+        annotations:
+          container.apparmor.security.beta.kubernetes.io/main: unconfined
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "work"
+          effect: "NoSchedule"
+      nodeSelector:
+        spot: "{{inputs.parameters.use-spot}}"
+        workload-type: work
+      serviceAccountName: arvo-workflow-sa
+      retryStrategy:
+        limit: 3
+        retryPolicy: "Always"
+        expression: 'lastRetry.status == "Error" or (lastRetry.status == "Failed" and asInt(lastRetry.exitCode) not in [0])'
+        backoff:
+          duration: "30s"
+          factor: 2
+          cap: "5m"
+
+      activeDeadlineSeconds: 86400
+
+      initContainers:
+        # 1. Download agent runtime from GCS
+        - name: fetch-runtime
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              gsutil cp gs://{{inputs.parameters.bucket}}/agent-runtime/agent-runtime.tar.gz /tmp/
+              tar -xzf /tmp/agent-runtime.tar.gz -C /agent-runtime --strip-components=1
+              chmod +x /agent-runtime/bin/* 2>/dev/null || true
+          volumeMounts:
+            - name: agent-runtime
+              mountPath: /agent-runtime
+
+        # 2. Conditional: extract GT binary from -fix image
+        - name: fetch-gt-binary
+          image: "{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{inputs.parameters.build-version}}"
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              PATCHER_1="{{inputs.parameters.patcher-1-id}}"
+              PATCHER_2="{{inputs.parameters.patcher-2-id}}"
+
+              if [ "$PATCHER_1" != "gt" ] && [ "$PATCHER_2" != "gt" ]; then
+                echo "Neither patcher is GT -- skipping"
+                exit 0
+              fi
+
+              echo "Extracting GT binary from -fix image..."
+
+              BINARY=""
+              if [ -f /bin/arvo ]; then
+                CANDIDATE=$(sed -n 's|.*exec[[:space:]]\+\(/[^ ]*\).*|\1|p' /bin/arvo | head -1)
+                if [ -z "$CANDIDATE" ]; then
+                  CANDIDATE=$(sed -n 's|.*/out/\([^ ]*\).*|/out/\1|p' /bin/arvo | head -1)
+                fi
+                if [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ] && [ -x "$CANDIDATE" ]; then
+                  BINARY="$CANDIDATE"
+                fi
+              fi
+              if [ -z "$BINARY" ]; then
+                BINARY=$(find /out/ -maxdepth 1 -type f -executable \
+                  ! -name "*.dict" ! -name "*.options" ! -name "*.zip" ! -name "*.txt" \
+                  ! -name "llvm-*" ! -name "*.a" ! -name "*.o" \
+                  2>/dev/null | head -1)
+              fi
+
+              if [ -z "$BINARY" ] || [ ! -f "$BINARY" ]; then
+                echo "ERROR: Could not find fuzzer binary in -fix image"
+                exit 1
+              fi
+
+              cp "$BINARY" /shared/gt-binary
+              chmod +x /shared/gt-binary
+              echo "Extracted GT binary: ${BINARY} -> /shared/gt-binary"
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+        # 3. Fetch patches, binaries, and crash output from GCS
+        - name: fetch-artifacts
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              BUCKET="{{inputs.parameters.bucket}}"
+              SRC_EXP="{{inputs.parameters.source-experiment}}"
+              CASE_ID="{{inputs.parameters.case-id}}"
+              PATCHER_1="{{inputs.parameters.patcher-1-id}}"
+              PATCHER_2="{{inputs.parameters.patcher-2-id}}"
+
+              mkdir -p /artifacts/patcher-1 /artifacts/patcher-2
+
+              fetch_patcher_artifacts() {
+                local PATCHER_ID="$1"
+                local DEST="$2"
+
+                if [ "$PATCHER_ID" = "gt" ]; then
+                  echo "Fetching GT patch for case ${CASE_ID}..."
+                  gsutil -q cp "gs://${BUCKET}/patches/${CASE_ID}-patch.json" "${DEST}/patch.json" || \
+                    echo "WARNING: GT patch not found"
+                  if [ -f /shared/gt-binary ]; then
+                    cp /shared/gt-binary "${DEST}/rebuilt_binary"
+                  fi
+                else
+                  local BASE="gs://${BUCKET}/results/${SRC_EXP}/${CASE_ID}/${PATCHER_ID}"
+                  echo "Fetching artifacts for ${PATCHER_ID}..."
+                  gsutil -q cp "${BASE}/patch.patch" "${DEST}/patch.patch" || \
+                    echo "WARNING: patch.patch not found for ${PATCHER_ID}"
+                  gsutil -q cp "${BASE}/rebuilt_binary" "${DEST}/rebuilt_binary" || \
+                    echo "WARNING: rebuilt_binary not found for ${PATCHER_ID}"
+                fi
+              }
+
+              fetch_patcher_artifacts "$PATCHER_1" "/artifacts/patcher-1"
+              fetch_patcher_artifacts "$PATCHER_2" "/artifacts/patcher-2"
+
+              gsutil -q cp "gs://${BUCKET}/results/${SRC_EXP}/${CASE_ID}/${PATCHER_1}/crash_output.txt" \
+                /artifacts/crash_output.txt 2>/dev/null || \
+              gsutil -q cp "gs://${BUCKET}/results/${SRC_EXP}/${CASE_ID}/${PATCHER_2}/crash_output.txt" \
+                /artifacts/crash_output.txt 2>/dev/null || \
+                echo "No cached crash output found -- will generate at runtime"
+
+              echo "Artifact fetch complete"
+              ls -la /artifacts/patcher-1/ /artifacts/patcher-2/
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+              readOnly: true
+            - name: artifacts
+              mountPath: /artifacts
+
+      container:
+        image: "{{inputs.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{inputs.parameters.build-version}}"
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+            CASE_ID="{{inputs.parameters.case-id}}"
+            PATCHER_1="{{inputs.parameters.patcher-1-id}}"
+            PATCHER_2="{{inputs.parameters.patcher-2-id}}"
+            BUCKET="{{inputs.parameters.bucket}}"
+            ANALYSIS_EXP="{{inputs.parameters.analysis-experiment}}"
+
+            # Fallback: skip if already completed
+            SUCCESS_PATH="gs://${BUCKET}/analysis/witnessed-analysis/${ANALYSIS_EXP}/${CASE_ID}/${PATCHER_1}-vs-${PATCHER_2}/_SUCCESS"
+            if gsutil -q stat "${SUCCESS_PATH}" 2>/dev/null; then
+              echo "[SKIP] Witnessed analysis already completed"
+              gsutil cp "${SUCCESS_PATH}" /output/_SUCCESS
+              exit 0
+            fi
+
+            # Move artifacts to expected locations
+            mkdir -p /tmp/artifacts
+            cp -r /artifacts/* /tmp/artifacts/ 2>/dev/null || true
+
+            # Run the witnessed analysis agent
+            /agent-runtime/bin/agent-entrypoint.sh python3 -m witnessed_analysis.main \
+              --case-id ${CASE_ID} \
+              --source-experiment "{{inputs.parameters.source-experiment}}" \
+              --patcher-1 "${PATCHER_1}" \
+              --patcher-2 "${PATCHER_2}" \
+              --output-dir /output \
+              --verbose
+
+            # Write completion marker
+            cat > /output/_SUCCESS << EOF
+            {
+              "completed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "pod": "{{pod.name}}",
+              "case_id": "${CASE_ID}",
+              "patcher_1": "${PATCHER_1}",
+              "patcher_2": "${PATCHER_2}"
+            }
+            EOF
+        env:
+          - name: ANTHROPIC_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: anthropic-api-key
+                key: key
+          - name: PYTHONPATH
+            value: "/agent-runtime"
+          - name: AGENT_CONFIG
+            value: "{{inputs.parameters.agent-config}}"
+          - name: BUCKET
+            value: "{{inputs.parameters.bucket}}"
+          - name: PROJECT
+            value: "{{inputs.parameters.project}}"
+        volumeMounts:
+          - name: agent-runtime
+            mountPath: /agent-runtime
+            readOnly: true
+          - name: artifacts
+            mountPath: /artifacts
+            readOnly: true
+          - name: output
+            mountPath: /output
+        resources:
+          requests:
+            cpu: "1.7"
+            memory: "6G"
+          limits:
+            cpu: "1.8"
+            memory: "14G"
+        securityContext:
+          capabilities:
+            add: ["SYS_ADMIN"]
+
+      volumes:
+        - name: agent-runtime
+          emptyDir: {}
+        - name: shared
+          emptyDir: {}
+        - name: artifacts
+          emptyDir: {}
+        - name: output
+          emptyDir: {}

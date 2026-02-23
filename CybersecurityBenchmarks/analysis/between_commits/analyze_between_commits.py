@@ -8,7 +8,7 @@ Analyze intermediate commits between vul and fix for each APB case.
 4. Generate a report identifying cases with "bonus fixes"
 
 Usage:
-    python analyze_between_commits.py --config ../../benchmark/gcp/.gke-config.json
+    python analyze_between_commits.py --config ../../.gke-config.json
     python analyze_between_commits.py --local-dir /tmp/between_commits  # skip GCS download
 """
 

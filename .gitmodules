@@ -2,6 +2,6 @@
 	path = CyberSOCEval_data
 	url = https://github.com/CrowdStrike/CyberSOCEval_data
 [submodule "CybersecurityBenchmarks/benchmark/autopatch/build/casr"]
-	path = CybersecurityBenchmarks/benchmark/autopatch/build/casr
+	path = CybersecurityBenchmarks/build/casr
 	url = https://github.com/safety-research/casr.git
 	branch = casr-cluster

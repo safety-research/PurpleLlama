@@ -16,7 +16,7 @@ The user must provide (or you infer from context):
 | `analysis_experiment` | Analysis experiment ID (GCS path segment) | `analysis-20260213-133233` |
 | `source_experiment` | Source patching experiment ID | `fuzz1800_all_0213_3` |
 | `agent_id` | Agent being compared to GT | `claudecode-claude-opus-4-6` |
-| `cases_config` | Config file with cases list | `benchmark/gcp/configs/new_vul_all.json` |
+| `cases_config` | Config file with cases list | `configs/new_vul_all.json` |
 | `output_path` | Where to save the HTML | `/tmp/analysis_explorer.html` |
 
 Optional:
@@ -30,7 +30,7 @@ Optional:
 ### 1. Download artifacts from GCS
 
 ```bash
-BUCKET=$(python3 -c "import json; print(json.load(open('benchmark/gcp/.gke-config.json'))['bucket_name'])")
+BUCKET=$(python3 -c "import json; print(json.load(open('.gke-config.json'))['bucket_name'])")
 ```
 
 Download three types of artifacts per case to a local staging dir:
@@ -53,7 +53,7 @@ gsutil -m rsync -r "gs://$BUCKET/analysis/patch-comparison/$ANALYSIS_EXP/" "$STA
 Run the generator script, passing all parameters:
 
 ```bash
-python3 benchmark/gcp/analysis/build_explorer.py \
+python3 analysis/build_explorer.py \
   --analysis-dir "$STAGING/analysis" \
   --artifacts-dir "$STAGING" \
   --agent-id "$AGENT_ID" \

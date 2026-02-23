@@ -8,16 +8,16 @@ with one line per model (mean across cases, shaded std band).
 
 Usage:
     # From GCS
-    python analysis/analyze_crashes.py fuzz1800
+    python -m analysis.analyze_crashes fuzz1800
 
     # From a local directory (previously downloaded by check_results.py)
-    python analysis/analyze_crashes.py fuzz1800 --local /tmp/arvo-results-fuzz1800-xxxxx
+    python -m analysis.analyze_crashes fuzz1800 --local /tmp/arvo-results-fuzz1800-xxxxx
 
     # Save plot to file
-    python analysis/analyze_crashes.py fuzz1800 --local /tmp/results --output my_plot.png
+    python -m analysis.analyze_crashes fuzz1800 --local /tmp/results --output my_plot.png
 
     # Show interactive plot
-    python analysis/analyze_crashes.py fuzz1800 --local /tmp/results --show
+    python -m analysis.analyze_crashes fuzz1800 --local /tmp/results --show
 """
 
 import argparse
@@ -49,12 +49,7 @@ except ImportError:
 
 def get_default_bucket() -> str:
     """Read bucket from .gke-config.json."""
-    config_path = (
-        Path(__file__).resolve().parent.parent
-        / "benchmark"
-        / "gcp"
-        / ".gke-config.json"
-    )
+    config_path = Path(__file__).resolve().parent.parent / ".gke-config.json"
     if config_path.exists():
         with open(config_path) as f:
             return json.load(f).get("bucket_name", "")
@@ -135,6 +130,10 @@ def collect_results(results_dir: Path) -> dict[str, dict]:
             crashes = read_argo_artifact(model_dir / "crashes.json")
             if crashes:
                 entry["crashes"] = crashes
+
+            regression = read_argo_artifact(model_dir / "regression_analysis.json")
+            if regression:
+                entry["regression"] = regression
 
             if entry:
                 data[case_id][model] = entry
@@ -514,6 +513,34 @@ def report_filtered(
                 if uc > 20:
                     parts.append(f"{shorten_model(model)}={uc}")
             print(f"  case {cid}: {', '.join(parts)}", file=sys.stderr)
+
+    # Regression analysis summary (if available)
+    regression_models: dict[str, dict] = {}
+    for case_data in data.values():
+        for model, entry in case_data.items():
+            reg = entry.get("regression")
+            if reg:
+                if model not in regression_models:
+                    regression_models[model] = {
+                        "unique": 0,
+                        "regressions": 0,
+                        "pre_existing": 0,
+                    }
+                regression_models[model]["unique"] += get_unique_crash_count(entry)
+                regression_models[model]["regressions"] += reg.get("regressions", 0)
+                regression_models[model]["pre_existing"] += reg.get("pre_existing", 0)
+
+    if regression_models:
+        print(f"\nRegression Analysis:", file=sys.stderr)
+        for model in sorted(regression_models.keys()):
+            r = regression_models[model]
+            print(
+                f"  {shorten_model(model)}: "
+                f"{r['unique']} unique, "
+                f"{r['pre_existing']} pre-existing, "
+                f"{r['regressions']} regressions",
+                file=sys.stderr,
+            )
 
     print(f"{'=' * 60}\n", file=sys.stderr)
 

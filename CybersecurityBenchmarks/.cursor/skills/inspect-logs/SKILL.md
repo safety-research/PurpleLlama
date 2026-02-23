@@ -10,7 +10,7 @@ Debug workflow failures, inspect LLM transcripts, and understand pod reschedulin
 ## Config
 
 ```bash
-BUCKET=$(python3 -c "import json; print(json.load(open('benchmark/gcp/.gke-config.json'))['bucket_name'])")
+BUCKET=$(python3 -c "import json; print(json.load(open('.gke-config.json'))['bucket_name'])")
 ```
 
 - Project: `fellows-safety-research`
@@ -144,7 +144,7 @@ gsutil ls "gs://$BUCKET/argo-logs/*/*/*/{wf}/" | grep patch-case
 For workflows with compressed or offloaded nodes (large workflows), use the argo-server proxy to get full node status including retry history:
 
 ```python
-# From benchmark/gcp/ directory
+# From the CybersecurityBenchmarks/ directory
 from cli.argo import run_argo_via_server
 result = run_argo_via_server(["get", "{wf}", "-n", "argo", "-o", "json"])
 ```

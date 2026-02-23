@@ -30,11 +30,8 @@ from typing import Any, Optional
 def get_default_bucket() -> str:
     """Read bucket from .gke-config.json."""
     # Script is at .cursor/skills/check-results/scripts/check_results.py
-    # Need 5 parents to reach CybersecurityBenchmarks/
     config_path = (
         Path(__file__).resolve().parent.parent.parent.parent.parent
-        / "benchmark"
-        / "gcp"
         / ".gke-config.json"
     )
     if config_path.exists():

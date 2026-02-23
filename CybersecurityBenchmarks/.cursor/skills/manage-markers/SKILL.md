@@ -19,7 +19,7 @@ gs://{bucket}/results/{experiment_id}/{case_id}/{agent_id}/patch/_SUCCESS
 gs://{bucket}/results/{experiment_id}/{case_id}/{agent_id}/_SUCCESS
 ```
 
-The bucket is read from `benchmark/gcp/.gke-config.json` (`bucket_name` field).
+The bucket is read from `.gke-config.json` (`bucket_name` field).
 
 ## Commands
 
@@ -28,7 +28,7 @@ All commands require `network` permissions for `gsutil`.
 ### List all markers for an experiment
 
 ```bash
-BUCKET=$(python3 -c "import json; print(json.load(open('benchmark/gcp/.gke-config.json'))['bucket_name'])")
+BUCKET=$(python3 -c "import json; print(json.load(open('.gke-config.json'))['bucket_name'])")
 gsutil ls -r "gs://$BUCKET/results/{experiment_id}/**/_SUCCESS"
 ```
 

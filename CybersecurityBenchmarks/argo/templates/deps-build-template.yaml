@@ -1,0 +1,534 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: arvo-deps-build
+  namespace: argo
+spec:
+  templates:
+    # =========================================================================
+    # Build CASR binaries from source
+    # Requirements: Rust compiler, ~15-30 minutes on 4 cores
+    # Produces: casr-binaries.tar.gz uploaded to GCS
+    # =========================================================================
+    - name: build-casr
+      inputs:
+        parameters:
+          - name: bucket
+          - name: force-rebuild
+            default: "false"
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "build"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+        workload-type: build
+      serviceAccountName: arvo-workflow-sa
+      retryStrategy:
+        limit: 3
+        retryPolicy: "Always"
+        expression: 'lastRetry.status == "Error" or (lastRetry.status == "Failed" and asInt(lastRetry.exitCode) not in [0])'
+        backoff:
+          duration: "30s"
+          factor: 2
+          cap: "10m"
+      container:
+        image: docker.io/library/rust:1.93-bookworm
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+
+            BUCKET="{{inputs.parameters.bucket}}"
+            FORCE_REBUILD="{{inputs.parameters.force-rebuild}}"
+            WORKDIR="/tmp/casr-build"
+
+            echo "==========================================="
+            echo "CASR Build Job"
+            echo "==========================================="
+            echo "Bucket:        ${BUCKET}"
+            echo "Force Rebuild: ${FORCE_REBUILD}"
+            echo "==========================================="
+
+            # Install dependencies
+            apt-get update -qq
+            apt-get install -y -qq curl jq
+
+            # Install gsutil
+            curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt >/dev/null
+            export PATH="/opt/google-cloud-sdk/bin:$PATH"
+
+            mkdir -p "${WORKDIR}"
+            cd "${WORKDIR}"
+
+            # Download CASR source from GCS
+            echo "[*] Downloading CASR source from GCS..."
+            mkdir -p casr
+            gsutil -m cp -r "gs://${BUCKET}/deps-sources/casr/*" casr/ || {
+                echo "ERROR: CASR source not found in GCS"
+                echo "Upload with: gsutil -m rsync -r build/casr gs://${BUCKET}/deps-sources/casr/"
+                exit 1
+            }
+
+            # Download hash script
+            gsutil cp "gs://${BUCKET}/deps-sources/compute_hashes.sh" . || {
+                echo "ERROR: compute_hashes.sh not found"
+                exit 1
+            }
+            chmod +x compute_hashes.sh
+            source compute_hashes.sh
+
+            # Compute local hash
+            LOCAL_HASH=$(compute_casr_hash casr)
+            echo "[*] Local CASR hash: ${LOCAL_HASH}"
+
+            # Check if rebuild needed
+            if [ "${FORCE_REBUILD}" != "true" ]; then
+                MANIFEST=$(gsutil cat "gs://${BUCKET}/build-assets/deps-manifest.json" 2>/dev/null || echo "{}")
+                GCS_HASH=$(echo "${MANIFEST}" | jq -r '.casr_hash // ""')
+                echo "[*] GCS CASR hash: ${GCS_HASH:-none}"
+                
+                if [ "${LOCAL_HASH}" = "${GCS_HASH}" ]; then
+                    echo "[*] CASR unchanged, skipping build"
+                    exit 0
+                fi
+            fi
+
+            # Build CASR
+            echo "[*] Building CASR..."
+            cd casr
+            cargo build --release
+
+            # Package binaries
+            echo "[*] Packaging CASR binaries..."
+            mkdir -p "${WORKDIR}/output/bin"
+            find target/release -maxdepth 1 -type f -name 'casr-*' ! -name '*.d' -executable \
+                -exec cp {} "${WORKDIR}/output/bin/" \;
+
+            # Verify
+            echo "[*] Built binaries:"
+            ls -la "${WORKDIR}/output/bin/"
+
+            # Create tarball
+            cd "${WORKDIR}"
+            tar -czvf casr-binaries.tar.gz -C output .
+
+            # Upload to GCS
+            echo "[*] Uploading casr-binaries.tar.gz..."
+            gsutil cp casr-binaries.tar.gz "gs://${BUCKET}/build-assets/"
+
+            # Update manifest
+            echo "[*] Updating deps-manifest.json..."
+            MANIFEST=$(gsutil cat "gs://${BUCKET}/build-assets/deps-manifest.json" 2>/dev/null || echo "{}")
+            UPDATED_MANIFEST=$(echo "${MANIFEST}" | jq --arg hash "${LOCAL_HASH}" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '.casr_hash = $hash | .casr_built_at = $ts')
+            echo "${UPDATED_MANIFEST}" > deps-manifest.json
+            gsutil cp deps-manifest.json "gs://${BUCKET}/build-assets/"
+
+            echo "[*] CASR build complete!"
+        resources:
+          requests:
+            cpu: "8"
+            memory: "8G"
+          limits:
+            cpu: "8"
+            memory: "16G"
+
+    # =========================================================================
+    # Build differential-debugging-deps (DD) packages
+    # Requirements: Docker-in-Docker, ~2-4 hours
+    # Produces: differential-debugging-deps-{16.04,20.04}.deb uploaded to GCS
+    # =========================================================================
+    - name: build-dd
+      inputs:
+        parameters:
+          - name: bucket
+          - name: force-rebuild
+            default: "false"
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "build"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+        workload-type: build
+      serviceAccountName: arvo-workflow-sa
+      retryStrategy:
+        limit: 3
+        retryPolicy: "Always"
+        expression: 'lastRetry.status == "Error" or (lastRetry.status == "Failed" and asInt(lastRetry.exitCode) not in [0])'
+        backoff:
+          duration: "30s"
+          factor: 2
+          cap: "10m"
+      # Use Docker-in-Docker sidecar for container builds
+      sidecars:
+        - name: docker
+          image: docker:24-dind
+          securityContext:
+            privileged: true
+          env:
+            - name: DOCKER_TLS_CERTDIR
+              value: ""
+          volumeMounts:
+            - name: docker-graph
+              mountPath: /var/lib/docker
+      volumes:
+        - name: docker-graph
+          emptyDir: {}
+        - name: workspace
+          emptyDir: {}
+      container:
+        image: docker.io/library/ubuntu:22.04
+        env:
+          - name: DOCKER_HOST
+            value: tcp://localhost:2375
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+
+            BUCKET="{{inputs.parameters.bucket}}"
+            FORCE_REBUILD="{{inputs.parameters.force-rebuild}}"
+            WORKDIR="/tmp/dd-build"
+
+            echo "==========================================="
+            echo "Differential Debugging Deps Build Job"
+            echo "==========================================="
+            echo "Bucket:        ${BUCKET}"
+            echo "Force Rebuild: ${FORCE_REBUILD}"
+            echo "==========================================="
+
+            # Install dependencies
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq curl jq docker.io apt-transport-https ca-certificates gnupg
+
+            # Install gsutil
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | \
+                tee /etc/apt/sources.list.d/google-cloud-sdk.list
+            curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+                gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+            apt-get update -qq && apt-get install -y -qq google-cloud-cli
+
+            # Wait for Docker daemon
+            echo "[*] Waiting for Docker daemon..."
+            for i in $(seq 1 30); do
+                if docker info >/dev/null 2>&1; then
+                    echo "    Docker is ready"
+                    break
+                fi
+                echo "    Waiting... ($i/30)"
+                sleep 2
+            done
+
+            docker info || { echo "ERROR: Docker not available"; exit 1; }
+
+            mkdir -p "${WORKDIR}"
+            cd "${WORKDIR}"
+
+            # Download build script from GCS
+            echo "[*] Downloading DD build files from GCS..."
+            gsutil cp "gs://${BUCKET}/deps-sources/build_deb_packages.sh" . || {
+                echo "ERROR: build_deb_packages.sh not found"
+                exit 1
+            }
+            chmod +x build_deb_packages.sh
+
+            # Download hash script
+            gsutil cp "gs://${BUCKET}/deps-sources/compute_hashes.sh" . || {
+                echo "ERROR: compute_hashes.sh not found"
+                exit 1
+            }
+            chmod +x compute_hashes.sh
+            source compute_hashes.sh
+
+            # Compute local hash
+            LOCAL_HASH=$(compute_dd_hash build_deb_packages.sh)
+            echo "[*] Local DD hash: ${LOCAL_HASH}"
+
+            # Check if rebuild needed
+            if [ "${FORCE_REBUILD}" != "true" ]; then
+                MANIFEST=$(gsutil cat "gs://${BUCKET}/build-assets/deps-manifest.json" 2>/dev/null || echo "{}")
+                GCS_HASH=$(echo "${MANIFEST}" | jq -r '.dd_hash // ""')
+                echo "[*] GCS DD hash: ${GCS_HASH:-none}"
+                
+                if [ "${LOCAL_HASH}" = "${GCS_HASH}" ]; then
+                    echo "[*] DD unchanged, skipping build"
+                    exit 0
+                fi
+            fi
+
+            # Build DD packages (non-interactive)
+            echo "[*] Building differential-debugging-deps packages..."
+            echo "[*] This will take 2-4 hours..."
+
+            # Delete existing to force rebuild
+            rm -f differential-debugging-deps-*.deb 2>/dev/null || true
+
+            # Run build with auto-yes
+            yes y | timeout 14400 bash build_deb_packages.sh || {
+                echo "[*] Build finished or timed out"
+            }
+
+            # Upload results
+            if [ -f "differential-debugging-deps-16.04.deb" ]; then
+                echo "[*] Uploading differential-debugging-deps-16.04.deb..."
+                gsutil cp differential-debugging-deps-16.04.deb "gs://${BUCKET}/build-assets/"
+            else
+                echo "WARNING: 16.04 package not built"
+            fi
+
+            if [ -f "differential-debugging-deps-20.04.deb" ]; then
+                echo "[*] Uploading differential-debugging-deps-20.04.deb..."
+                gsutil cp differential-debugging-deps-20.04.deb "gs://${BUCKET}/build-assets/"
+            else
+                echo "WARNING: 20.04 package not built"
+            fi
+
+            # Update manifest
+            echo "[*] Updating deps-manifest.json..."
+            MANIFEST=$(gsutil cat "gs://${BUCKET}/build-assets/deps-manifest.json" 2>/dev/null || echo "{}")
+            UPDATED_MANIFEST=$(echo "${MANIFEST}" | jq --arg hash "${LOCAL_HASH}" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '.dd_hash = $hash | .dd_built_at = $ts')
+            echo "${UPDATED_MANIFEST}" > deps-manifest.json
+            gsutil cp deps-manifest.json "gs://${BUCKET}/build-assets/"
+
+            echo "[*] DD build complete!"
+        resources:
+          requests:
+            cpu: "16"
+            memory: "32G"
+          limits:
+            cpu: "16"
+            memory: "32G"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    # =========================================================================
+    # Build namespace-isolated libFuzzer archives
+    # Requirements: clang, cmake, ninja, binutils, ~5-10 minutes
+    # Produces: libfuzzer-prebuilt.tar.gz uploaded to GCS
+    # =========================================================================
+    - name: build-libfuzzer
+      inputs:
+        parameters:
+          - name: bucket
+          - name: force-rebuild
+            default: "false"
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "build"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+        workload-type: build
+      serviceAccountName: arvo-workflow-sa
+      retryStrategy:
+        limit: 3
+        retryPolicy: "Always"
+        expression: 'lastRetry.status == "Error" or (lastRetry.status == "Failed" and asInt(lastRetry.exitCode) not in [0])'
+        backoff:
+          duration: "30s"
+          factor: 2
+          cap: "10m"
+      container:
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+
+            BUCKET="{{inputs.parameters.bucket}}"
+            FORCE_REBUILD="{{inputs.parameters.force-rebuild}}"
+            WORKDIR="/tmp/libfuzzer-build"
+
+            echo "==========================================="
+            echo "libFuzzer Build Job"
+            echo "==========================================="
+            echo "Bucket:        ${BUCKET}"
+            echo "Force Rebuild: ${FORCE_REBUILD}"
+            echo "==========================================="
+
+            # Install build dependencies on top of the gcloud SDK image (Debian-based)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq \
+                clang binutils \
+                jq xz-utils \
+                gcc-multilib g++-multilib \
+                2>/dev/null
+
+            mkdir -p "${WORKDIR}"
+            cd "${WORKDIR}"
+
+            # Download libfuzzer source and build script from GCS
+            echo "[*] Downloading libfuzzer source from GCS..."
+            gsutil cp "gs://${BUCKET}/deps-sources/build-libfuzzer.sh" . || {
+                echo "ERROR: build-libfuzzer.sh not found in GCS"
+                echo "Upload with: python -m cli upload-deps-sources"
+                exit 1
+            }
+            chmod +x build-libfuzzer.sh
+
+            mkdir -p libfuzzer-modern
+            gsutil -m cp -r "gs://${BUCKET}/deps-sources/libfuzzer-modern/*" libfuzzer-modern/ || {
+                echo "ERROR: libfuzzer-modern source not found in GCS"
+                exit 1
+            }
+
+            # Download hash script
+            gsutil cp "gs://${BUCKET}/deps-sources/compute_hashes.sh" . || {
+                echo "ERROR: compute_hashes.sh not found"
+                exit 1
+            }
+            chmod +x compute_hashes.sh
+            source compute_hashes.sh
+
+            # Compute local hash (hash all .cpp, .h, and the build script)
+            LOCAL_HASH=$(compute_libfuzzer_hash libfuzzer-modern build-libfuzzer.sh)
+            echo "[*] Local libfuzzer hash: ${LOCAL_HASH}"
+
+            # Check if rebuild needed
+            if [ "${FORCE_REBUILD}" != "true" ]; then
+                MANIFEST=$(gsutil cat "gs://${BUCKET}/build-assets/deps-manifest.json" 2>/dev/null || echo "{}")
+                GCS_HASH=$(echo "${MANIFEST}" | jq -r '.libfuzzer_hash // ""')
+                echo "[*] GCS libfuzzer hash: ${GCS_HASH:-none}"
+
+                if [ "${LOCAL_HASH}" = "${GCS_HASH}" ]; then
+                    echo "[*] libfuzzer unchanged, skipping build"
+                    exit 0
+                fi
+            fi
+
+            # Build for both architectures
+            echo "[*] Building namespace-isolated libFuzzer..."
+            export OUTPUT_DIR="${WORKDIR}/output"
+            export ARCHS="x86_64 i386"
+
+            # Point build script at our downloaded source
+            ln -sf "${WORKDIR}/libfuzzer-modern" "$(dirname build-libfuzzer.sh)/libfuzzer-modern" 2>/dev/null || true
+            bash build-libfuzzer.sh
+
+            # Upload to GCS
+            echo "[*] Uploading libfuzzer-prebuilt.tar.gz..."
+            gsutil cp "${OUTPUT_DIR}/libfuzzer-prebuilt.tar.gz" "gs://${BUCKET}/build-assets/"
+
+            # Update manifest
+            echo "[*] Updating deps-manifest.json..."
+            MANIFEST=$(gsutil cat "gs://${BUCKET}/build-assets/deps-manifest.json" 2>/dev/null || echo "{}")
+            UPDATED_MANIFEST=$(echo "${MANIFEST}" | jq --arg hash "${LOCAL_HASH}" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '.libfuzzer_hash = $hash | .libfuzzer_built_at = $ts')
+            echo "${UPDATED_MANIFEST}" > deps-manifest.json
+            gsutil cp deps-manifest.json "gs://${BUCKET}/build-assets/"
+
+            echo "[*] libFuzzer build complete!"
+        resources:
+          requests:
+            cpu: "4"
+            memory: "8G"
+          limits:
+            cpu: "8"
+            memory: "16G"
+
+    # =========================================================================
+    # Upload build assets from local to GCS
+    # This is a quick job to sync local build assets to GCS
+    # =========================================================================
+    - name: upload-build-assets
+      inputs:
+        parameters:
+          - name: bucket
+        artifacts:
+          - name: build-assets
+            path: /workspace/build-assets
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "work"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+        workload-type: work
+      serviceAccountName: arvo-workflow-sa
+      retryStrategy:
+        limit: 3
+        retryPolicy: "Always"
+        expression: 'lastRetry.status == "Error" or (lastRetry.status == "Failed" and asInt(lastRetry.exitCode) not in [0])'
+        backoff:
+          duration: "30s"
+          factor: 2
+          cap: "10m"
+      container:
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+
+            BUCKET="{{inputs.parameters.bucket}}"
+
+            echo "[*] Uploading build assets to gs://${BUCKET}/build-assets/..."
+
+            cd /workspace/build-assets
+
+            # Upload Dockerfile templates
+            for template in dockerfile_*_template; do
+                if [ -f "$template" ]; then
+                    echo "    Uploading $template..."
+                    gsutil cp "$template" "gs://${BUCKET}/build-assets/"
+                fi
+            done
+
+            # Upload libfuzzer-modern
+            if [ -d "libfuzzer-modern" ]; then
+                echo "    Uploading libfuzzer-modern/..."
+                gsutil -m cp -r libfuzzer-modern "gs://${BUCKET}/build-assets/"
+            fi
+
+            # Upload casr-binaries.tar.gz
+            if [ -f "casr-binaries.tar.gz" ]; then
+                echo "    Uploading casr-binaries.tar.gz..."
+                gsutil cp casr-binaries.tar.gz "gs://${BUCKET}/build-assets/"
+            fi
+
+            # Upload glibc
+            if [ -f "libc6_2.35-0ubuntu3_amd64.deb" ]; then
+                echo "    Uploading libc6_2.35-0ubuntu3_amd64.deb..."
+                gsutil cp libc6_2.35-0ubuntu3_amd64.deb "gs://${BUCKET}/build-assets/"
+            fi
+
+            # Upload DD debs
+            for deb in differential-debugging-deps-*.deb; do
+                if [ -f "$deb" ]; then
+                    echo "    Uploading $deb..."
+                    gsutil cp "$deb" "gs://${BUCKET}/build-assets/"
+                fi
+            done
+
+            # Upload microsnapshots
+            if [ -d "microsnapshots" ]; then
+                echo "    Uploading microsnapshots/..."
+                gsutil -m cp -r microsnapshots "gs://${BUCKET}/build-assets/"
+            fi
+
+            # Upload casr_cluster.py
+            if [ -f "casr_cluster.py" ]; then
+                echo "    Uploading casr_cluster.py..."
+                gsutil cp casr_cluster.py "gs://${BUCKET}/build-assets/"
+            fi
+
+            echo "[*] Build assets uploaded!"
+            gsutil ls "gs://${BUCKET}/build-assets/"
+        resources:
+          requests:
+            cpu: "1"
+            memory: "1G"

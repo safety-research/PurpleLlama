@@ -22,7 +22,7 @@ from claude_agent_sdk import (
 from ..base import AgentResult, AgentStatus, BaseAgent
 from .permissions import restrict_file_writes
 from .prompts import get_project_source_path, get_system_prompt
-from .retry_tracker import RetryTimeTracker
+from shared.retry_tracker import RetryTimeTracker
 from .tools import create_arvo_mcp_server
 
 LOG = logging.getLogger(__name__)

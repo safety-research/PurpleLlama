@@ -70,3 +70,5 @@
 {"location":"build.sh:step5","message":"xattr count after strip","data":{"count":4076},"timestamp":1771450043000,"sessionId":"debug-session","hypothesisId":"B"}
 {"location":"build.sh:step5","message":"xattr count before strip","data":{"count":4172},"timestamp":1771823958000,"sessionId":"debug-session","hypothesisId":"B"}
 {"location":"build.sh:step5","message":"xattr count after strip","data":{"count":4170},"timestamp":1771823959000,"sessionId":"debug-session","hypothesisId":"B"}
+{"location":"build.sh:step5","message":"xattr count before strip","data":{"count":4172},"timestamp":1771835959000,"sessionId":"debug-session","hypothesisId":"B"}
+{"location":"build.sh:step5","message":"xattr count after strip","data":{"count":4170},"timestamp":1771835959000,"sessionId":"debug-session","hypothesisId":"B"}

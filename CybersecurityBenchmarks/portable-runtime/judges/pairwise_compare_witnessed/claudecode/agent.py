@@ -28,6 +28,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+from shared.retry_tracker import RetryTimeTracker
 from judges.pairwise_compare.setup import WorkspaceInfo
 from ..types import Claim, WitnessReport, WitnessStatus
 from .permissions import restrict_witnessed_writes
@@ -157,6 +158,15 @@ class WitnessAnalystAgent:
             "mcp__witnessed__run_witness",
         ]
 
+        initial_prompt = get_analyst_initial_prompt(self.workspace)
+        LOG.info(
+            f"Starting witnessed analysis session: max_turns={self.max_turns}, "
+            f"max_runtime={self.max_runtime_seconds}s"
+        )
+
+        last_assistant_text = ""
+        retry_tracker = RetryTimeTracker()
+
         options = ClaudeAgentOptions(
             cli_path=self.cli_path,
             system_prompt=get_analyst_system_prompt(self.workspace),
@@ -170,19 +180,13 @@ class WitnessAnalystAgent:
             max_thinking_tokens=self.thinking_budget,
             max_buffer_size=100 * 1024 * 1024,
             env={"CLAUDE_CODE_MAX_RETRIES": "500"},
+            stderr=retry_tracker.handle_stderr_line,
         )
-
-        initial_prompt = get_analyst_initial_prompt(self.workspace)
-        LOG.info(
-            f"Starting witnessed analysis session: max_turns={self.max_turns}, "
-            f"max_runtime={self.max_runtime_seconds}s"
-        )
-
-        last_assistant_text = ""
 
         async with ClaudeSDKClient(options=options) as client:
             await client.query(initial_prompt)
             async for message in client.receive_response():
+                retry_tracker.on_message_received()
                 self._process_message(message)
 
                 if isinstance(message, AssistantMessage):
@@ -191,9 +195,12 @@ class WitnessAnalystAgent:
                             last_assistant_text += block.text
 
                 elapsed = time.monotonic() - session_start
-                if elapsed > self.max_runtime_seconds:
+                excluded = retry_tracker.get_excluded_seconds()
+                active = elapsed - excluded
+                if active > self.max_runtime_seconds:
                     LOG.warning(
-                        f"Time budget exceeded: {elapsed:.1f}s. Interrupting."
+                        f"Time budget exceeded: {active:.1f}s active "
+                        f"(excluded {excluded:.1f}s from {retry_tracker.get_retry_count()} retries). Interrupting."
                     )
                     timeout_triggered = True
                     self.report.status = WitnessStatus.TIMEOUT.value
@@ -201,8 +208,10 @@ class WitnessAnalystAgent:
                     break
 
         session_elapsed = time.monotonic() - session_start
+        session_excluded = retry_tracker.get_excluded_seconds()
         LOG.info(
             f"Analyst session complete: {session_elapsed:.1f}s"
+            + (f", {session_excluded:.1f}s excluded ({retry_tracker.get_retry_count()} retries)" if session_excluded > 0 else "")
             + (", TIMEOUT" if timeout_triggered else "")
         )
 

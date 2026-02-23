@@ -55,7 +55,7 @@ RUN curl -L -o python.tar.gz \
 # ARVO containers use Ubuntu 16.04 (glibc 2.23), so we need the musl build
 # which is fully static and works on any glibc version.
 # Distribution: https://claude.ai/install.sh -> GCS bucket with versioned releases.
-ARG CLAUDE_CODE_VERSION=latest
+ARG CLAUDE_CODE_VERSION=2.1.44
 RUN mkdir -p /runtime/bin && \
     GCS_BUCKET="https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases" && \
     if [ "${CLAUDE_CODE_VERSION}" = "latest" ]; then \

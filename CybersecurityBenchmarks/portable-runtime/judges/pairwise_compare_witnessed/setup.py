@@ -127,10 +127,14 @@ def setup_workspace(
     _create_worktree(git_root, patch_a_path, "witnessed-patch-a")
     _create_worktree(git_root, patch_b_path, "witnessed-patch-b")
 
-    if not _apply_patch_to_worktree(patch_a_path, a_diff):
-        LOG.error("Failed to apply Patch A -- analysis may be limited")
-    if not _apply_patch_to_worktree(patch_b_path, b_diff):
-        LOG.error("Failed to apply Patch B -- analysis may be limited")
+    try:
+        _apply_patch_to_worktree(patch_a_path, a_diff)
+    except RuntimeError as e:
+        LOG.error(f"Failed to apply Patch A -- analysis may be limited: {e}")
+    try:
+        _apply_patch_to_worktree(patch_b_path, b_diff)
+    except RuntimeError as e:
+        LOG.error(f"Failed to apply Patch B -- analysis may be limited: {e}")
 
     original_binary = _find_original_binary()
     original_binary_dest = f"{BINARIES_DIR}/original"

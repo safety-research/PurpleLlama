@@ -209,8 +209,10 @@ def submit_witnessed_analysis(
     analysis_experiment: Optional[str] = None,
     analysis_model: str = "claude-opus-4-6",
     max_runtime_seconds: int = 3600,
-    max_witness_time: int = 600,
+    max_witness_time: int = 900,
     witness_time_fraction: float = 0.7,
+    max_critic_time: int = 120,
+    max_critic_attempts: int = 3,
     thinking_budget: Optional[int] = None,
     build_version: str = "latest",
     config_file: Optional[Path] = None,
@@ -245,6 +247,8 @@ def submit_witnessed_analysis(
             "witness_time_fraction", witness_time_fraction
         )
         thinking_budget = config.get("thinking_budget", thinking_budget)
+        max_critic_time = config.get("max_critic_time", max_critic_time)
+        max_critic_attempts = config.get("max_critic_attempts", max_critic_attempts)
         build_version = config.get("build_version", build_version)
         use_spot = config.get("use_spot", use_spot)
 
@@ -298,6 +302,8 @@ def submit_witnessed_analysis(
         "max_runtime_seconds": max_runtime_seconds,
         "max_witness_time": max_witness_time,
         "witness_time_fraction": witness_time_fraction,
+        "max_critic_time": max_critic_time,
+        "max_critic_attempts": max_critic_attempts,
     }
     if thinking_budget:
         analysis_config["thinking_budget"] = thinking_budget

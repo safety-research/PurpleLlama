@@ -65,7 +65,9 @@ def parse_agent_config(args: argparse.Namespace) -> dict:
             "max_runtime_seconds": config.get("max_runtime_seconds", 3600),
             "thinking_budget": config.get("thinking_budget"),
             "witness_time_fraction": config.get("witness_time_fraction", 0.7),
-            "max_witness_time": config.get("max_witness_time", 600),
+            "max_witness_time": config.get("max_witness_time", 900),
+            "max_critic_time": config.get("max_critic_time", 120),
+            "max_critic_attempts": config.get("max_critic_attempts", 3),
         }
     else:
         return {
@@ -75,6 +77,8 @@ def parse_agent_config(args: argparse.Namespace) -> dict:
             "thinking_budget": args.thinking_budget,
             "witness_time_fraction": args.witness_time_fraction,
             "max_witness_time": args.max_witness_time,
+            "max_critic_time": args.max_critic_time,
+            "max_critic_attempts": args.max_critic_attempts,
         }
 
 
@@ -167,8 +171,20 @@ def main() -> int:
     parser.add_argument(
         "--max-witness-time",
         type=int,
-        default=600,
-        help="Max seconds per witness builder sub-agent (default: 600)",
+        default=900,
+        help="Max seconds per witness claim including critic loop (default: 900)",
+    )
+    parser.add_argument(
+        "--max-critic-time",
+        type=int,
+        default=120,
+        help="Max seconds per critic evaluation (default: 120)",
+    )
+    parser.add_argument(
+        "--max-critic-attempts",
+        type=int,
+        default=3,
+        help="Max generate-critique iterations per claim (default: 3)",
     )
     parser.add_argument(
         "--agent-config",
@@ -230,7 +246,9 @@ def main() -> int:
         max_runtime_seconds=agent_cfg["max_runtime_seconds"],
         thinking_budget=agent_cfg.get("thinking_budget"),
         witness_time_fraction=agent_cfg.get("witness_time_fraction", 0.7),
-        max_witness_time=agent_cfg.get("max_witness_time", 600),
+        max_witness_time=agent_cfg.get("max_witness_time", 900),
+        max_critic_time=agent_cfg.get("max_critic_time", 120),
+        max_critic_attempts=agent_cfg.get("max_critic_attempts", 3),
         dry_run=args.dry_run,
     )
 

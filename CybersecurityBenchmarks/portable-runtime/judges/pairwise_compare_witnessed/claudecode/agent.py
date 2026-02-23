@@ -49,10 +49,12 @@ class WitnessAnalystAgent:
     Configurable parameters (via constructor or AGENT_CONFIG JSON):
         model (str): LLM model name
         max_turns (int): Max agentic loop iterations (default: 500)
-        max_runtime_seconds (int): Max total runtime (default: 3600)
+        max_runtime_seconds (int): Total runtime budget for the entire judge (default: 3600)
         thinking_budget (int): Extended thinking token budget (default: None)
         witness_time_fraction (float): Fraction of budget for witnesses (default: 0.7)
-        max_witness_time (int): Max seconds per witness builder (default: 600)
+        max_witness_time (int): Per-claim budget covering generate-critique loop (default: 900)
+        max_critic_time (int): Per-critic evaluation budget (default: 120)
+        max_critic_attempts (int): Max generate-critique iterations per claim (default: 3)
     """
 
     def __init__(
@@ -64,7 +66,9 @@ class WitnessAnalystAgent:
         max_runtime_seconds: int = 3600,
         thinking_budget: int | None = None,
         witness_time_fraction: float = 0.7,
-        max_witness_time: int = 600,
+        max_witness_time: int = 900,
+        max_critic_time: int = 120,
+        max_critic_attempts: int = 3,
         dry_run: bool = False,
     ):
         self.workspace = workspace
@@ -75,6 +79,8 @@ class WitnessAnalystAgent:
         self.thinking_budget = thinking_budget
         self.witness_time_fraction = witness_time_fraction
         self.max_witness_time = max_witness_time
+        self.max_critic_time = max_critic_time
+        self.max_critic_attempts = max_critic_attempts
         self.dry_run = dry_run
 
         self._conversation_messages: list[dict] = []
@@ -128,6 +134,8 @@ class WitnessAnalystAgent:
             model=self.model,
             thinking_budget=self.thinking_budget,
             max_witness_time=self.max_witness_time,
+            max_critic_time=self.max_critic_time,
+            max_critic_attempts=self.max_critic_attempts,
             patch_a_diff=self.workspace.patch_a_diff,
             patch_b_diff=self.workspace.patch_b_diff,
             permissions_callback=restrict_witnessed_writes,

@@ -209,8 +209,10 @@ spec:
 
                 if [ "$PATCHER_ID" = "gt" ]; then
                   echo "Fetching GT patch for case ${CASE_ID}..."
-                  gsutil -q cp "gs://${BUCKET}/patches/${CASE_ID}-patch.json" "${DEST}/patch.json" || \
-                    echo "WARNING: GT patch not found"
+                  # Prefer real diff (from generate-gt-patches); fall back to ARVO metadata JSON
+                  gsutil -q cp "gs://${BUCKET}/patches/${CASE_ID}-gt.patch" "${DEST}/patch.patch" || \
+                    gsutil -q cp "gs://${BUCKET}/patches/${CASE_ID}-patch.json" "${DEST}/patch.json" || \
+                    echo "WARNING: No GT patch found"
                   if [ -f /shared/gt-binary ]; then
                     cp /shared/gt-binary "${DEST}/rebuilt_binary"
                   fi

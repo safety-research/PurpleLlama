@@ -1,0 +1,196 @@
+# Generate proper GT patch diffs by diffing -vul and -fix source trees.
+#
+# For each case, runs the -vul and -fix images as init containers to extract
+# their source trees, then diffs them and uploads the result to GCS at
+# patches/{case_id}-gt.patch. Skips cases where the patch already exists.
+#
+# Usage:
+#   python -m cli generate-gt-patches --cases 5576,9180
+#   python -m cli generate-gt-patches --config configs/new_vul_all.json
+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: generate-gt-patches-
+  namespace: argo
+spec:
+  entrypoint: gt-patch-pipeline
+  serviceAccountName: arvo-workflow-sa
+  parallelism: 50
+
+  podMetadata:
+    labels:
+      owner: "{{workflow.labels.owner}}"
+
+  arguments:
+    parameters:
+      - name: bucket
+        value: ""
+      - name: registry
+        value: ""
+      - name: build-version
+        value: "latest"
+      - name: cases-json
+        value: "[]"
+
+  templates:
+    - name: gt-patch-pipeline
+      dag:
+        failFast: false
+        tasks:
+          - name: gen-patch
+            withParam: "{{workflow.parameters.cases-json}}"
+            template: generate-gt-patch
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{item.case_id}}"
+                - name: project
+                  value: "{{item.project}}"
+
+    - name: generate-gt-patch
+      inputs:
+        parameters:
+          - name: case-id
+          - name: project
+            value: ""
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "work"
+          effect: "NoSchedule"
+      nodeSelector:
+        spot: "true"
+        workload-type: work
+      serviceAccountName: arvo-workflow-sa
+      activeDeadlineSeconds: 600
+
+      initContainers:
+        # 1. Extract source tree from -vul image
+        - name: extract-vul-src
+          image: "{{workflow.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{workflow.parameters.build-version}}"
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              PROJECT="{{inputs.parameters.project}}"
+              # Use explicit project name if provided, else scan for .git/
+              if [ -n "$PROJECT" ] && [ -d "/src/${PROJECT}" ]; then
+                PROJECT_DIR="/src/${PROJECT}/"
+              else
+                PROJECT_DIR=""
+                for d in /src/*/; do
+                  if [ -d "${d}.git" ]; then
+                    PROJECT_DIR="$d"
+                    break
+                  fi
+                done
+              fi
+              if [ -z "$PROJECT_DIR" ]; then
+                echo "ERROR: No git project found in /src/"
+                ls -la /src/
+                exit 1
+              fi
+              echo "Vul source: ${PROJECT_DIR}"
+              tar --exclude='.git' -czf /shared/vul-src.tar.gz -C "$(dirname "${PROJECT_DIR%/}")" "$(basename "${PROJECT_DIR%/}")"
+              echo "Vul source tarball: $(du -h /shared/vul-src.tar.gz | cut -f1)"
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+        # 2. Extract source tree from -fix image
+        - name: extract-fix-src
+          image: "{{workflow.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{workflow.parameters.build-version}}"
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              PROJECT="{{inputs.parameters.project}}"
+              if [ -n "$PROJECT" ] && [ -d "/src/${PROJECT}" ]; then
+                PROJECT_DIR="/src/${PROJECT}/"
+              else
+                PROJECT_DIR=""
+                for d in /src/*/; do
+                  if [ -d "${d}.git" ]; then
+                    PROJECT_DIR="$d"
+                    break
+                  fi
+                done
+              fi
+              if [ -z "$PROJECT_DIR" ]; then
+                echo "ERROR: No git project found in /src/"
+                ls -la /src/
+                exit 1
+              fi
+              echo "Fix source: ${PROJECT_DIR}"
+              tar --exclude='.git' -czf /shared/fix-src.tar.gz -C "$(dirname "${PROJECT_DIR%/}")" "$(basename "${PROJECT_DIR%/}")"
+              echo "Fix source tarball: $(du -h /shared/fix-src.tar.gz | cut -f1)"
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+      # Main container: diff and upload
+      container:
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+            CASE_ID="{{inputs.parameters.case-id}}"
+            BUCKET="{{workflow.parameters.bucket}}"
+            DEST="gs://${BUCKET}/patches/${CASE_ID}-gt.patch"
+
+            # Skip if already exists
+            if gsutil -q stat "$DEST" 2>/dev/null; then
+              echo "Case ${CASE_ID}: gt.patch already exists, skipping"
+              exit 0
+            fi
+
+            # Extract both source trees, then rename to a/ and b/ so the diff
+            # produces paths like "a/file.c" and "b/file.c" that git apply expects.
+            mkdir -p /tmp/vul-src /tmp/fix-src
+            tar -xzf /shared/vul-src.tar.gz -C /tmp/vul-src
+            tar -xzf /shared/fix-src.tar.gz -C /tmp/fix-src
+
+            VUL_DIR=$(ls /tmp/vul-src/)
+            FIX_DIR=$(ls /tmp/fix-src/)
+            echo "Vul project: ${VUL_DIR}, Fix project: ${FIX_DIR}"
+
+            mkdir -p /tmp/diff-stage
+            mv "/tmp/vul-src/${VUL_DIR}" /tmp/diff-stage/a
+            mv "/tmp/fix-src/${FIX_DIR}" /tmp/diff-stage/b
+
+            # Generate unified diff (exit code 1 = differences found, which is expected)
+            cd /tmp/diff-stage
+            diff -ruN a b > /tmp/gt.patch || true
+
+            PATCH_SIZE=$(wc -c < /tmp/gt.patch | tr -d ' ')
+            if [ "$PATCH_SIZE" -eq 0 ]; then
+              echo "WARNING: Case ${CASE_ID}: diff produced empty output (vul and fix sources identical -- fix may be non-source). Skipping."
+              exit 0
+            fi
+
+            PATCH_LINES=$(wc -l < /tmp/gt.patch | tr -d ' ')
+            echo "Case ${CASE_ID}: generated gt.patch (${PATCH_LINES} lines, ${PATCH_SIZE} bytes)"
+
+            # Upload
+            gsutil -q cp /tmp/gt.patch "$DEST"
+            echo "Case ${CASE_ID}: uploaded to ${DEST}"
+        volumeMounts:
+          - name: shared
+            mountPath: /shared
+            readOnly: true
+        resources:
+          requests:
+            cpu: "1.7"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+
+      volumes:
+        - name: shared
+          emptyDir: {}

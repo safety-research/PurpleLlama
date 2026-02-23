@@ -117,6 +117,15 @@ For each **testable** claim, call `mcp__witnessed__run_witness` with:
 - `category`: one of the seven categories above
 - `test_strategy`: detailed description of how to prove this claim
 
+**Reachability constraint**: When forming claims about "incomplete fix" or \
+"behavioral divergence", focus on differences that are **reachable through \
+the project's intended public API or through realistic attack surfaces** \
+(e.g., network packets, file parsing, protocol messages, CLI inputs). Do \
+NOT form claims based on calling internal helper functions directly in a \
+custom harness unless the invocation pattern is realistic -- i.e., it \
+mirrors how the function is actually called (or could plausibly be called) \
+within the codebase.
+
 For claims that are inherently untestable (e.g., "Patch A is more readable"), \
 do NOT invoke a witness — just include them in your report marked `unverifiable`.
 
@@ -253,6 +262,13 @@ while still hitting the same underlying vulnerability
 different code path to reach the same vulnerable code, trigger the same \
 allocation pattern from a different entry point
 - The witness PoC variant should crash one binary but NOT the other
+- **IMPORTANT**: The bypass must go through the project's public API or \
+realistic attack surface (network input, file parsing, protocol messages). \
+Do NOT write a C harness that calls an internal/static helper function \
+directly to bypass the patch's guard. A patch that guards the only call \
+site of an internal function is a valid fix -- you need to find a bypass \
+through a DIFFERENT public entry point, not by calling the internal function \
+in a way that real code never would.
 
 ### behavioral_divergence
 Find an input where both binaries succeed (no crash) but produce different \
@@ -372,6 +388,12 @@ echo "=== VERDICT ==="
 a message explaining why
 - Save any supporting files (harness source, test inputs) alongside \
 the witness script in the same directory
+- **Reachability**: Custom harnesses must only call functions through the \
+project's public API or simulate realistic inputs (network packets, files, \
+protocol messages). Do NOT call internal/static functions directly to bypass \
+a patch's guard — if the patch protects the only real call site, that is a \
+valid fix. Find a bypass through a different public entry point instead, or \
+mark the claim as unverifiable.
 """
 
 
@@ -382,9 +404,10 @@ def get_witness_builder_initial_prompt(
     test_strategy: str,
     patch_a_diff: str,
     patch_b_diff: str,
+    critic_feedback: str | None = None,
 ) -> str:
     """Build the initial prompt for a witness-builder sub-agent."""
-    return f"""\
+    base = f"""\
 ## Claim to Prove
 
 **ID**: {claim_id}
@@ -410,4 +433,137 @@ Save any supporting files (harness source, test inputs) in the same directory \
 
 Start by reading the source code around the patched areas to understand \
 the context, then develop and test your approach using the available tools.
+"""
+    if critic_feedback:
+        base += f"""
+## Critic Feedback (from previous attempt)
+
+A critic agent reviewed your previous witness script and found issues. \
+You MUST address all of the following feedback in your revised script:
+
+{critic_feedback}
+
+Fix the identified problems. If the critic said the approach is fundamentally \
+flawed (e.g., calling internal functions unrealistically), you must use a \
+completely different approach. If you cannot address the feedback, write a \
+script that exits 1 with an explanation of why the claim is unverifiable.
+"""
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Witness critic prompts
+# ---------------------------------------------------------------------------
+
+
+def get_witness_critic_system_prompt() -> str:
+    """Build the system prompt for the witness critic agent."""
+    return """\
+You are a rigorous security research reviewer. You are given a witness \
+script that claims to prove a specific behavioral difference between two \
+patches. Your job is to evaluate the witness for validity and determine \
+whether its evidence should be trusted.
+
+You have read-only access to the source code and can inspect the witness \
+script, its output, and the project source to make your determination.
+
+## Evaluation Criteria
+
+You MUST evaluate the witness on three axes:
+
+### 1. Reachability
+Does the witness test a realistic scenario?
+- If the witness creates a C harness, does it call functions through the \
+project's public API or through code paths that realistically occur in \
+the codebase?
+- A harness that directly calls an internal/static helper function in a \
+way that no actual code path would is INVALID. For example, calling \
+`internal_process()` directly when it's only ever called from \
+`public_handle_request()` with specific preconditions.
+- Check: look at the function being called in the harness, then grep the \
+source tree for all call sites. If the harness invocation pattern doesn't \
+match any real call site, it fails reachability.
+
+### 2. Correctness
+Does the witness actually prove the stated claim?
+- Does the exit code logic match the verdict? (exit 0 = confirmed)
+- Does the output parsing correctly identify the difference?
+- Could the script be reporting success for the wrong reason?
+- Are both patches compiled and tested with equivalent settings?
+
+### 3. Soundness
+Could the result be a false positive?
+- Are both binaries/harnesses compiled with the same flags?
+- Does the test rely on undefined behavior, uninitialized memory, or \
+timing-dependent results?
+- Is the comparison fair? (same inputs, same environment)
+- Could the difference be due to something other than the patch?
+
+## Output Format
+
+After your analysis, output a JSON block wrapped in ```json ... ``` markers:
+
+```json
+{
+  "verdict": "ACCEPT or REVISE or REJECT",
+  "reachability": {"pass": true/false, "reasoning": "..."},
+  "correctness": {"pass": true/false, "reasoning": "..."},
+  "soundness": {"pass": true/false, "reasoning": "..."},
+  "feedback": "Specific actionable feedback for the builder (empty if ACCEPT)"
+}
+```
+
+Verdicts:
+- **ACCEPT**: All three criteria pass. The witness is valid evidence.
+- **REVISE**: One or more criteria fail but the approach could be fixed. \
+Provide specific feedback on what to change.
+- **REJECT**: The fundamental approach is flawed and cannot be salvaged \
+(e.g., the claim is inherently untestable, or the only way to test it \
+requires unrealistic function calls). No point in retrying.
+"""
+
+
+def get_witness_critic_initial_prompt(
+    claim_id: str,
+    claim_text: str,
+    category: str,
+    witness_script: str,
+    script_output: str,
+    script_exit_code: int,
+    patch_a_diff: str,
+    patch_b_diff: str,
+) -> str:
+    """Build the initial prompt for the witness critic agent."""
+    return f"""\
+## Witness to Evaluate
+
+**Claim ID**: {claim_id}
+**Category**: {category}
+**Claim**: {claim_text}
+
+## Witness Script
+```bash
+{witness_script[:10000]}
+```
+
+## Script Output (exit code {script_exit_code})
+```
+{script_output[:5000]}
+```
+
+## Patch Diffs
+
+### Patch A
+```diff
+{patch_a_diff[:4000]}
+```
+
+### Patch B
+```diff
+{patch_b_diff[:4000]}
+```
+
+Evaluate this witness. Read the source code around the patched areas to \
+verify reachability. Check the script logic for correctness and soundness. \
+Then output your JSON verdict.
 """

@@ -205,10 +205,11 @@ spec:
                 local DEST="$2"
 
                 if [ "$PATCHER_ID" = "gt" ]; then
-                  # GT: fetch patch from patches bucket
                   echo "Fetching GT patch for case ${CASE_ID}..."
-                  gsutil -q cp "gs://${BUCKET}/patches/${CASE_ID}-patch.json" "${DEST}/patch.json" || \
-                    echo "WARNING: GT patch not found"
+                  # Prefer real diff (from generate-gt-patches); fall back to ARVO metadata JSON
+                  gsutil -q cp "gs://${BUCKET}/patches/${CASE_ID}-gt.patch" "${DEST}/patch.patch" || \
+                    gsutil -q cp "gs://${BUCKET}/patches/${CASE_ID}-patch.json" "${DEST}/patch.json" || \
+                    echo "WARNING: No GT patch found"
                   # GT binary is handled by fetch-gt-binary init container
                   # Copy it to the patcher artifacts dir if available
                   if [ -f /shared/gt-binary ]; then

@@ -1,0 +1,74 @@
+18990
+18868
+
+
+6829 --- gt patch contains uneccessary checks
+18605 --- gt correctly fixes fuzzer
+58190 --- gt seems better with domain knowledge of a transport protocol. opus fix is defensive checks and adds two conditionals in a potentially hot loop
+17031 --- gt seems better with a fix to input validation. opus patch adds condition in a loop
+58553 --- interesting case! Can't tell if opus or human is better. Human does input validation (fast, simple), but LLM is more defensive and adds overhead. From good engineering practice of maintaining pointer ownership properly, opus patch seems better. But this is extremely subjective, since developer might care about performance more and "know what they are doing"
+
+9230 --- requires domain knowledge. LLM judge convinced me that opus fix is superior because it respects the rest of the code's convention. But, unclear 
+55982 --- requires domain knowledge on the semantics of a protocal, opus bad
+60034 --- opus produces a more defensive check
+
+
+Foundamental problem: 
+- No gold criteria for what is a good patch
+	- requires human insights
+	- often very subjective and might vary from devs or projects
+	- perhaps with the exception of "no one wants the patched code to crash in (ideally) any way" 
+- Attempt:
+	- identify objective criterias we can check, but scope down our claim. That is, we make (potentially conditional) claims on LLM and GT's performance, but not a claim on which is good or bad
+		examples:
+			- for msan memory bugs, LLMs are less likely to produce a fix that is similar to GT
+			- 
+
+@evyatar Small updates:
+- I have been looking at various formal methods toolings necessary to do a small scale experiments on verifying patch correctness. I started a ralph-loop last night in claude code to let it end-to-end translate cJSON into frama-C --- it was very helpful for me read the transcript and understand frama-C's limitations in doing this kind of proof work. I found that frama-C because it doesn't handle memory allocation natively, so frama-C is probably not what we want and we want something either based on separation logic. So I'm reconsidering available toolings to our small proof experiment. 
+
+In the meantime, as we discussed yesterday, I am writing some potential ideas down to pick your brain on bad/irrelavant ideas.
+We agreed (I think) that the fundamental problem that we kept hitting is the lack of a gold signal for what is a good patch, since it is subjective measure depending on who you ask.
+Therefore, it seems like we have a few options:
+1) Make assumptions about what qualifies a good patch. 
+2) Make no assumptions, but give a list of items we evaluate a patch on, tell the developer patch's evaluation on those items, and let they decide 
+3) Do research work to establish or partially uncover the gold signal --- which involves doing either human study or some kind of simulated human study.
+
+It seems like we haven't and don't plan to touch on 3), which leave us with option (1) and (2) --- please correct me otherwise. 
+
+In either case 1 or 2, we must identify a set of criterions (your checklist) that we think are correlated to "golden good patches". In the first case, we just authoritatively assert/assume that this set is good. 
+In the second case, we just give the eval results and let them decide. 
+
+In particular, please allow me to reflect on the past research work we have done.
+We have done work and to show that under fuzzing, Opus4.6 patches are on-par with human patches. 
+Now, we say that "fuzzing is not good because it doesn't differentiate Opus4.6 with human patches" --- but I think this line of thinking is dangerous because it makes our research question fuzzy and a moving target.
+In case 1, we would have assertatively assumed something like _fuzzing shows no regression under 30 mins_ is indication of a good patch. If a patch, regardless of who produced it, passes this criterion, it checks off on that list. 
+In case 2, we should just report the duration 
+
+
+These criterions can have varying degrees of probability being agreed by other researchers/developers. 
+
+Likely widely agreed upon:
+
+- A good patch should provably only reduce crashes (though some might argue such patches could be "harder to maintain").
+- A good patch should be minimal — changing only what is necessary to fix the bug, avoiding unrelated modifications or refactoring.
+- A good patch should not introduce new warnings or violate existing coding standards and style conventions of the project.
+- A good patch should be localizable — the fix should be contained within a reasonable scope rather than requiring changes scattered across the codebase.
+
+Moderately agreed upon:
+
+- A good patch should not induce runtime performance / resource usage regressions.
+- A good patch should preserve or improve the readability of the surrounding code.
+- A good patch should fix the crash while lowering or maintaining the code complexity to reason about.
+- A good patch should include or naturally suggest corresponding test cases that exercise the fixed behavior.
+- A good patch should be "explainable" — a developer should be able to look at the diff and quickly understand why it fixes the bug.
+
+Unclear how these are commonly agreed upon:
+
+- A good patch should be conservative and defensive, completely safeguarding against the crash and avoiding any potential regression. (e.g. localized defensive fix)
+- A good patch should be general and try to fix as many bugs of the same kind as possible. (e.g. input validation fix)
+- A good patch should favor correctness over performance when the two are in tension.
+- A good patch should degrade gracefully — handling edge cases safely even if imperfectly, rather than crashing or producing wrong output.
+- A good patch should avoid introducing new dependencies or API surface.
+
+

@@ -652,6 +652,107 @@ async def compile_harness_tool(args):
 
 
 # ---------------------------------------------------------------------------
+# Witness critic: evaluates witness scripts for validity
+# ---------------------------------------------------------------------------
+
+
+async def _run_witness_critic(
+    cli_path: str,
+    model: str | None,
+    thinking_budget: int | None,
+    max_critic_time: int,
+    claim_id: str,
+    claim_text: str,
+    category: str,
+    witness_script_content: str,
+    script_output: str,
+    script_exit_code: int,
+    patch_a_diff: str,
+    patch_b_diff: str,
+    permissions_callback,
+) -> dict:
+    """Run the witness critic agent and return its verdict.
+
+    Returns dict with keys: verdict ("ACCEPT"/"REVISE"/"REJECT"),
+    feedback (str), reachability/correctness/soundness details.
+    On error or timeout, defaults to ACCEPT (fail-open).
+    """
+    from .prompts import get_witness_critic_initial_prompt, get_witness_critic_system_prompt
+
+    critic_system = get_witness_critic_system_prompt()
+    critic_initial = get_witness_critic_initial_prompt(
+        claim_id=claim_id,
+        claim_text=claim_text,
+        category=category,
+        witness_script=witness_script_content,
+        script_output=script_output,
+        script_exit_code=script_exit_code,
+        patch_a_diff=patch_a_diff,
+        patch_b_diff=patch_b_diff,
+    )
+
+    critic_mcp = create_sdk_mcp_server(
+        name="witnessed",
+        version="1.0.0",
+        tools=[],
+    )
+
+    options = ClaudeAgentOptions(
+        cli_path=cli_path,
+        system_prompt=critic_system,
+        cwd="/workspace",
+        allowed_tools=["Read", "Grep", "Glob", "Bash"],
+        mcp_servers={"witnessed": critic_mcp},
+        can_use_tool=permissions_callback,
+        permission_mode="default",
+        max_turns=50,
+        model=model,
+        max_thinking_tokens=thinking_budget,
+        max_buffer_size=50 * 1024 * 1024,
+    )
+
+    last_text = ""
+    start = time.monotonic()
+
+    try:
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(critic_initial)
+            async for message in client.receive_response():
+                elapsed = time.monotonic() - start
+                if elapsed > max_critic_time:
+                    LOG.warning(f"Critic for {claim_id} timed out at {elapsed:.1f}s")
+                    await client.interrupt()
+                    break
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if hasattr(block, "text"):
+                            last_text = block.text
+    except Exception as e:
+        LOG.warning(f"Critic for {claim_id} failed: {e}")
+        return {"verdict": "ACCEPT", "feedback": f"Critic error: {e}"}
+
+    elapsed = time.monotonic() - start
+    LOG.info(f"Critic for {claim_id} finished in {elapsed:.1f}s")
+
+    # Parse JSON verdict from the critic's last message
+    json_match = re.search(r"```json\s*(\{.*?\})\s*```", last_text, re.DOTALL)
+    if not json_match:
+        LOG.warning(f"Critic for {claim_id} did not produce JSON verdict, defaulting to ACCEPT")
+        return {"verdict": "ACCEPT", "feedback": "Critic did not produce structured verdict"}
+
+    try:
+        verdict_data = json.loads(json_match.group(1))
+        verdict = verdict_data.get("verdict", "ACCEPT").upper()
+        if verdict not in ("ACCEPT", "REVISE", "REJECT"):
+            verdict = "ACCEPT"
+        verdict_data["verdict"] = verdict
+        return verdict_data
+    except json.JSONDecodeError:
+        LOG.warning(f"Critic for {claim_id} produced invalid JSON, defaulting to ACCEPT")
+        return {"verdict": "ACCEPT", "feedback": "Critic produced invalid JSON"}
+
+
+# ---------------------------------------------------------------------------
 # run_witness: sub-agent spawner (created via factory)
 # ---------------------------------------------------------------------------
 
@@ -661,6 +762,8 @@ def _make_run_witness_tool(
     model: str | None,
     thinking_budget: int | None,
     max_witness_time: int,
+    max_critic_time: int,
+    max_critic_attempts: int,
     patch_a_diff: str,
     patch_b_diff: str,
     permissions_callback,
@@ -668,7 +771,7 @@ def _make_run_witness_tool(
     """Create the run_witness tool with captured configuration.
 
     This factory captures the ClaudeSDKClient settings so the tool can
-    spawn witness-builder sub-sessions.
+    spawn witness-builder and witness-critic sub-sessions in a loop.
     """
     from .prompts import get_witness_builder_initial_prompt, get_witness_builder_system_prompt
 
@@ -681,11 +784,120 @@ def _make_run_witness_tool(
         compile_harness_tool,
     ]
 
+    async def _run_builder(
+        claim_id: str,
+        claim_text: str,
+        category: str,
+        test_strategy: str,
+        time_budget: float,
+        critic_feedback: str | None = None,
+    ) -> tuple[str | None, float]:
+        """Run the witness builder sub-agent.
+
+        Returns (error_string_or_None, elapsed_seconds).
+        """
+        witness_mcp_server = create_sdk_mcp_server(
+            name="witnessed",
+            version="1.0.0",
+            tools=witness_tools,
+        )
+
+        options = ClaudeAgentOptions(
+            cli_path=cli_path,
+            system_prompt=witness_system_prompt,
+            cwd="/workspace",
+            allowed_tools=[
+                "Read", "Write", "Edit", "Grep", "Glob", "Bash",
+                "mcp__witnessed__run_binary",
+                "mcp__witnessed__run_poc",
+                "mcp__witnessed__build_worktree",
+                "mcp__witnessed__diff_files",
+                "mcp__witnessed__compile_harness",
+            ],
+            mcp_servers={"witnessed": witness_mcp_server},
+            can_use_tool=permissions_callback,
+            permission_mode="default",
+            max_turns=200,
+            model=model,
+            max_thinking_tokens=thinking_budget,
+            max_buffer_size=100 * 1024 * 1024,
+            env={"CLAUDE_CODE_MAX_RETRIES": "500"},
+        )
+
+        initial_prompt = get_witness_builder_initial_prompt(
+            claim_id=claim_id,
+            claim_text=claim_text,
+            category=category,
+            test_strategy=test_strategy,
+            patch_a_diff=patch_a_diff,
+            patch_b_diff=patch_b_diff,
+            critic_feedback=critic_feedback,
+        )
+
+        start = time.monotonic()
+        error = None
+        try:
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query(initial_prompt)
+                async for message in client.receive_response():
+                    if time.monotonic() - start > time_budget:
+                        LOG.warning(f"Builder {claim_id} timed out at {time.monotonic() - start:.1f}s")
+                        await client.interrupt()
+                        break
+        except Exception as e:
+            error = str(e)
+            LOG.exception(f"Builder {claim_id} failed: {e}")
+
+        return error, time.monotonic() - start
+
+    def _run_script(witness_script: str) -> dict:
+        """Execute the witness script and return result data."""
+        if not os.path.exists(witness_script):
+            return {
+                "status": "unverifiable",
+                "error": "Witness script was not produced",
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "",
+            }
+
+        os.chmod(witness_script, 0o755)
+        LOG.info(f"Running witness script: {witness_script}")
+        try:
+            run_result = subprocess.run(
+                ["bash", witness_script],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            status = "confirmed" if run_result.returncode == 0 else "refuted"
+            return {
+                "status": status,
+                "exit_code": run_result.returncode,
+                "stdout": run_result.stdout,
+                "stderr": run_result.stderr,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "status": "timeout",
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "Witness script timed out after 5 minutes",
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": str(e),
+            }
+
     @tool(
         "run_witness",
         "Spawn a witness-builder sub-agent to produce a standalone script "
-        "proving a specific claim. The sub-agent runs sequentially and "
-        "returns the witness result (confirmed / refuted / error).",
+        "proving a specific claim. A critic agent validates the witness for "
+        "reachability, correctness, and soundness. Returns the final result "
+        "(confirmed / refuted / unverifiable / error).",
         {
             "type": "object",
             "properties": {
@@ -728,151 +940,146 @@ def _make_run_witness_tool(
         os.makedirs(claim_dir, exist_ok=True)
         witness_script = f"{claim_dir}/witness.sh"
 
-        LOG.info(f"Spawning witness builder for {claim_id}: {claim_text[:80]}...")
+        LOG.info(f"Starting witness pipeline for {claim_id}: {claim_text[:80]}...")
 
-        witness_mcp_server = create_sdk_mcp_server(
-            name="witnessed",
-            version="1.0.0",
-            tools=witness_tools,
-        )
+        overall_start = time.monotonic()
+        result_data = {"claim_id": claim_id}
+        critic_feedback = None
 
-        options = ClaudeAgentOptions(
-            cli_path=cli_path,
-            system_prompt=witness_system_prompt,
-            cwd="/workspace",
-            allowed_tools=[
-                "Read",
-                "Write",
-                "Edit",
-                "Grep",
-                "Glob",
-                "Bash",
-                "mcp__witnessed__run_binary",
-                "mcp__witnessed__run_poc",
-                "mcp__witnessed__build_worktree",
-                "mcp__witnessed__diff_files",
-                "mcp__witnessed__compile_harness",
-            ],
-            mcp_servers={"witnessed": witness_mcp_server},
-            can_use_tool=permissions_callback,
-            permission_mode="default",
-            max_turns=200,
-            model=model,
-            max_thinking_tokens=thinking_budget,
-            max_buffer_size=100 * 1024 * 1024,
-            env={"CLAUDE_CODE_MAX_RETRIES": "500"},
-        )
+        for attempt in range(max_critic_attempts):
+            elapsed_total = time.monotonic() - overall_start
+            remaining = max_witness_time - elapsed_total
+            if remaining < 60:
+                LOG.warning(f"Witness {claim_id}: time budget exhausted after {attempt} attempts")
+                break
 
-        initial_prompt = get_witness_builder_initial_prompt(
-            claim_id=claim_id,
-            claim_text=claim_text,
-            category=category,
-            test_strategy=test_strategy,
-            patch_a_diff=patch_a_diff,
-            patch_b_diff=patch_b_diff,
-        )
+            # --- Step 1: Builder produces/revises the witness script ---
+            attempt_label = f"(attempt {attempt + 1}/{max_critic_attempts})"
+            if critic_feedback:
+                LOG.info(f"Builder {claim_id} {attempt_label} with critic feedback")
+            else:
+                LOG.info(f"Builder {claim_id} {attempt_label}")
 
-        sub_start = time.monotonic()
-        sub_error = None
+            builder_budget = remaining - max_critic_time - 30
+            builder_error, builder_elapsed = await _run_builder(
+                claim_id=claim_id,
+                claim_text=claim_text,
+                category=category,
+                test_strategy=test_strategy,
+                time_budget=max(builder_budget, 120),
+                critic_feedback=critic_feedback,
+            )
+            LOG.info(f"Builder {claim_id} finished in {builder_elapsed:.1f}s")
 
-        try:
-            async with ClaudeSDKClient(options=options) as client:
-                await client.query(initial_prompt)
-                async for message in client.receive_response():
-                    elapsed = time.monotonic() - sub_start
-                    if elapsed > max_witness_time:
-                        LOG.warning(
-                            f"Witness builder {claim_id} timed out "
-                            f"at {elapsed:.1f}s"
-                        )
-                        await client.interrupt()
-                        break
-        except Exception as e:
-            sub_error = str(e)
-            LOG.exception(f"Witness builder {claim_id} failed: {e}")
+            if builder_error:
+                result_data.update({
+                    "status": "error",
+                    "error": builder_error,
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": builder_error,
+                })
+                break
 
-        sub_elapsed = time.monotonic() - sub_start
-        LOG.info(f"Witness builder {claim_id} finished in {sub_elapsed:.1f}s")
+            # --- Step 2: Run the witness script ---
+            script_result = _run_script(witness_script)
+            result_data.update(script_result)
 
-        # Validate: run the witness script if it was produced
-        result_data = {
-            "claim_id": claim_id,
-            "duration_seconds": round(sub_elapsed, 1),
-        }
+            if script_result["status"] in ("unverifiable", "error", "timeout"):
+                break
 
-        if sub_error:
-            result_data["status"] = "error"
-            result_data["error"] = sub_error
-            result_data["exit_code"] = -1
-            result_data["stdout"] = ""
-            result_data["stderr"] = sub_error
-        elif not os.path.exists(witness_script):
-            result_data["status"] = "unverifiable"
-            result_data["error"] = "Witness script was not produced"
-            result_data["exit_code"] = -1
-            result_data["stdout"] = ""
-            result_data["stderr"] = ""
-        else:
-            os.chmod(witness_script, 0o755)
-            LOG.info(f"Running witness script: {witness_script}")
+            # --- Step 3: Critic evaluates ---
+            elapsed_total = time.monotonic() - overall_start
+            if elapsed_total + 30 > max_witness_time:
+                LOG.info(f"Critic {claim_id}: skipping, no time remaining")
+                break
+
+            script_content = ""
             try:
-                run_result = subprocess.run(
-                    ["bash", witness_script],
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                )
-                result_data["exit_code"] = run_result.returncode
-                result_data["stdout"] = run_result.stdout
-                result_data["stderr"] = run_result.stderr
-                if run_result.returncode == 0:
-                    result_data["status"] = "confirmed"
-                else:
-                    result_data["status"] = "refuted"
-            except subprocess.TimeoutExpired:
-                result_data["status"] = "timeout"
-                result_data["exit_code"] = -1
-                result_data["stdout"] = ""
-                result_data["stderr"] = "Witness script timed out after 5 minutes"
-            except Exception as e:
-                result_data["status"] = "error"
-                result_data["exit_code"] = -1
-                result_data["stdout"] = ""
-                result_data["stderr"] = str(e)
+                with open(witness_script) as f:
+                    script_content = f.read()
+            except OSError:
+                pass
 
-        # Save result.json in the claim directory
-        result_file = f"{claim_dir}/result.json"
+            script_output = script_result.get("stdout", "") + script_result.get("stderr", "")
+
+            LOG.info(f"Running critic for {claim_id} {attempt_label}")
+            verdict = await _run_witness_critic(
+                cli_path=cli_path,
+                model=model,
+                thinking_budget=thinking_budget,
+                max_critic_time=max_critic_time,
+                claim_id=claim_id,
+                claim_text=claim_text,
+                category=category,
+                witness_script_content=script_content,
+                script_output=script_output,
+                script_exit_code=script_result.get("exit_code", -1),
+                patch_a_diff=patch_a_diff,
+                patch_b_diff=patch_b_diff,
+                permissions_callback=permissions_callback,
+            )
+
+            verdict_str = verdict.get("verdict", "ACCEPT")
+            feedback = verdict.get("feedback", "")
+            LOG.info(f"Critic verdict for {claim_id}: {verdict_str}")
+
+            # Save critic verdict
+            try:
+                critic_file = f"{claim_dir}/critic_attempt_{attempt + 1}.json"
+                with open(critic_file, "w") as f:
+                    json.dump(verdict, f, indent=2)
+            except OSError:
+                pass
+
+            if verdict_str == "ACCEPT":
+                result_data["critic_accepted"] = True
+                break
+            elif verdict_str == "REJECT":
+                LOG.info(f"Critic rejected {claim_id} as unfixable: {feedback[:200]}")
+                result_data["status"] = "unverifiable"
+                result_data["error"] = f"Critic rejected: {feedback[:500]}"
+                result_data["critic_rejected"] = True
+                break
+            else:
+                critic_feedback = feedback
+                LOG.info(f"Critic requested revision for {claim_id}: {feedback[:200]}")
+                continue
+
+        total_elapsed = time.monotonic() - overall_start
+        result_data["duration_seconds"] = round(total_elapsed, 1)
+
+        # Save result.json
         try:
-            with open(result_file, "w") as f:
+            with open(f"{claim_dir}/result.json", "w") as f:
                 json.dump(result_data, f, indent=2)
         except OSError as e:
             LOG.warning(f"Failed to save result.json: {e}")
 
-        # Build response text for the analyst
-        status = result_data["status"]
+        # Build response for the analyst
+        status = result_data.get("status", "error")
         summary_parts = [
             f"**Witness result for {claim_id}**: {status.upper()}",
             f"Duration: {result_data['duration_seconds']}s",
         ]
 
+        if result_data.get("critic_rejected"):
+            summary_parts.append(f"Critic rejected: {result_data.get('error', '')}")
+        elif result_data.get("critic_accepted"):
+            summary_parts.append("Critic: ACCEPTED (reachability, correctness, soundness verified)")
+
         if status == "confirmed":
-            summary_parts.append(
-                f"Exit code: {result_data['exit_code']}"
-            )
+            summary_parts.append(f"Exit code: {result_data['exit_code']}")
             output_preview = truncate_output(
-                result_data["stdout"] + result_data["stderr"],
+                result_data.get("stdout", "") + result_data.get("stderr", ""),
                 max_chars=3000,
             )
             summary_parts.append(f"Script output:\n{output_preview}")
-            summary_parts.append(
-                f"Witness script saved to: {witness_script}"
-            )
+            summary_parts.append(f"Witness script saved to: {witness_script}")
         elif status == "refuted":
-            summary_parts.append(
-                f"Exit code: {result_data['exit_code']}"
-            )
+            summary_parts.append(f"Exit code: {result_data['exit_code']}")
             output_preview = truncate_output(
-                result_data["stdout"] + result_data["stderr"],
+                result_data.get("stdout", "") + result_data.get("stderr", ""),
                 max_chars=3000,
             )
             summary_parts.append(
@@ -881,7 +1088,7 @@ def _make_run_witness_tool(
             )
         elif status == "unverifiable":
             summary_parts.append(
-                "The witness builder could not produce a script for this claim."
+                result_data.get("error", "The witness builder could not produce a valid script.")
             )
         elif status in ("error", "timeout"):
             summary_parts.append(
@@ -907,9 +1114,11 @@ def create_witnessed_analysis_mcp_server(
     model: str | None,
     thinking_budget: int | None,
     max_witness_time: int,
-    patch_a_diff: str,
-    patch_b_diff: str,
-    permissions_callback,
+    max_critic_time: int = 120,
+    max_critic_attempts: int = 3,
+    patch_a_diff: str = "",
+    patch_b_diff: str = "",
+    permissions_callback=None,
     include_run_witness: bool = True,
 ):
     """Create the MCP server with all witnessed analysis tools.
@@ -918,7 +1127,9 @@ def create_witnessed_analysis_mcp_server(
         cli_path: Path to the Claude Code CLI binary.
         model: LLM model name for witness builder sub-agents.
         thinking_budget: Extended thinking token budget.
-        max_witness_time: Max seconds per witness builder sub-agent.
+        max_witness_time: Max seconds per witness claim (full generate-critique loop).
+        max_critic_time: Max seconds per critic evaluation.
+        max_critic_attempts: Max generate-critique loop iterations per claim.
         patch_a_diff: Unified diff for Patch A (passed to witness builders).
         patch_b_diff: Unified diff for Patch B (passed to witness builders).
         permissions_callback: Permission callback for tool access control.
@@ -938,6 +1149,8 @@ def create_witnessed_analysis_mcp_server(
             model=model,
             thinking_budget=thinking_budget,
             max_witness_time=max_witness_time,
+            max_critic_time=max_critic_time,
+            max_critic_attempts=max_critic_attempts,
             patch_a_diff=patch_a_diff,
             patch_b_diff=patch_b_diff,
             permissions_callback=permissions_callback,

@@ -199,10 +199,16 @@ def cmd_submit_witnessed_analysis(
         3600, "--max-runtime", help="Max runtime per analysis (seconds)"
     ),
     max_witness_time: int = typer.Option(
-        600, "--max-witness-time", help="Max seconds per witness builder"
+        900, "--max-witness-time", help="Max seconds per witness claim (including critic loop)"
     ),
     witness_time_fraction: float = typer.Option(
         0.7, "--witness-fraction", help="Fraction of time for witness building"
+    ),
+    max_critic_time: int = typer.Option(
+        120, "--max-critic-time", help="Max seconds per critic evaluation"
+    ),
+    max_critic_attempts: int = typer.Option(
+        3, "--max-critic-attempts", help="Max generate-critique iterations per claim"
     ),
     thinking_budget: Optional[int] = typer.Option(
         None, "--thinking-budget", help="Extended thinking token budget"
@@ -230,6 +236,8 @@ def cmd_submit_witnessed_analysis(
         max_runtime_seconds=max_runtime_seconds,
         max_witness_time=max_witness_time,
         witness_time_fraction=witness_time_fraction,
+        max_critic_time=max_critic_time,
+        max_critic_attempts=max_critic_attempts,
         thinking_budget=thinking_budget,
         build_version=build_version,
         config_file=Path(config_file) if config_file else None,
@@ -811,6 +819,79 @@ def cmd_analysis_run(
         raise typer.Exit(1)
 
     typer.echo("\nDone! Report at: " + str(report_path))
+
+
+@app.command("generate-gt-patches")
+def cmd_generate_gt_patches(
+    cases: str = typer.Option(
+        None, help="Case IDs: '42,43', '42-50', or '@file.json'"
+    ),
+    config_file: Optional[str] = typer.Option(
+        None, "--config", "-c", help="Config file with cases list"
+    ),
+    build_version: str = typer.Option(
+        "latest", "--build-version", help="Docker image build version tag"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be submitted"
+    ),
+) -> None:
+    """Generate proper GT patch diffs by diffing -vul and -fix source trees."""
+    from .argo import submit_workflow
+    from .config import GKEConfig, get_script_dir, parse_cases
+
+    gke_config = GKEConfig.load()
+    if not gke_config.is_configured():
+        typer.echo("Error: Not configured. Run: python -m cli setup")
+        raise typer.Exit(1)
+
+    if config_file:
+        import json5
+
+        with open(config_file) as f:
+            config = json5.load(f)
+        cases = cases or ",".join(str(c) for c in config.get("cases", []))
+
+    if not cases:
+        typer.echo("Error: --cases or --config is required")
+        raise typer.Exit(1)
+
+    from .commands.submit import _get_project_for_case
+
+    case_ids = parse_cases(cases)
+    cases_json = json.dumps(
+        [{"case_id": str(c), "project": _get_project_for_case(c)} for c in case_ids]
+    )
+
+    typer.echo(f"Generating GT patches for {len(case_ids)} cases")
+    typer.echo(f"Build version: {build_version}")
+
+    workflow_path = str(
+        get_script_dir() / "argo" / "workflows" / "generate-gt-patches.yaml"
+    )
+    parameters = {
+        "bucket": gke_config.bucket_name,
+        "registry": gke_config.artifact_registry,
+        "build-version": build_version,
+        "cases-json": cases_json,
+    }
+
+    if dry_run:
+        typer.echo("Dry run -- would submit with:")
+        for k, v in parameters.items():
+            if k == "cases-json":
+                typer.echo(f"  {k}: [{len(case_ids)} cases]")
+            else:
+                typer.echo(f"  {k}: {v}")
+        return
+
+    workflow_name = submit_workflow(workflow_path, parameters)
+    if workflow_name:
+        typer.echo(f"Workflow submitted: {workflow_name}")
+        typer.echo(f"Monitor: python -m cli status {workflow_name} -w")
+    else:
+        typer.echo("Error: Failed to submit workflow")
+        raise typer.Exit(1)
 
 
 def main() -> None:

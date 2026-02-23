@@ -80,7 +80,9 @@ def cmd_submit(
         True, "--check-deps/--no-check-deps", help="Check if CASR/DD need rebuilding"
     ),
     auto_build_deps: bool = typer.Option(
-        False, "--auto-build-deps", help="Auto-trigger dep builds if needed"
+        True,
+        "--auto-build-deps/--no-auto-build-deps",
+        help="Auto-rebuild outdated deps as part of workflow",
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Show what would be submitted"
@@ -349,6 +351,15 @@ def cmd_build_dd(
     deps.build_dd(force=force, dry_run=dry_run)
 
 
+@app.command("build-libfuzzer")
+def cmd_build_libfuzzer(
+    force: bool = typer.Option(False, "--force", "-f", help="Force rebuild"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done"),
+) -> None:
+    """Build namespace-isolated libFuzzer on GKE (~5-10 min)."""
+    deps.build_libfuzzer(force=force, dry_run=dry_run)
+
+
 @app.command("build-deps")
 def cmd_build_deps(
     casr_only: bool = typer.Option(False, "--casr-only", help="Only build CASR"),
@@ -470,6 +481,9 @@ def cmd_debug_vm_launch(
     build_version: str = typer.Option(
         "latest", "--build-version", help="Build version tag"
     ),
+    image_suffix: str = typer.Option(
+        "fix", "--image-suffix", help="Image suffix for build type: 'fix' or 'vul'"
+    ),
 ) -> None:
     """Launch a debug pod with fuzz/patch environment."""
     debug_vm.launch(
@@ -479,6 +493,7 @@ def cmd_debug_vm_launch(
         target=target,
         experiment_id=experiment_id,
         build_version=build_version,
+        image_suffix=image_suffix,
     )
 
 

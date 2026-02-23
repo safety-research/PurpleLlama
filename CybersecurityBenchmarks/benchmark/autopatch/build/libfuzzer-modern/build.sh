@@ -47,6 +47,9 @@ fi
 CXX="${CXX:-clang++}"
 
 # Find static libc++ and libc++abi libraries
+# NOTE: This build.sh is now only used as a FALLBACK for the ~20% of cases
+# where OSS-Fuzz's compile_libfuzzer compiles from /src/libfuzzer/ source.
+# The primary path uses precompiled namespace-isolated archives (see build-libfuzzer.sh).
 # For 32-bit, OSS-Fuzz provides 32-bit libc++ at /usr/i386/lib/
 if [ "$ARCH" = "i386" ] || [ "$ARCH" = "i686" ]; then
     # OSS-Fuzz containers have 32-bit libc++ at /usr/i386/lib/
@@ -98,9 +101,10 @@ echo "Using C++ standard: $CXX_STD (clang version: ${CLANG_VERSION:-unknown})"
 
 # Common compiler flags (matching LLVM's compiler-rt build)
 # -ffunction-sections -fdata-sections allows linker to GC unused code
+# -fno-builtin prevents inlining of memcpy/memset/etc so MSan can intercept them
 CXXFLAGS="$ARCH_FLAGS -g -O2 -fno-omit-frame-pointer $CXX_STD $STDLIB_FLAG"
 CXXFLAGS="$CXXFLAGS -fPIC -fvisibility=hidden -fno-exceptions -fno-rtti"
-CXXFLAGS="$CXXFLAGS -ffunction-sections -fdata-sections"
+CXXFLAGS="$CXXFLAGS -ffunction-sections -fdata-sections -fno-builtin"
 CXXFLAGS="$CXXFLAGS -I$LIBFUZZER_SRC_DIR"
 
 echo "Final CXXFLAGS: $CXXFLAGS"
@@ -167,6 +171,12 @@ if [ -n "$LIBCXX_A" ] && [ -f "$LIBCXX_A" ] && [ "$CAN_BUNDLE_LIBCXX" = "true" ]
     if [ -d libcxxabi_objs ]; then
         cp libcxxabi_objs/*.o all_objs/
     fi
+
+    # Remove operator new/delete objects so they resolve from the system runtime.
+    # On MSan builds, MSan provides intercepting operator new/delete that properly
+    # track allocation shadow state.  Bundling our own copies would bypass MSan's
+    # interceptors and cause false positives on older clang versions (e.g. clang 6).
+    rm -f all_objs/new.o all_objs/*new_delete* 2>/dev/null || true
 
     # Create fat archive with all object files
     echo "Creating self-contained libFuzzer.a..."

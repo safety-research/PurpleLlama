@@ -3,62 +3,51 @@ FROM {VUL_BASE_IMAGE}
 # Set environment variables to avoid interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Copy patched libfuzzer source (LLVM 10 with trace-pc-guard support re-added)
-# This libfuzzer has:
+# Install precompiled namespace-isolated libfuzzer
+# This libfuzzer has its own private libc++ in the __Fuzzer ABI namespace,
+# matching LLVM's compiler-rt approach. This eliminates MSan false positives
+# from uninstrumented libc++ symbol collisions.
+#
+# Features:
 # 1. Fork mode support (from LLVM 10) - enables -fork, -ignore_crashes, etc.
 # 2. trace-pc-guard support (re-added from LLVM 8) - works with existing instrumentation
 # 3. Per-crash log files for CASR (RedirectStderrToCrashLog) - avoids binary re-runs
-# No need to change COVERAGE_FLAGS or rebuild project libraries!
+# 4. Namespace-isolated libc++ (__Fuzzer) - no MSan false positives
 #
-# Two installation methods (both are applied):
-# A) Replace source at /src/libfuzzer/ - OSS-Fuzz's compile_libfuzzer will compile it
-# B) Build and replace clang runtime libraries (if they exist) - for direct linking
-#
-# IMPORTANT: We must delete old source first! Old files like FuzzerTraceState.cpp
-# reference APIs from old headers that our modern headers don't have.
+# Archives contain both x86_64 and i386 variants.
+COPY ./libfuzzer-prebuilt/ /tmp/libfuzzer-prebuilt/
+
+# Also copy source for compile_libfuzzer (OLD method, ~20% of cases compile from source)
 RUN rm -rf /src/libfuzzer/* 2>/dev/null || true
 COPY ./libfuzzer-modern/ /src/libfuzzer/
 
-# Build and install our modified libfuzzer
-# Detection logic:
-# - NEW compile_libfuzzer (uses -fsanitize=fuzzer): MUST replace system library
-# - OLD compile_libfuzzer (compiles from source): source replacement works, library optional
-# Note: 80% of cases use NEW, 20% use OLD (based on benchmark analysis)
-RUN cd /src/libfuzzer && \
-    chmod +x ./build.sh && \
-    PROJECT_ARCH=$(grep -oP 'ARCHITECTURE=\K\w+' /bin/arvo 2>/dev/null || echo "x86_64") && \
-    if [ "$PROJECT_ARCH" = "i386" ]; then FUZZER_ARCH="i386"; else FUZZER_ARCH="x86_64"; fi && \
-    echo "Detected project architecture: $PROJECT_ARCH -> target: $FUZZER_ARCH" && \
-    if grep -q 'fsanitize=fuzzer' /usr/local/bin/compile_libfuzzer 2>/dev/null; then \
-        COMPILE_TYPE="NEW"; \
-        echo "compile_libfuzzer type: NEW (uses -fsanitize=fuzzer, library replacement REQUIRED)"; \
+# Backport __msan_scoped_disable_interceptor_checks on old MSan runtimes
+# (pre-rL336447, July 2018).  The bundled libc++ is uninstrumented, so MSan
+# interceptors must be told to skip shadow checks for fuzzer-internal data.
+# On LLVM 8+ this API exists natively; on older runtimes we patch it in by
+# globalizing the existing in_interceptor_scope TLS counter and adding a shim.
+COPY ./patch-msan-scoped-disable.sh /tmp/patch-msan-scoped-disable.sh
+RUN chmod +x /tmp/patch-msan-scoped-disable.sh && /tmp/patch-msan-scoped-disable.sh && rm /tmp/patch-msan-scoped-disable.sh
+
+# Install precompiled archives: replace system clang runtime + FuzzingEngine
+RUN PROJECT_ARCH=$(grep -oP 'ARCHITECTURE=\K\w+' /bin/arvo 2>/dev/null || echo "x86_64") && \
+    if [ "$PROJECT_ARCH" = "i386" ]; then FUZZER_SUFFIX="i386"; else FUZZER_SUFFIX="x86_64"; fi && \
+    echo "Installing precompiled libfuzzer for ${FUZZER_SUFFIX}..." && \
+    FUZZER_LIB=$(find /usr/local/lib/clang -name "libclang_rt.fuzzer-${FUZZER_SUFFIX}.a" 2>/dev/null | head -1) && \
+    if [ -n "$FUZZER_LIB" ]; then \
+        CLANG_LIB_DIR=$(dirname "$FUZZER_LIB") && \
+        cp /tmp/libfuzzer-prebuilt/libFuzzer-${FUZZER_SUFFIX}.a "$CLANG_LIB_DIR/libclang_rt.fuzzer-${FUZZER_SUFFIX}.a" && \
+        cp /tmp/libfuzzer-prebuilt/libFuzzer_no_main-${FUZZER_SUFFIX}.a "$CLANG_LIB_DIR/libclang_rt.fuzzer_no_main-${FUZZER_SUFFIX}.a" && \
+        echo "Replaced system libfuzzer at: $CLANG_LIB_DIR"; \
     else \
-        COMPILE_TYPE="OLD"; \
-        echo "compile_libfuzzer type: OLD (compiles from /src/libfuzzer/, source method works)"; \
-    fi && \
-    FUZZER_LIB=$(find /usr/local/lib/clang -name "libclang_rt.fuzzer-${FUZZER_ARCH}.a" 2>/dev/null | head -1) && \
-    if [ -n "$FUZZER_LIB" ]; then CLANG_LIB_DIR=$(dirname "$FUZZER_LIB"); else CLANG_LIB_DIR=""; fi && \
-    if [ -n "$CLANG_LIB_DIR" ]; then \
-        echo "=== Building and replacing system libfuzzer ===" && \
-        ARCH=$FUZZER_ARCH ./build.sh && \
-        echo "Replacing system libfuzzer at: $CLANG_LIB_DIR (arch: $FUZZER_ARCH)" && \
-        cp libFuzzer.a "$CLANG_LIB_DIR/libclang_rt.fuzzer-${FUZZER_ARCH}.a" && \
-        cp libFuzzer_no_main.a "$CLANG_LIB_DIR/libclang_rt.fuzzer_no_main-${FUZZER_ARCH}.a" && \
-        echo "LIBRARY method: system libfuzzer replaced successfully"; \
-    else \
-        echo "=== No system libfuzzer found (clang $(/usr/local/bin/clang --version 2>/dev/null | head -1 || echo 'unknown')) ===" && \
-        if [ "$COMPILE_TYPE" = "NEW" ]; then \
-            echo "WARNING: NEW compile_libfuzzer but no system library to replace!"; \
-            echo "Custom crash logging may not work for this case."; \
-        fi && \
-        echo "SOURCE method: using /src/libfuzzer/ (already installed)"; \
+        echo "No system libfuzzer found -- source method will be used"; \
     fi && \
     if [ -f /usr/lib/libFuzzingEngine.a ]; then \
-        echo "Also replacing /usr/lib/libFuzzingEngine.a" && \
-        ARCH=$FUZZER_ARCH ./build.sh 2>/dev/null || true && \
-        cp libFuzzer.a /usr/lib/libFuzzingEngine.a 2>/dev/null || true; \
+        cp /tmp/libfuzzer-prebuilt/libFuzzer-${FUZZER_SUFFIX}.a /usr/lib/libFuzzingEngine.a && \
+        echo "Replaced /usr/lib/libFuzzingEngine.a"; \
     fi && \
-    echo "Modified libFuzzer installed (source at /src/libfuzzer/)"
+    rm -rf /tmp/libfuzzer-prebuilt/ && \
+    echo "Precompiled libFuzzer installed"
 
 # Prepare /tmp/corpus and modify /bin/arvo
 RUN mkdir -p /tmp/corpus/ && \
@@ -81,6 +70,15 @@ RUN find /out -maxdepth 1 -type f \( -name '*fuzz*' -o -name '*fuzzer*' \) -exec
 # Rebuild project including fuzzer binaries with our modified libfuzzer
 # The project libraries keep their existing trace-pc-guard instrumentation
 RUN arvo compile
+
+# Some projects (e.g. freeradius) install fuzzer binaries to /usr/local/bin/
+# via "make install" but fail to copy them back to /out/. Recover any missing
+# binaries that the arvo script references.
+RUN BINARY=$(sed -n 's|.*/out/\([^ ]*\).*|\1|p' /bin/arvo | head -1) && \
+    if [ -n "$BINARY" ] && [ ! -f "/out/$BINARY" ] && [ -f "/usr/local/bin/$BINARY" ]; then \
+        cp "/usr/local/bin/$BINARY" "/out/$BINARY" && \
+        echo "Recovered /out/$BINARY from /usr/local/bin/"; \
+    fi
 
 # QA: Assert that `arvo compile` works for a second time
 RUN arvo compile

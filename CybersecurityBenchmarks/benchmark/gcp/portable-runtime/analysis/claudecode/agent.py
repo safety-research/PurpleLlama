@@ -139,6 +139,11 @@ class PatchAnalysisAgent:
             max_turns=self.max_turns,
             model=self.model,
             max_thinking_tokens=self.thinking_budget,
+            # 100 MB buffer — avoid JSON buffer overflow on long conversations
+            # (SDK default is 1 MB, which large build outputs can exceed)
+            max_buffer_size=100 * 1024 * 1024,
+            # Allow CLI to retry through long API overload windows (default: 10)
+            env={"CLAUDE_CODE_MAX_RETRIES": "500"},
         )
 
         initial_prompt = get_initial_prompt(self.workspace)

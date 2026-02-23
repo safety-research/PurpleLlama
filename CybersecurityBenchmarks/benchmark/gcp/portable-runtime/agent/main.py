@@ -91,7 +91,7 @@ def create_agent(
     output_dir: Path,
     model: str,
     dry_run: bool = False,
-    max_retries: int = 10,
+    max_retries: int = 3,
     agent_id: str | None = None,
     **kwargs,
 ) -> BaseAgent:

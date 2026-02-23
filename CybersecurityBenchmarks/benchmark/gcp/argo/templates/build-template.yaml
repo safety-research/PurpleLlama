@@ -83,6 +83,13 @@ spec:
               # Download Dockerfile template and build assets
               gsutil cp gs://${BUCKET}/build-assets/dockerfile_vul_template /workspace/
               gsutil cp -r gs://${BUCKET}/build-assets/libfuzzer-modern/ /workspace/ || true
+              gsutil cp gs://${BUCKET}/build-assets/patch-msan-scoped-disable.sh /workspace/ || true
+
+              # Download precompiled namespace-isolated libfuzzer archives
+              mkdir -p /workspace/libfuzzer-prebuilt
+              gsutil cp gs://${BUCKET}/build-assets/libfuzzer-prebuilt.tar.gz /tmp/ && \
+                tar -xzf /tmp/libfuzzer-prebuilt.tar.gz -C /workspace/libfuzzer-prebuilt/ || \
+                echo "WARNING: prebuilt libfuzzer not found, build.sh fallback will be used"
 
               # Determine vul base image (default: upstream, or override for closest-vul)
               VUL_BASE_IMAGE="{{inputs.parameters.vul-base-image}}"
@@ -219,9 +226,16 @@ spec:
               gsutil cp gs://${BUCKET}/build-assets/casr-binaries.tar.gz /workspace/ || true
               gsutil cp gs://${BUCKET}/build-assets/libc6_2.35-0ubuntu3_amd64.deb /workspace/ || true
               gsutil cp -r gs://${BUCKET}/build-assets/libfuzzer-modern/ /workspace/ || true
+              gsutil cp gs://${BUCKET}/build-assets/patch-msan-scoped-disable.sh /workspace/ || true
               gsutil cp gs://${BUCKET}/build-assets/differential-debugging-deps-16.04.deb /workspace/ || true
               gsutil cp gs://${BUCKET}/build-assets/differential-debugging-deps-20.04.deb /workspace/ || true
               gsutil cp -r gs://${BUCKET}/build-assets/microsnapshots/ /workspace/ || true
+
+              # Download precompiled namespace-isolated libfuzzer archives
+              mkdir -p /workspace/libfuzzer-prebuilt
+              gsutil cp gs://${BUCKET}/build-assets/libfuzzer-prebuilt.tar.gz /tmp/ && \
+                tar -xzf /tmp/libfuzzer-prebuilt.tar.gz -C /workspace/libfuzzer-prebuilt/ || \
+                echo "WARNING: prebuilt libfuzzer not found, build.sh fallback will be used"
 
               # Generate Dockerfile from template
               sed "s|{ARVO_ID}|${CASE_ID}|g" /workspace/dockerfile_fuzzing_template > /workspace/Dockerfile

@@ -1,0 +1,197 @@
+# Check all ARVO -vul and -fix images for dirty git trees.
+#
+# For each case, runs lightweight init containers in both the -vul and -fix
+# images, captures `git status` and `git diff`, and uploads JSON results to GCS.
+# This detects cases where the base image was built from a dirty working tree.
+#
+# Uses the same cases-json format as between-commits.yaml:
+#   [{"case_id":"1436","project":"wireshark"}, ...]
+#
+# Usage:
+#   argo submit check-image-cleanliness.yaml -n argo \
+#     -p bucket=my-bucket \
+#     -p registry=us-central1-docker.pkg.dev/project/repo \
+#     -p build-version=latest \
+#     -p 'cases-json=[{"case_id":"1436","project":"wireshark"}]'
+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: check-images-
+  namespace: argo
+spec:
+  entrypoint: check-pipeline
+  serviceAccountName: arvo-workflow-sa
+  parallelism: 50
+
+  podMetadata:
+    labels:
+      owner: "{{workflow.labels.owner}}"
+
+  arguments:
+    parameters:
+      - name: bucket
+        value: ""
+      - name: registry
+        value: ""
+      - name: build-version
+        value: "latest"
+      - name: cases-json
+        value: "[]"
+
+  templates:
+    - name: check-pipeline
+      dag:
+        failFast: false
+        tasks:
+          - name: check-cases
+            withParam: "{{workflow.parameters.cases-json}}"
+            template: check-case
+            arguments:
+              parameters:
+                - name: case-id
+                  value: "{{item.case_id}}"
+                - name: project
+                  value: "{{item.project}}"
+
+    - name: check-case
+      inputs:
+        parameters:
+          - name: case-id
+          - name: project
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "work"
+          effect: "NoSchedule"
+      nodeSelector:
+        workload-type: work
+      serviceAccountName: arvo-workflow-sa
+      activeDeadlineSeconds: 1800
+
+      initContainers:
+        # Check -vul image for dirty git tree
+        - name: check-vul
+          image: "{{workflow.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-vul:{{workflow.parameters.build-version}}"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              CASE_ID="{{inputs.parameters.case-id}}"
+              PROJECT="{{inputs.parameters.project}}"
+              IMG_TYPE="vul"
+
+              # Use project name to find source dir (same as paths.py / between-commits.yaml)
+              SRC_DIR="/src/$PROJECT"
+              if [ ! -d "$SRC_DIR/.git" ]; then
+                # Fallback: git rev-parse from /src
+                SRC_DIR=$(cd /src && git rev-parse --show-toplevel 2>/dev/null || echo "/src")
+              fi
+              cd "$SRC_DIR" 2>/dev/null || cd /src
+
+              STATUS=$(git status --short 2>/dev/null || echo "")
+              DIFF_NAMES=$(git diff --name-only 2>/dev/null || echo "")
+
+              IS_DIRTY="false"
+              if [ -n "$STATUS" ]; then
+                IS_DIRTY="true"
+              fi
+
+              # Escape newlines for JSON safety
+              DIFF_NAMES_ESC=$(echo "$DIFF_NAMES" | tr '\n' ',' | sed 's/,$//')
+              STATUS_ESC=$(echo "$STATUS" | tr '\n' '|' | sed 's/|$//')
+
+              cat > /shared/vul.json <<EOFJ
+              {
+                "case_id": "$CASE_ID",
+                "image_type": "$IMG_TYPE",
+                "dirty": $IS_DIRTY,
+                "git_status": "$STATUS_ESC",
+                "modified_files": "$DIFF_NAMES_ESC",
+                "src_dir": "$SRC_DIR"
+              }
+              EOFJ
+              echo "[$CASE_ID-$IMG_TYPE] dirty=$IS_DIRTY files=$DIFF_NAMES_ESC"
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+        # Check -fix image for dirty git tree
+        - name: check-fix
+          image: "{{workflow.parameters.registry}}/arvo-{{inputs.parameters.case-id}}-fix:{{workflow.parameters.build-version}}"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              CASE_ID="{{inputs.parameters.case-id}}"
+              PROJECT="{{inputs.parameters.project}}"
+              IMG_TYPE="fix"
+
+              SRC_DIR="/src/$PROJECT"
+              if [ ! -d "$SRC_DIR/.git" ]; then
+                SRC_DIR=$(cd /src && git rev-parse --show-toplevel 2>/dev/null || echo "/src")
+              fi
+              cd "$SRC_DIR" 2>/dev/null || cd /src
+
+              STATUS=$(git status --short 2>/dev/null || echo "")
+              DIFF_NAMES=$(git diff --name-only 2>/dev/null || echo "")
+
+              IS_DIRTY="false"
+              if [ -n "$STATUS" ]; then
+                IS_DIRTY="true"
+              fi
+
+              DIFF_NAMES_ESC=$(echo "$DIFF_NAMES" | tr '\n' ',' | sed 's/,$//')
+              STATUS_ESC=$(echo "$STATUS" | tr '\n' '|' | sed 's/|$//')
+
+              cat > /shared/fix.json <<EOFJ
+              {
+                "case_id": "$CASE_ID",
+                "image_type": "$IMG_TYPE",
+                "dirty": $IS_DIRTY,
+                "git_status": "$STATUS_ESC",
+                "modified_files": "$DIFF_NAMES_ESC",
+                "src_dir": "$SRC_DIR"
+              }
+              EOFJ
+              echo "[$CASE_ID-$IMG_TYPE] dirty=$IS_DIRTY files=$DIFF_NAMES_ESC"
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+      # Main container: upload results to GCS
+      container:
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+            CASE_ID="{{inputs.parameters.case-id}}"
+            BUCKET="{{workflow.parameters.bucket}}"
+            DEST="gs://${BUCKET}/image-audit/${CASE_ID}"
+
+            for f in vul.json fix.json; do
+              if [ -f "/shared/$f" ]; then
+                gsutil -q cp "/shared/$f" "${DEST}/$f"
+                echo "Uploaded ${DEST}/$f"
+                cat "/shared/$f"
+              else
+                echo "WARNING: /shared/$f not found"
+              fi
+            done
+        volumeMounts:
+          - name: shared
+            mountPath: /shared
+            readOnly: true
+        resources:
+          requests:
+            cpu: "1.7"
+            memory: "6G"
+          limits:
+            cpu: "1.8"
+            memory: "12G"
+
+      volumes:
+        - name: shared
+          emptyDir: {}

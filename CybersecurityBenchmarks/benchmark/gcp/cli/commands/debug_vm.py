@@ -192,6 +192,62 @@ def _build_fuzz_pod_spec(
     }
 
 
+def _build_build_pod_spec(
+    name: str,
+    case_id: int,
+    bucket: str,
+    owner: str,
+    image_suffix: str = "fix",
+) -> dict:
+    """Build a Pod spec for debugging the Docker build step.
+
+    Uses the **base DockerHub image** (``n132/arvo:{case_id}-{suffix}``)
+    directly, matching the build-template resource limits so we can
+    interactively reproduce ``arvo compile`` failures.
+    """
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "namespace": NAMESPACE,
+            "labels": {
+                DEBUG_LABEL: "true",
+                "owner": owner,
+                "case-id": str(case_id),
+                "job-type": "build",
+            },
+        },
+        "spec": {
+            "serviceAccountName": SERVICE_ACCOUNT,
+            "restartPolicy": "Never",
+            "nodeSelector": {"workload-type": "debug"},
+            "tolerations": [
+                {
+                    "key": "workload",
+                    "operator": "Equal",
+                    "value": "debug",
+                    "effect": "NoSchedule",
+                }
+            ],
+            "containers": [
+                {
+                    "name": CONTAINER_NAME,
+                    "image": f"docker.io/n132/arvo:{case_id}-{image_suffix}",
+                    "command": ["sleep", "infinity"],
+                    "env": [
+                        {"name": "CASE_ID", "value": str(case_id)},
+                    ],
+                    "resources": {
+                        "requests": {"cpu": "3", "memory": "12G"},
+                        "limits": {"cpu": "7", "memory": "24G"},
+                    },
+                },
+            ],
+        },
+    }
+
+
 def _build_patch_pod_spec(
     name: str,
     case_id: int,
@@ -417,6 +473,13 @@ def launch(
         str,
         typer.Option("--build-version", help="Build version tag"),
     ] = "latest",
+    image_suffix: Annotated[
+        str,
+        typer.Option(
+            "--image-suffix",
+            help="Image suffix for build type: 'fix' (default) or 'vul'",
+        ),
+    ] = "fix",
 ) -> None:
     """Launch a debug pod with the same environment as fuzz/patch templates.
 
@@ -433,10 +496,11 @@ def launch(
         python -m cli debug-vm launch 12803 --type fuzz
         python -m cli debug-vm launch 12803 --type fuzz -a autopatchbench-claude-sonnet-4-20250514 -e 20260205-120000
         python -m cli debug-vm launch 12803 --type patch
+        python -m cli debug-vm launch 12803 --type build --image-suffix vul
     """
     # Validate job type
-    if job_type not in ("fuzz", "patch"):
-        echo_error("Job type must be 'fuzz' or 'patch'")
+    if job_type not in ("fuzz", "patch", "build"):
+        echo_error("Job type must be 'fuzz', 'patch', or 'build'")
         raise typer.Exit(1)
 
     # If agent_id is not gt, experiment_id is required for fuzz (to find the binary)
@@ -477,44 +541,50 @@ def launch(
     typer.echo(f"Owner:          {owner}")
     typer.echo()
 
-    # Check if agent runtime needs rebuild/upload
-    echo_info("Checking agent runtime...")
-    needs_rebuild, reason = check_runtime_needs_rebuild()
-    if needs_rebuild:
-        echo_warning(f"Runtime needs rebuild ({reason})")
-        build_script = get_script_dir() / "portable-runtime" / "build.sh"
-        echo_info("Rebuilding runtime...")
-        result = subprocess.run(
-            ["bash", str(build_script)], capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            echo_error(f"Runtime build failed: {result.stderr}")
-            raise typer.Exit(1)
-        echo_success("Runtime rebuilt")
-
-        runtime_tar = (
-            get_script_dir() / "portable-runtime" / "output" / "agent-runtime.tar.gz"
-        )
-        if runtime_tar.exists():
-            echo_info("Uploading runtime to GCS...")
-            result = subprocess.run(
-                [
-                    "gsutil",
-                    "cp",
-                    str(runtime_tar),
-                    f"gs://{config.bucket_name}/agent-runtime/",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                echo_success("Runtime uploaded")
-            else:
-                echo_warning(f"Upload failed: {result.stderr}")
-        else:
-            echo_warning("Runtime tarball not found after build")
+    # Check if agent runtime needs rebuild/upload (not needed for build type)
+    if job_type == "build":
+        echo_info("Skipping runtime check for build debug VM")
     else:
-        echo_success("Runtime up to date")
+        echo_info("Checking agent runtime...")
+        needs_rebuild, reason = check_runtime_needs_rebuild()
+        if needs_rebuild:
+            echo_warning(f"Runtime needs rebuild ({reason})")
+            build_script = get_script_dir() / "portable-runtime" / "build.sh"
+            echo_info("Rebuilding runtime...")
+            result = subprocess.run(
+                ["bash", str(build_script)], capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                echo_error(f"Runtime build failed: {result.stderr}")
+                raise typer.Exit(1)
+            echo_success("Runtime rebuilt")
+
+            runtime_tar = (
+                get_script_dir()
+                / "portable-runtime"
+                / "output"
+                / "agent-runtime.tar.gz"
+            )
+            if runtime_tar.exists():
+                echo_info("Uploading runtime to GCS...")
+                result = subprocess.run(
+                    [
+                        "gsutil",
+                        "cp",
+                        str(runtime_tar),
+                        f"gs://{config.bucket_name}/agent-runtime/",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    echo_success("Runtime uploaded")
+                else:
+                    echo_warning(f"Upload failed: {result.stderr}")
+            else:
+                echo_warning("Runtime tarball not found after build")
+        else:
+            echo_success("Runtime up to date")
     typer.echo()
 
     # Build pod spec
@@ -529,6 +599,14 @@ def launch(
             registry=config.artifact_registry,
             build_version=build_version,
             owner=owner,
+        )
+    elif job_type == "build":
+        pod_spec = _build_build_pod_spec(
+            name=pod_name,
+            case_id=case_id,
+            bucket=config.bucket_name,
+            owner=owner,
+            image_suffix=image_suffix,
         )
     else:
         pod_spec = _build_patch_pod_spec(

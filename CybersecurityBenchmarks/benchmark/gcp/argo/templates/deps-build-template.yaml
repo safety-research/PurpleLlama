@@ -311,6 +311,134 @@ spec:
             mountPath: /workspace
 
     # =========================================================================
+    # Build namespace-isolated libFuzzer archives
+    # Requirements: clang, cmake, ninja, binutils, ~5-10 minutes
+    # Produces: libfuzzer-prebuilt.tar.gz uploaded to GCS
+    # =========================================================================
+    - name: build-libfuzzer
+      inputs:
+        parameters:
+          - name: bucket
+          - name: force-rebuild
+            default: "false"
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "build"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-spot: "true"
+        workload-type: build
+      serviceAccountName: arvo-workflow-sa
+      retryStrategy:
+        limit: 3
+        retryPolicy: "Always"
+        expression: 'lastRetry.status == "Error" or (lastRetry.status == "Failed" and asInt(lastRetry.exitCode) not in [0])'
+        backoff:
+          duration: "30s"
+          factor: 2
+          cap: "10m"
+      container:
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command:
+          - /bin/bash
+          - -c
+          - |
+            set -e
+
+            BUCKET="{{inputs.parameters.bucket}}"
+            FORCE_REBUILD="{{inputs.parameters.force-rebuild}}"
+            WORKDIR="/tmp/libfuzzer-build"
+
+            echo "==========================================="
+            echo "libFuzzer Build Job"
+            echo "==========================================="
+            echo "Bucket:        ${BUCKET}"
+            echo "Force Rebuild: ${FORCE_REBUILD}"
+            echo "==========================================="
+
+            # Install build dependencies on top of the gcloud SDK image (Debian-based)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq \
+                clang binutils \
+                jq xz-utils \
+                gcc-multilib g++-multilib \
+                2>/dev/null
+
+            mkdir -p "${WORKDIR}"
+            cd "${WORKDIR}"
+
+            # Download libfuzzer source and build script from GCS
+            echo "[*] Downloading libfuzzer source from GCS..."
+            gsutil cp "gs://${BUCKET}/deps-sources/build-libfuzzer.sh" . || {
+                echo "ERROR: build-libfuzzer.sh not found in GCS"
+                echo "Upload with: python -m cli upload-deps-sources"
+                exit 1
+            }
+            chmod +x build-libfuzzer.sh
+
+            mkdir -p libfuzzer-modern
+            gsutil -m cp -r "gs://${BUCKET}/deps-sources/libfuzzer-modern/*" libfuzzer-modern/ || {
+                echo "ERROR: libfuzzer-modern source not found in GCS"
+                exit 1
+            }
+
+            # Download hash script
+            gsutil cp "gs://${BUCKET}/deps-sources/compute_hashes.sh" . || {
+                echo "ERROR: compute_hashes.sh not found"
+                exit 1
+            }
+            chmod +x compute_hashes.sh
+            source compute_hashes.sh
+
+            # Compute local hash (hash all .cpp, .h, and the build script)
+            LOCAL_HASH=$(compute_libfuzzer_hash libfuzzer-modern build-libfuzzer.sh)
+            echo "[*] Local libfuzzer hash: ${LOCAL_HASH}"
+
+            # Check if rebuild needed
+            if [ "${FORCE_REBUILD}" != "true" ]; then
+                MANIFEST=$(gsutil cat "gs://${BUCKET}/build-assets/deps-manifest.json" 2>/dev/null || echo "{}")
+                GCS_HASH=$(echo "${MANIFEST}" | jq -r '.libfuzzer_hash // ""')
+                echo "[*] GCS libfuzzer hash: ${GCS_HASH:-none}"
+
+                if [ "${LOCAL_HASH}" = "${GCS_HASH}" ]; then
+                    echo "[*] libfuzzer unchanged, skipping build"
+                    exit 0
+                fi
+            fi
+
+            # Build for both architectures
+            echo "[*] Building namespace-isolated libFuzzer..."
+            export OUTPUT_DIR="${WORKDIR}/output"
+            export ARCHS="x86_64 i386"
+
+            # Point build script at our downloaded source
+            ln -sf "${WORKDIR}/libfuzzer-modern" "$(dirname build-libfuzzer.sh)/libfuzzer-modern" 2>/dev/null || true
+            bash build-libfuzzer.sh
+
+            # Upload to GCS
+            echo "[*] Uploading libfuzzer-prebuilt.tar.gz..."
+            gsutil cp "${OUTPUT_DIR}/libfuzzer-prebuilt.tar.gz" "gs://${BUCKET}/build-assets/"
+
+            # Update manifest
+            echo "[*] Updating deps-manifest.json..."
+            MANIFEST=$(gsutil cat "gs://${BUCKET}/build-assets/deps-manifest.json" 2>/dev/null || echo "{}")
+            UPDATED_MANIFEST=$(echo "${MANIFEST}" | jq --arg hash "${LOCAL_HASH}" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '.libfuzzer_hash = $hash | .libfuzzer_built_at = $ts')
+            echo "${UPDATED_MANIFEST}" > deps-manifest.json
+            gsutil cp deps-manifest.json "gs://${BUCKET}/build-assets/"
+
+            echo "[*] libFuzzer build complete!"
+        resources:
+          requests:
+            cpu: "4"
+            memory: "8G"
+          limits:
+            cpu: "8"
+            memory: "16G"
+
+    # =========================================================================
     # Upload build assets from local to GCS
     # This is a quick job to sync local build assets to GCS
     # =========================================================================

@@ -159,7 +159,7 @@ class RunConfig:
     agents: list[AgentSpec] = field(default_factory=list)
     experiment_id: str = "default"
     fuzzing_duration: int = 300
-    build_version: str = "auto"
+    build_version: str = "latest"
     patch_use_spot: bool = True
     fuzz_use_spot: bool = True
     vul_base_image: str = (

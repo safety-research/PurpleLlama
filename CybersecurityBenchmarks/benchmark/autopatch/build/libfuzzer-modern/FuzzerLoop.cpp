@@ -238,7 +238,6 @@ void Fuzzer::FinalizeCrashLog(const char *Prefix) {
   std::string LogsDir = Options.ArtifactPrefix + "logs";
   std::string FinalLogPath = DirPlusFile(LogsDir, CrashName + ".log");
 
-  // Rename is atomic and fast (no data copy, just directory entry update)
   rename(PendingCrashLogPath.c_str(), FinalLogPath.c_str());
   
   // Clear the path so we don't try to rename again

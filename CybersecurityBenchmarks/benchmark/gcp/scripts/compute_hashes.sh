@@ -67,6 +67,32 @@ compute_dd_hash() {
     sha256sum "$script_path" | cut -c1-16
 }
 
+# Compute hash of libfuzzer source (*.cpp, *.h files + build script)
+# Matches Python: compute_libfuzzer_source_hash()
+compute_libfuzzer_hash() {
+    local libfuzzer_dir="$1"
+    local build_script="${2:-}"
+    local combined=""
+    
+    # Hash .cpp and .h files (sorted)
+    while IFS= read -r -d $'\0' filepath; do
+        local relative_path="${filepath#${libfuzzer_dir}/}"
+        local file_hash
+        file_hash=$(sha256sum "$filepath" | cut -d' ' -f1)
+        combined+="${relative_path}${file_hash}"
+    done < <(find "$libfuzzer_dir" \( -name "*.cpp" -o -name "*.h" \) -print0 2>/dev/null | sort -z)
+    
+    # Also hash the build script if provided
+    if [ -n "$build_script" ] && [ -f "$build_script" ]; then
+        local file_hash
+        file_hash=$(sha256sum "$build_script" | cut -d' ' -f1)
+        combined+="build-libfuzzer.sh${file_hash}"
+    fi
+    
+    # Final hash, truncated to 16 chars
+    echo -n "$combined" | sha256sum | cut -c1-16
+}
+
 # Compute hash of runtime source (agent/ + evaluation/ + entrypoint)
 # Matches Python: compute_runtime_source_hash()
 compute_runtime_hash() {
@@ -115,11 +141,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo "  casr <casr_dir>        - CASR source hash (16 chars)"
         echo "  dd <script_path>       - DD build script hash (16 chars)"
         echo "  runtime <runtime_dir>  - Runtime source hash (16 chars)"
+        echo "  libfuzzer <dir> [build_script] - libfuzzer source hash (16 chars)"
         echo ""
         echo "Examples:"
         echo "  $0 file /path/to/file.txt"
         echo "  $0 casr /path/to/casr"
         echo "  $0 runtime /path/to/portable-runtime"
+        echo "  $0 libfuzzer /path/to/libfuzzer-modern /path/to/build-libfuzzer.sh"
         exit 1
     }
     
@@ -158,6 +186,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
                 exit 1
             fi
             compute_runtime_hash "$TARGET_PATH"
+            ;;
+        libfuzzer)
+            if [ ! -d "$TARGET_PATH" ]; then
+                echo "Error: Directory not found: $TARGET_PATH" >&2
+                exit 1
+            fi
+            compute_libfuzzer_hash "$TARGET_PATH" "${3:-}"
             ;;
         *)
             echo "Error: Unknown hash type: $HASH_TYPE" >&2

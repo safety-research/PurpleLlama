@@ -26,13 +26,12 @@ from ..hashing import (
     AUTOPATCH_BUILD_DIR,
     check_runtime_needs_rebuild,
     compute_deps_source_hash,
-    compute_image_build_version,
+    compute_libfuzzer_source_hash,
     compute_local_build_assets_hashes,
     compute_local_patch_hashes,
     get_build_assets_manifest_from_gcs,
     get_deps_manifest_from_gcs,
     get_patch_manifest_from_gcs,
-    run_gsutil,
 )
 from ..output import echo_error, echo_info, echo_success, echo_warning
 from . import semaphore
@@ -181,7 +180,7 @@ def _apply_argo_templates(dry_run: bool = False) -> bool:
 def _check_deps_status(
     bucket: str,
     build_dir: Path,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, bool]:
     """Check if dependencies need rebuilding.
 
     Args:
@@ -189,62 +188,74 @@ def _check_deps_status(
         build_dir: Path to autopatch build directory
 
     Returns:
-        Tuple of (casr_needs_build, dd_needs_build)
+        Tuple of (casr_needs_build, dd_needs_build, libfuzzer_needs_build)
     """
-    # Compute local hashes
     local_casr_hash, local_dd_hash = compute_deps_source_hash(build_dir)
+    local_libfuzzer_hash = compute_libfuzzer_source_hash(build_dir)
     manifest = get_deps_manifest_from_gcs(bucket)
 
     gcs_casr_hash = manifest.get("casr_hash", "")
     gcs_dd_hash = manifest.get("dd_hash", "")
+    gcs_libfuzzer_hash = manifest.get("libfuzzer_hash", "")
 
     casr_changed = bool(local_casr_hash and local_casr_hash != gcs_casr_hash)
     dd_changed = bool(local_dd_hash and local_dd_hash != gcs_dd_hash)
+    libfuzzer_changed = bool(
+        local_libfuzzer_hash and local_libfuzzer_hash != gcs_libfuzzer_hash
+    )
 
-    return casr_changed, dd_changed
+    return casr_changed, dd_changed, libfuzzer_changed
 
 
 def _report_deps_status(
     casr_changed: bool,
     dd_changed: bool,
+    libfuzzer_changed: bool,
     bucket: str,
     build_dir: Path,
     auto_build: bool = False,
     dry_run: bool = False,
-) -> tuple[bool, bool, bool]:
+) -> tuple[bool, bool, bool, bool]:
     """Report dependency status and get user confirmation.
 
     Args:
         casr_changed: True if CASR needs rebuilding
         dd_changed: True if DD needs rebuilding
+        libfuzzer_changed: True if libFuzzer needs rebuilding
         bucket: GCS bucket name
         build_dir: Path to autopatch build directory
         auto_build: If True, automatically include builds in workflow
         dry_run: If True, only show what would be done
 
     Returns:
-        Tuple of (should_continue, build_casr, build_dd)
+        Tuple of (should_continue, build_casr, build_dd, build_libfuzzer)
     """
-    if not casr_changed and not dd_changed:
+    if not casr_changed and not dd_changed and not libfuzzer_changed:
         echo_success("Dependencies up to date")
-        return True, False, False
+        return True, False, False, False
 
     # Get hashes for display
     local_casr_hash, local_dd_hash = compute_deps_source_hash(build_dir)
+    local_libfuzzer_hash = compute_libfuzzer_source_hash(build_dir)
     manifest = get_deps_manifest_from_gcs(bucket)
     gcs_casr_hash = manifest.get("casr_hash", "")
     gcs_dd_hash = manifest.get("dd_hash", "")
+    gcs_libfuzzer_hash = manifest.get("libfuzzer_hash", "")
 
     # Show what changed
     typer.echo()
     echo_warning("Dependencies need rebuilding:")
     if casr_changed:
         typer.echo(
-            f"  CASR: {gcs_casr_hash[:8] if gcs_casr_hash else 'none'}... -> {local_casr_hash[:8]}..."
+            f"  CASR:      {gcs_casr_hash[:8] if gcs_casr_hash else 'none'}... -> {local_casr_hash[:8]}..."
         )
     if dd_changed:
         typer.echo(
-            f"  DD:   {gcs_dd_hash[:8] if gcs_dd_hash else 'none'}... -> {local_dd_hash[:8]}..."
+            f"  DD:        {gcs_dd_hash[:8] if gcs_dd_hash else 'none'}... -> {local_dd_hash[:8]}..."
+        )
+    if libfuzzer_changed:
+        typer.echo(
+            f"  libFuzzer: {gcs_libfuzzer_hash[:8] if gcs_libfuzzer_hash else 'none'}... -> {local_libfuzzer_hash[:8]}..."
         )
     typer.echo()
 
@@ -253,13 +264,18 @@ def _report_deps_status(
             typer.echo("  [DRY RUN] Would include dependency builds in workflow")
         else:
             typer.echo("  [DRY RUN] Would warn about outdated deps")
-        return True, casr_changed and auto_build, dd_changed and auto_build
+        return (
+            True,
+            casr_changed and auto_build,
+            dd_changed and auto_build,
+            libfuzzer_changed and auto_build,
+        )
 
     build_casr = False
     build_dd = False
+    build_libfuzzer = False
 
     if auto_build:
-        # Include builds in the workflow
         if casr_changed:
             echo_info("CASR build will run as part of workflow (~15-30 min)")
             build_casr = True
@@ -273,9 +289,12 @@ def _report_deps_status(
                     "Skipping DD build - workflow may fail if DD deps are missing in GCS"
                 )
 
-        return True, build_casr, build_dd
+        if libfuzzer_changed:
+            echo_info("libFuzzer build will run as part of workflow (~5-10 min)")
+            build_libfuzzer = True
+
+        return True, build_casr, build_dd, build_libfuzzer
     else:
-        # Warn user but continue
         echo_warning("Dependencies are outdated. Options:")
         typer.echo("  1. Use --auto-build-deps to include builds in workflow")
         typer.echo("  2. Run builds separately first:")
@@ -283,12 +302,14 @@ def _report_deps_status(
             typer.echo("       python -m cli build-casr")
         if dd_changed:
             typer.echo("       python -m cli build-dd")
+        if libfuzzer_changed:
+            typer.echo("       python -m cli build-libfuzzer")
         typer.echo()
 
         if not typer.confirm("Continue without rebuilding?", default=True):
-            return False, False, False
+            return False, False, False, False
 
-        return True, False, False
+        return True, False, False, False
 
 
 def _sanitize_name(name: str) -> str:
@@ -777,8 +798,8 @@ def submit(
         Optional[int], typer.Option(help="Fuzzing duration in seconds")
     ] = None,
     build_version: Annotated[
-        str, typer.Option(help="Build version tag ('auto' = content hash)")
-    ] = "auto",
+        Optional[str], typer.Option(help="Build version tag for Docker images")
+    ] = None,
     config_file: Annotated[
         Optional[Path], typer.Option("--config", "-c", help="Config file (JSON)")
     ] = None,
@@ -798,9 +819,10 @@ def submit(
     auto_build_deps: Annotated[
         bool,
         typer.Option(
-            "--auto-build-deps", help="Automatically trigger dep builds if needed"
+            "--auto-build-deps/--no-auto-build-deps",
+            help="Auto-rebuild outdated deps as part of workflow",
         ),
-    ] = False,
+    ] = True,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Show what would be submitted")
     ] = False,
@@ -859,7 +881,7 @@ def submit(
         run_config.experiment_id = experiment_id
     if fuzzing_duration is not None:
         run_config.fuzzing_duration = fuzzing_duration
-    if build_version:
+    if build_version is not None:
         run_config.build_version = build_version
 
     # Validate: must have at least one agent spec or run_gt enabled
@@ -880,17 +902,6 @@ def submit(
         typer.echo("Error: No cases specified. Use --cases or --config.")
         raise typer.Exit(1)
 
-    # Auto-compute build version from content hash of all image inputs
-    if run_config.build_version == "auto":
-        typer.echo("Computing build version from image inputs...")
-        version_hash, input_hashes = compute_image_build_version(AUTOPATCH_BUILD_DIR)
-        run_config.build_version = version_hash
-        typer.echo(f"  Build version: {version_hash}")
-        if dry_run:
-            for name, h in sorted(input_hashes.items()):
-                typer.echo(f"    {name}: {h[:12]}...")
-        typer.echo()
-
     owner = get_current_user()
 
     typer.echo("=" * 50)
@@ -910,15 +921,17 @@ def submit(
     # Check if dependencies need rebuilding
     build_casr = False
     build_dd = False
+    build_libfuzzer = False
     if check_deps:
         typer.echo("Checking dependencies...")
-        casr_changed, dd_changed = _check_deps_status(
+        casr_changed, dd_changed, libfuzzer_changed = _check_deps_status(
             bucket=gke_config.bucket_name,
             build_dir=AUTOPATCH_BUILD_DIR,
         )
-        should_continue, build_casr, build_dd = _report_deps_status(
+        should_continue, build_casr, build_dd, build_libfuzzer = _report_deps_status(
             casr_changed=casr_changed,
             dd_changed=dd_changed,
+            libfuzzer_changed=libfuzzer_changed,
             bucket=gke_config.bucket_name,
             build_dir=AUTOPATCH_BUILD_DIR,
             auto_build=auto_build_deps,
@@ -928,10 +941,9 @@ def submit(
             typer.echo("Aborting submission.")
             raise typer.Exit(1)
 
-        # Auto-upload deps sources to GCS when deps will be rebuilt
-        # The build-casr/build-dd workflow tasks download source from GCS,
-        # so we must sync local source before the workflow runs.
-        if (build_casr or build_dd) and not dry_run:
+        # Auto-upload deps sources to GCS when deps will be rebuilt.
+        # The build tasks download source from GCS, so we must sync first.
+        if (build_casr or build_dd or build_libfuzzer) and not dry_run:
             from . import deps
 
             echo_info("Syncing deps sources to GCS (needed for build)...")
@@ -1152,6 +1164,7 @@ def submit(
         "fuzz-use-spot": str(run_config.fuzz_use_spot).lower(),
         "build-casr": str(build_casr).lower(),
         "build-dd": str(build_dd).lower(),
+        "build-libfuzzer": str(build_libfuzzer).lower(),
     }
 
     # Apply Argo workflow templates
@@ -1170,7 +1183,9 @@ def submit(
                 typer.echo(f"  {key}: {value}")
         typer.echo()
         typer.echo("Workflow structure:")
-        typer.echo("  Main DAG: build-casr, build-dd -> process-cases (withParam)")
+        typer.echo(
+            "  Main DAG: build-casr, build-dd, build-libfuzzer -> process-cases (withParam)"
+        )
         typer.echo(f"  case-pipeline template ({tasks_per_case} tasks per case):")
         typer.echo("    - chk-build-vul -> build-vul")
         typer.echo("    - chk-build-fix -> build-fix")
@@ -1180,19 +1195,23 @@ def submit(
             typer.echo(f"    - chk-fuzz-{id_safe} -> fuzz-{id_safe}")
         if run_gt:
             typer.echo("    - chk-gt -> fuzz-gt")
-        if build_casr or build_dd:
+        if build_casr or build_dd or build_libfuzzer:
             typer.echo()
             echo_info("Dependency builds included in workflow:")
             if build_casr:
                 typer.echo("  - CASR (~15-30 min)")
+            if build_libfuzzer:
+                typer.echo("  - libFuzzer (~5-10 min)")
             if build_dd:
                 typer.echo("  - DD (~2-4 hours)")
         return
 
-    if build_casr or build_dd:
+    if build_casr or build_dd or build_libfuzzer:
         echo_info("Submitting workflow with dependency builds...")
         if build_casr:
             typer.echo("  - CASR build will run first (~15-30 min)")
+        if build_libfuzzer:
+            typer.echo("  - libFuzzer build will run first (~5-10 min)")
         if build_dd:
             typer.echo("  - DD build will run first (~2-4 hours)")
     else:

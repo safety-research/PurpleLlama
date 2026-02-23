@@ -145,62 +145,6 @@ def compute_build_version(build_dir: Path) -> tuple[str, dict]:
     return version_hash, asset_hashes
 
 
-def compute_image_build_version(build_dir: Path) -> tuple[str, dict]:
-    """Compute image build version from all inputs that affect Docker images.
-
-    Unlike compute_build_version() which hashes built artifacts (tarballs, debs),
-    this hashes SOURCE inputs so that changing CASR/DD source immediately
-    invalidates the build version even before artifacts are rebuilt.
-
-    Returns:
-        Tuple of (version_hash, input_hashes_dict)
-        version_hash is first 8 chars of combined hash
-    """
-    input_hashes: dict[str, str] = {}
-
-    # Hash Dockerfile templates
-    for template_name in [
-        "dockerfile_vul_template",
-        "dockerfile_fix_template",
-        "dockerfile_fuzzing_template",
-    ]:
-        template_file = build_dir / template_name
-        if template_file.exists():
-            input_hashes[template_name] = compute_file_hash(template_file)
-
-    # Hash libfuzzer-modern directory
-    libfuzzer_dir = build_dir / "libfuzzer-modern"
-    if libfuzzer_dir.exists():
-        input_hashes["libfuzzer-modern"] = compute_directory_hash(libfuzzer_dir)
-
-    # Hash CASR and DD SOURCE (not built artifacts)
-    # This ensures changing source invalidates images before deps are rebuilt
-    casr_hash, dd_hash = compute_deps_source_hash(build_dir)
-    if casr_hash:
-        input_hashes["casr-source"] = casr_hash
-    if dd_hash:
-        input_hashes["dd-source"] = dd_hash
-
-    # Hash microsnapshots directory
-    microsnapshots_dir = build_dir / "microsnapshots"
-    if microsnapshots_dir.exists():
-        input_hashes["microsnapshots"] = compute_directory_hash(microsnapshots_dir)
-
-    # Hash glibc deb (rarely changes, but include for correctness)
-    glibc_deb = build_dir / "libc6_2.35-0ubuntu3_amd64.deb"
-    if glibc_deb.exists():
-        input_hashes["libc6_2.35-0ubuntu3_amd64.deb"] = compute_file_hash(glibc_deb)
-
-    # Compute combined hash
-    combined = hashlib.sha256()
-    for key in sorted(input_hashes.keys()):
-        combined.update(key.encode())
-        combined.update(input_hashes[key].encode())
-
-    version_hash = combined.hexdigest()[:8]
-    return version_hash, input_hashes
-
-
 def compute_local_build_assets_hashes(build_dir: Path) -> dict[str, str]:
     """Compute hashes of all local build assets that get uploaded to GCS.
 
@@ -220,6 +164,11 @@ def compute_local_build_assets_hashes(build_dir: Path) -> dict[str, str]:
         path = build_dir / name
         if path.exists():
             hashes[name] = compute_file_hash(path)
+
+    # MSan scoped-disable backport script
+    patch_script = build_dir / "patch-msan-scoped-disable.sh"
+    if patch_script.exists():
+        hashes["patch-msan-scoped-disable.sh"] = compute_file_hash(patch_script)
 
     # libfuzzer-modern directory
     libfuzzer_dir = build_dir / "libfuzzer-modern"
@@ -361,6 +310,37 @@ def compute_deps_source_hash(build_dir: Path) -> tuple[str, str]:
         dd_hash = _call_hash_script("dd", dd_script)
 
     return casr_hash, dd_hash
+
+
+def compute_libfuzzer_source_hash(build_dir: Path) -> str:
+    """Compute hash of libfuzzer source files + build script.
+
+    Uses the shared compute_hashes.sh script as the single source of truth.
+
+    Returns:
+        Hash string (16 chars), or empty string on error
+    """
+    libfuzzer_dir = build_dir / "libfuzzer-modern"
+    build_script = build_dir / "build-libfuzzer.sh"
+
+    if not libfuzzer_dir.exists():
+        return ""
+
+    # Call hash script with optional build script path
+    hash_script = get_script_dir() / "scripts" / "compute_hashes.sh"
+    if not hash_script.exists():
+        echo_warning(f"Hash script not found: {hash_script}")
+        return ""
+
+    args = ["bash", str(hash_script), "libfuzzer", str(libfuzzer_dir)]
+    if build_script.exists():
+        args.append(str(build_script))
+
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        echo_warning(f"libfuzzer hash computation failed: {result.stderr}")
+        return ""
+    return result.stdout.strip()
 
 
 def get_deps_manifest_from_gcs(bucket: str) -> dict:

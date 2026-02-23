@@ -35,6 +35,8 @@ spec:
         value: "false"
       - name: build-dd
         value: "false"
+      - name: build-libfuzzer
+        value: "false"
       # withParam: JSON array of case ID strings, e.g. ["1236","16614",...]
       - name: cases-json
         value: "[]"
@@ -81,11 +83,24 @@ spec:
                 - name: force-rebuild
                   value: "true"
 
+          # Build libFuzzer (if needed)
+          - name: build-libfuzzer
+            when: '"{{workflow.parameters.build-libfuzzer}}" == "true"'
+            templateRef:
+              name: arvo-deps-build
+              template: build-libfuzzer
+            arguments:
+              parameters:
+                - name: bucket
+                  value: "{{workflow.parameters.bucket}}"
+                - name: force-rebuild
+                  value: "true"
+
           # Process each case via withParam - expands to one case-pipeline per case
           # The case-pipeline template (injected by CLI) handles builds, patches, fuzz, and GT per case
           # cases-json contains objects: [{"case_id": "1236", "project": "wireshark"}, ...]
           - name: process-cases
-            dependencies: [build-casr, build-dd]
+            dependencies: [build-casr, build-dd, build-libfuzzer]
             withParam: "{{workflow.parameters.cases-json}}"
             template: case-pipeline
             arguments:
